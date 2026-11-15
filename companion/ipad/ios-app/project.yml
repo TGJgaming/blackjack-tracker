@@ -31,6 +31,9 @@ targets:
       path: BlackjackTracker/Info.plist
     entitlements:
       path: BlackjackTracker/BlackjackTracker.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tgjgaming.blackjacktracker
     dependencies:
       - target: BroadcastExtension
         embed: true
@@ -56,9 +59,10 @@ targets:
     platform: iOS
     sources:
       - path: SafariKeepaliveExtension/SafariWebExtensionHandler.swift
-      - path: SafariKeepaliveExtension/Resources
+      - path: SafariKeepaliveExtension/Resources/manifest.json
         buildPhase: resources
-        type: folder
+      - path: SafariKeepaliveExtension/Resources/background.js
+        buildPhase: resources
     info:
       path: SafariKeepaliveExtension/Info.plist
     entitlements:

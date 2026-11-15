@@ -40,9 +40,23 @@ jobs:
       - name: Package BlackjackTracker.ipa for Sideloadly / AltStore
         working-directory: companion/ipad/ios-app
         run: |
+          rm -rf Payload BlackjackTracker.ipa
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/BlackjackTracker.app Payload/
+          for f in \
+            Payload/BlackjackTracker.app/Info.plist \
+            Payload/BlackjackTracker.app/index.html \
+            Payload/BlackjackTracker.app/default_pack.js \
+            Payload/BlackjackTracker.app/companion_engine.js \
+            Payload/BlackjackTracker.app/PlugIns/BroadcastExtension.appex/Info.plist \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/Info.plist \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/manifest.json \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/background.js
+          do
+            test -f "$f" || { echo "Missing expected bundle file: $f" >&2; exit 1; }
+          done
           zip -qry BlackjackTracker.ipa Payload
+          ls -lh BlackjackTracker.ipa
 
       - name: Upload BlackjackTracker.ipa Artifact
         uses: actions/upload-artifact@v4
