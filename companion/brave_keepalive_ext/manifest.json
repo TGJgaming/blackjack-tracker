@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Companion Tab Keep-Alive Bridge",
+  "version": "1.0.0",
+  "description": "Triggers native Brave tab reload on local companion Keep-Alive signal. Zero webpage script access.",
+  "permissions": [
+    "tabs",
+    "alarms"
+  ],
+  "action": {
+    "default_title": "Companion Tab Keep-Alive Bridge"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
