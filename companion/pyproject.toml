@@ -1,0 +1,17 @@
+[project]
+name = "playtech-bj-companion"
+version = "0.1.0"
+description = "Read-only Windows desktop companion for tracking Playtech All Bets Blackjack into blackjack-tracker/index.html"
+requires-python = ">=3.11"
+dependencies = [
+  "mss>=9.0.1",
+  "numpy>=1.26.0",
+  "opencv-python>=4.10.0",
+  "websockets>=13.0",
+]
+
+[dependency-groups]
+dev = [
+  "pillow>=10.4.0",
+  "pytest>=8.3.0",
+]

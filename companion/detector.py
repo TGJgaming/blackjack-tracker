@@ -1,0 +1,1744 @@
+"""OpenCV template matching for Playtech digital HUD strips and physical felt burst capture."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+
+from config import COMPANION_DIR, CompanionConfig, RANK_TO_VAL
+
+
+BANNER_TOKENS: set[str] = {"WAIT", "LAST_BETS", "NO_MORE_BETS", "PLACE_BETS", "SHUFFLE"}
+SUIT_TOKENS: set[str] = {"S", "H", "C", "D"}
+
+
+@dataclass(frozen=True)
+class CardDetection:
+    rank: str
+    val: int | None
+    conf: float
+    x: int
+    y: int = 0
+    w: int = 0
+    h: int = 0
+    suit: str | None = None
+    hand_index: int = 0
+
+
+@dataclass(frozen=True)
+class FeltObservation:
+    ts: float
+    matched: bool
+    rank: str | None
+    val: int | None
+    conf: float
+    sharpness: float
+    zone: str = "community"
+
+
+@dataclass(frozen=True)
+class FrameObservation:
+    ts: float
+    player_cards: list[CardDetection] = field(default_factory=list)
+    dealer_cards: list[CardDetection] = field(default_factory=list)
+    player_hands: dict[int, list[CardDetection]] = field(default_factory=dict)
+    felt_events: list[FeltObservation] = field(default_factory=list)
+    banner_state: str = ""
+    banner_conf: float = 0.0
+    shuffle_active: bool = False
+    shuffle_conf: float = 0.0
+    split_detected: bool = False
+    hud_refreshed: bool = True
+    dealer_only: bool = False
+    place_bets_conf: float = 0.0
+    banner_source: str = ""
+
+
+@dataclass
+class TemplateEntry:
+    rank: str
+    val: int | None
+    gray: np.ndarray
+    name: str
+    min_gray: np.ndarray | None = None
+    bgr: np.ndarray | None = None
+    felt_tl: np.ndarray | None = None
+    felt_br: np.ndarray | None = None
+    felt_tl_pad: np.ndarray | None = None
+    felt_br_pad: np.ndarray | None = None
+    _scale_cache: dict[tuple[Any, ...], Any] = field(default_factory=dict, repr=False, compare=False)
+
+
+def _to_min_gray(bgr_or_gray: np.ndarray) -> np.ndarray:
+    """Convert BGR image to min(B,G,R) so red card ranks remain as dark as black ranks."""
+    if bgr_or_gray.ndim == 2:
+        return bgr_or_gray
+    return bgr_or_gray.min(axis=2)
+
+
+def extract_felt_card_rect(bgr: np.ndarray) -> np.ndarray:
+    """Isolate the contiguous bright white playing-card rectangle from a felt crop, trimming outer felt/table text."""
+    if bgr.size == 0:
+        return bgr
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    h, w = gray.shape[:2]
+    if h < 10 or w < 14:
+        return bgr
+    thr = max(165.0, float(np.percentile(gray, 85)) - 35.0)
+
+    def _longest_run(arr: np.ndarray, min_val: float, bridge_1px: bool = False) -> tuple[int, int]:
+        n = len(arr)
+        runs: list[tuple[int, int]] = []
+        i = 0
+        while i < n:
+            if arr[i] >= min_val:
+                j = i
+                while j < n:
+                    if arr[j] >= min_val:
+                        j += 1
+                    elif bridge_1px and (j + 1 < n) and arr[j + 1] >= min_val and arr[j] >= (min_val - 20.0):
+                        j += 2
+                    else:
+                        break
+                runs.append((i, j))
+                i = j
+            else:
+                i += 1
+        if not runs:
+            return 0, n
+        runs.sort(key=lambda r: (r[1] - r[0]), reverse=True)
+        return runs[0]
+
+    col_p80 = np.percentile(gray, 80, axis=0)
+    x0, x1 = _longest_run(col_p80, thr, bridge_1px=False)
+    if (x1 - x0) < 18:
+        x0, x1 = 0, w
+    row_p80 = np.percentile(gray[:, x0:x1], 80, axis=1)
+    y0, y1 = _longest_run(row_p80, thr, bridge_1px=True)
+    if (y1 - y0) < 14:
+        row_p85 = np.percentile(gray[:, x0:x1], 85, axis=1)
+        y0, y1 = _longest_run(row_p85, thr - 10.0, bridge_1px=True)
+    if (y1 - y0) < 12:
+        y0, y1 = 0, h
+    col_p80_2 = np.percentile(gray[y0:y1, :], 80, axis=0)
+    x0, x1 = _longest_run(col_p80_2, thr, bridge_1px=False)
+    if (x1 - x0) < 18:
+        x0, x1 = 0, w
+    return bgr[y0:y1, x0:x1]
+
+
+def extract_felt_rank_views(bgr: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Extract contrast-normalized (tl, 180°-rotated br) 16x10 rank corner views from a landscape felt card."""
+    card = extract_felt_card_rect(bgr)
+    if card.size == 0:
+        return None, None
+    mg = _to_min_gray(card).astype(np.float32)
+    mh, mw = mg.shape[:2]
+    if mh < 8 or mw < 10:
+        return None, None
+    inner = mg[2 : max(3, mh - 2), 2 : max(3, mw - 2)]
+    if inner.size == 0:
+        return None, None
+    p85 = float(np.percentile(inner, 85))
+    p10 = float(np.percentile(inner, 10))
+    if p85 < 185.0 or (p85 - p10) < 55.0:
+        return None, None
+    lo = float(np.percentile(mg, 5))
+    hi = float(np.percentile(mg, 85))
+    if (hi - lo) < 25.0:
+        return None, None
+    norm = np.clip((mg - lo) * (255.0 / max(15.0, hi - lo)), 0, 255).astype(np.uint8)
+    canon = cv2.resize(norm, (32, 20), interpolation=cv2.INTER_LINEAR)
+    tl = canon[0:10, 0:16]
+    br = cv2.rotate(canon[10:20, 16:32], cv2.ROTATE_180)
+    return tl, br
+
+
+class TemplateBank:
+    """Loads PNG templates organized by prefix (<RANK>_*.png, <SUIT>_*.png, or <BANNER_TOKEN>_*.png)."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.card_templates: list[TemplateEntry] = []
+        self.shuffle_templates: list[TemplateEntry] = []
+        self.banner_templates: list[TemplateEntry] = []
+        self.suit_templates: list[TemplateEntry] = []
+        self.reload()
+
+    def reload(self) -> None:
+        _RANK_SCALE_CACHE.clear()
+        self.card_templates.clear()
+        self.shuffle_templates.clear()
+        self.banner_templates.clear()
+        self.suit_templates.clear()
+        if not self.directory.exists():
+            return
+        is_suit_dir = self.directory.name.lower() == "suit"
+        is_felt_dir = self.directory.name.lower() == "felt"
+        for png in sorted(self.directory.glob("*.png")):
+            stem_upper = png.stem.upper()
+            raw = cv2.imread(str(png), cv2.IMREAD_UNCHANGED)
+            if raw is None or raw.size == 0:
+                continue
+            if raw.ndim == 3 and raw.shape[2] == 4:
+                bgr = raw[:, :, :3]
+            elif raw.ndim == 3:
+                bgr = raw
+            else:
+                bgr = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+            gray = _to_gray(bgr)
+            min_g = _to_min_gray(bgr)
+            if float(np.std(min_g)) < 1.0 and float(np.std(gray)) < 1.0:
+                continue
+
+            matched_banner = None
+            for btok in sorted(BANNER_TOKENS, key=len, reverse=True):
+                if stem_upper == btok or stem_upper.startswith(btok + "_"):
+                    matched_banner = btok
+                    break
+
+            if matched_banner:
+                self.banner_templates.append(
+                    TemplateEntry(
+                        rank=matched_banner,
+                        val=None,
+                        gray=gray,
+                        min_gray=min_g,
+                        bgr=bgr,
+                        name=png.name,
+                    )
+                )
+
+            token = stem_upper.split("_")[0]
+            if is_suit_dir and token in SUIT_TOKENS:
+                self.suit_templates.append(
+                    TemplateEntry(
+                        rank=token,
+                        val=None,
+                        gray=min_g,
+                        min_gray=min_g,
+                        bgr=bgr,
+                        name=png.name,
+                    )
+                )
+            elif token in RANK_TO_VAL:
+                if is_felt_dir and token == "BACK":
+                    continue
+                felt_tl: np.ndarray | None = None
+                felt_br: np.ndarray | None = None
+                felt_tl_pad: np.ndarray | None = None
+                felt_br_pad: np.ndarray | None = None
+                if is_felt_dir and bgr.shape[1] >= bgr.shape[0]:
+                    felt_tl, felt_br = extract_felt_rank_views(bgr)
+                    if felt_tl is not None and felt_br is not None:
+                        felt_tl_pad = cv2.copyMakeBorder(felt_tl, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=255)
+                        felt_br_pad = cv2.copyMakeBorder(felt_br, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=255)
+                entry = TemplateEntry(
+                    rank=token,
+                    val=RANK_TO_VAL[token],
+                    gray=gray,
+                    min_gray=min_g,
+                    bgr=bgr,
+                    felt_tl=felt_tl,
+                    felt_br=felt_br,
+                    felt_tl_pad=felt_tl_pad,
+                    felt_br_pad=felt_br_pad,
+                    name=png.name,
+                )
+                if token == "SHUFFLE":
+                    self.shuffle_templates.append(entry)
+                else:
+                    self.card_templates.append(entry)
+
+
+def _rotate_image(img: np.ndarray, angle_deg: int) -> np.ndarray:
+    if angle_deg == 0:
+        return img
+    h, w = img.shape[:2]
+    mat = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), float(angle_deg), 1.0)
+    return cv2.warpAffine(img, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def _to_gray(bgr_or_gray: np.ndarray) -> np.ndarray:
+    if bgr_or_gray.ndim == 2:
+        return bgr_or_gray
+    return cv2.cvtColor(bgr_or_gray, cv2.COLOR_BGR2GRAY)
+
+
+def match_templates_nms(
+    roi_img: np.ndarray,
+    templates: list[TemplateEntry],
+    threshold: float,
+    min_dx: int,
+    scales: tuple[float, ...] = (1.0,),
+) -> list[CardDetection]:
+    """Run TM_CCOEFF_NORMED across templates and return left-to-right NMS detections."""
+    if roi_img.size == 0 or not templates:
+        return []
+    gray = _to_gray(roi_img)
+    roi_h, roi_w = gray.shape[:2]
+    peaks: list[CardDetection] = []
+
+    for tpl in templates:
+        th, tw = tpl.gray.shape[:2]
+        for sc in scales:
+            sw = max(4, int(round(tw * sc)))
+            sh = max(4, int(round(th * sc)))
+            if sw > roi_w or sh > roi_h:
+                continue
+            scaled = tpl.gray if sc == 1.0 else cv2.resize(tpl.gray, (sw, sh), interpolation=cv2.INTER_AREA)
+            if float(np.std(scaled)) < 1.0:
+                continue
+            res = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(res >= threshold)
+            for y_pos, x_pos in zip(ys.tolist(), xs.tolist()):
+                conf = float(res[y_pos, x_pos])
+                if not np.isfinite(conf):
+                    continue
+                patch = gray[y_pos : y_pos + sh, x_pos : x_pos + sw]
+                if int(patch.max()) - int(patch.min()) < 65 or not np.any(patch > 150) or not np.any(patch < 110):
+                    continue
+                peaks.append(
+                    CardDetection(
+                        rank=tpl.rank,
+                        val=tpl.val,
+                        conf=conf,
+                        x=int(x_pos),
+                        y=int(y_pos),
+                        w=sw,
+                        h=sh,
+                    )
+                )
+
+    if not peaks:
+        return []
+
+    peaks.sort(key=lambda d: d.conf, reverse=True)
+    kept: list[CardDetection] = []
+    min_dy = max(8, int(roi_h * 0.35))
+    for cand in peaks:
+        if any(abs(cand.x - k.x) < min_dx and abs(cand.y - k.y) < min_dy for k in kept):
+            continue
+        kept.append(cand)
+
+    # Sort left-to-right cleanly (grouping vertical rows if split UI stacks slightly)
+    kept.sort(key=lambda d: (d.y // max(12, min_dy), d.x))
+    return kept
+
+
+def _has_local_contrast(patch: np.ndarray, dark_on_white: bool = False) -> bool:
+    """Reject uniform dark/flat patches that match text templates via tiny sensor noise."""
+    if patch.size == 0:
+        return False
+    ptp = int(patch.max()) - int(patch.min())
+    if ptp < 65:
+        return False
+    if dark_on_white:
+        dark_frac = float(np.mean(patch < 115))
+        bright_frac = float(np.mean(patch > 150))
+        return bright_frac >= 0.22 and dark_frac >= 0.020
+    dark_frac = float(np.mean(patch < 95))
+    bright_frac = float(np.mean(patch > 150))
+    return dark_frac >= 0.22 and bright_frac >= 0.025
+
+
+def _get_scaled_tpl_gray(tpl: TemplateEntry, sc: float, use_min_gray: bool = False) -> tuple[np.ndarray, int, int] | None:
+    """Return per-template cached resized grayscale image (avoids re-resizing every frame)."""
+    key = ("g", use_min_gray, sc)
+    if key in tpl._scale_cache:
+        return tpl._scale_cache[key]
+    src = (tpl.min_gray if (use_min_gray and tpl.min_gray is not None) else tpl.gray)
+    th, tw = src.shape[:2]
+    sw = max(4, int(round(tw * sc)))
+    sh = max(4, int(round(th * sc)))
+    interp = cv2.INTER_AREA if sc <= 1.0 else cv2.INTER_CUBIC
+    scaled = src if sc == 1.0 else cv2.resize(src, (sw, sh), interpolation=interp)
+    if float(np.std(scaled)) < 1.0:
+        tpl._scale_cache[key] = None
+        return None
+    val = (scaled, sw, sh)
+    tpl._scale_cache[key] = val
+    return val
+
+
+def detect_best_single_with_scale(
+    roi_img: np.ndarray,
+    templates: list[TemplateEntry],
+    min_conf: float,
+    angles: tuple[int, ...] = (0,),
+    scales: tuple[float, ...] = (1.0,),
+    require_contrast: bool = False,
+    use_min_gray: bool = False,
+) -> tuple[TemplateEntry | None, float, float | None]:
+    """Return (best_tpl, best_conf, best_scale) over candidate angles and scales."""
+    if roi_img.size == 0 or not templates:
+        return None, 0.0, None
+    gray = _to_min_gray(roi_img) if use_min_gray else _to_gray(roi_img)
+    if require_contrast:
+        dark_lim = 115 if use_min_gray else 95
+        if int(gray.max()) - int(gray.min()) < 65 or not np.any(gray > 150) or not np.any(gray < dark_lim):
+            return None, 0.0, None
+    roi_h, roi_w = gray.shape[:2]
+    best_tpl: TemplateEntry | None = None
+    best_conf = 0.0
+    best_scale: float | None = None
+
+    for angle in angles:
+        rotated = _rotate_image(gray, angle)
+        for tpl in templates:
+            for sc in scales:
+                entry = _get_scaled_tpl_gray(tpl, sc, use_min_gray=use_min_gray)
+                if entry is None:
+                    continue
+                scaled, sw, sh = entry
+                if sw > roi_w or sh > roi_h:
+                    continue
+                res = cv2.matchTemplate(rotated, scaled, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                if not np.isfinite(max_val):
+                    continue
+                if require_contrast:
+                    mx, my = int(max_loc[0]), int(max_loc[1])
+                    matched_box = rotated[my : my + sh, mx : mx + sw]
+                    if not _has_local_contrast(matched_box, dark_on_white=use_min_gray):
+                        continue
+                if float(max_val) > best_conf:
+                    best_conf = float(max_val)
+                    best_tpl = tpl
+                    best_scale = sc
+
+    if best_tpl is not None and best_conf >= min_conf:
+        return best_tpl, best_conf, best_scale
+    return None, best_conf, None
+
+
+def detect_best_single(
+    roi_img: np.ndarray,
+    templates: list[TemplateEntry],
+    min_conf: float,
+    angles: tuple[int, ...] = (0,),
+    scales: tuple[float, ...] = (1.0,),
+    require_contrast: bool = False,
+    use_min_gray: bool = False,
+) -> tuple[TemplateEntry | None, float]:
+    """Return best single template match over candidate angles and scales."""
+    tpl, conf, _ = detect_best_single_with_scale(
+        roi_img,
+        templates,
+        min_conf=min_conf,
+        angles=angles,
+        scales=scales,
+        require_contrast=require_contrast,
+        use_min_gray=use_min_gray,
+    )
+    return tpl, conf
+
+
+class FeltBurstMonitor:
+    """Watches physical felt zone (community or dealer) and captures the sharpest frame per card arrival."""
+
+    def __init__(
+        self,
+        cfg: CompanionConfig,
+        felt_bank: TemplateBank,
+        zone: str = "community",
+        fallback_bank: TemplateBank | None = None,
+    ) -> None:
+        self.cfg = cfg
+        self.felt_bank = felt_bank
+        self.zone = zone
+        self.fallback_bank = fallback_bank
+        self._active = False
+        self._start_ts = 0.0
+        self._last_emit_ts = -999.0
+        self._best_frame: np.ndarray | None = None
+        self._best_sharpness = -1.0
+        self._had_contour = False
+        self._active_box: tuple[int, int, int, int] | None = None
+        self._settled_boxes: list[tuple[int, int, int, int]] = []
+        self._empty_frames: int = 0
+
+    def reset(self, clear_settled: bool = True) -> None:
+        self._active = False
+        self._best_frame = None
+        self._best_sharpness = -1.0
+        self._had_contour = False
+        self._active_box = None
+        if clear_settled:
+            self._settled_boxes.clear()
+            self._empty_frames = 0
+
+    @staticmethod
+    def _is_face_up_felt_box(bgr: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
+        """Reject face-down grey/blue hole-card backs (e.g. BACK_1.png) while keeping face-up white cards."""
+        patch_mb = _to_min_gray(bgr[y : y + h, x : x + w])
+        if patch_mb.size == 0 or float(np.mean(patch_mb > 135)) < 0.25:
+            return False
+        ph, pw = patch_mb.shape[:2]
+        inner = patch_mb[2 : max(3, ph - 2), 2 : max(3, pw - 2)]
+        if inner.size == 0:
+            return False
+        return float(np.percentile(inner, 85)) >= 192.0
+
+    @classmethod
+    def _split_wide_felt_box(
+        cls, bgr: np.ndarray, x: int, y: int, w: int, h: int
+    ) -> list[tuple[int, int, int, int]]:
+        """Split a wide horizontal contour containing 2-4 side-by-side landscape felt cards at vertical seams."""
+        if (w / max(1.0, float(h))) < 2.15:
+            return [(x, y, w, h)] if cls._is_face_up_felt_box(bgr, x, y, w, h) else []
+        unit_w = max(22.0, min(33.0, h * 1.62))
+        if w < max(40, int(round(unit_w * 1.55))):
+            return [(x, y, w, h)] if cls._is_face_up_felt_box(bgr, x, y, w, h) else []
+        n_cards = max(2, min(4, int(round(w / unit_w))))
+        mg = _to_min_gray(bgr[y : y + h, x : x + w]).astype(np.float32)
+        col_p75 = np.percentile(mg, 75, axis=0)
+        cuts = [0]
+        for k in range(1, n_cards):
+            expected = int(round(k * w / float(n_cards)))
+            lo = max(cuts[-1] + 16, expected - 7)
+            hi = min(w - 16, expected + 7)
+            cut = (lo + int(np.argmin(col_p75[lo : hi + 1]))) if hi >= lo else expected
+            cuts.append(cut)
+        cuts.append(w)
+        out: list[tuple[int, int, int, int]] = []
+        for idx in range(len(cuts) - 1):
+            sx0, sx1 = cuts[idx], cuts[idx + 1]
+            sw = sx1 - sx0
+            if sw < 14:
+                continue
+            if cls._is_face_up_felt_box(bgr, x + sx0, y, sw, h):
+                out.append((x + sx0, y, sw, h))
+        return out
+
+    def _find_card_contours(self, bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+        """Return valid bright white playing-card bounding boxes inside the felt ROI."""
+        if bgr.size == 0:
+            return []
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        v_min = max(150, self.cfg.felt_motion.min_brightness)
+        mask = cv2.inRange(hsv, (0, 0, v_min), (180, 80, 255))
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []
+        roi_area = float(bgr.shape[0] * bgr.shape[1])
+        rects: list[tuple[int, int, int, int]] = []
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            if area / max(1.0, roi_area) < self.cfg.felt_motion.min_contour_area_ratio:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            if h < 12 or (w / max(1.0, float(h))) > 8.5:
+                continue
+            fill = area / float(max(1, w * h))
+            if fill < 0.25:
+                continue
+            for sub_box in self._split_wide_felt_box(bgr, x, y, w, h):
+                rects.append(sub_box)
+        rects.sort(key=lambda r: (r[1] // 10, r[0]))
+        return rects
+
+    def _select_novel_contour(
+        self, bgr: np.ndarray, rects: list[tuple[int, int, int, int]]
+    ) -> tuple[bool, np.ndarray | None, tuple[int, int, int, int] | None]:
+        """Select a newly arrived or expanded card contour that has not already settled."""
+        if not rects:
+            return False, None, None
+
+        chosen_crop_rect: tuple[int, int, int, int] | None = None
+        chosen_full_rect: tuple[int, int, int, int] | None = None
+
+        for rx, ry, rw, rh in rects:
+            rcx = rx + rw * 0.5
+            rcy = ry + rh * 0.5
+            matched_settled = False
+            for sx, sy, sw, sh in self._settled_boxes:
+                scx = sx + sw * 0.5
+                scy = sy + sh * 0.5
+                if (
+                    abs(rcx - scx) <= 11.0
+                    and abs(rcy - scy) <= 9.0
+                    and abs(rw - sw) <= 12
+                    and abs(rh - sh) <= 10
+                ):
+                    matched_settled = True
+                    break
+                # Check if a new card landed immediately adjacent/overlapping the right side of a settled card
+                if abs(ry - sy) <= 10 and abs(rx - sx) <= 10 and (rw - sw) >= 10:
+                    nx = sx + max(4, sw - 6)
+                    nw = max(12, (rx + rw) - nx)
+                    chosen_crop_rect = (nx, ry, nw, rh)
+                    chosen_full_rect = (rx, ry, rw, rh)
+                    break
+            if chosen_crop_rect is not None:
+                break
+            if not matched_settled:
+                chosen_crop_rect = (rx, ry, rw, rh)
+                chosen_full_rect = (rx, ry, rw, rh)
+                break
+
+        if chosen_crop_rect is None or chosen_full_rect is None:
+            return False, None, None
+
+        x, y, w, h = chosen_crop_rect
+        pad = 3
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(bgr.shape[1], x + w + pad)
+        y1 = min(bgr.shape[0], y + h + pad)
+        return True, bgr[y0:y1, x0:x1], chosen_full_rect
+
+    def _has_card_contour(self, bgr: np.ndarray) -> tuple[bool, np.ndarray | None]:
+        """Backward-compatible helper returning (present, patch) for the primary novel card contour."""
+        rects = self._find_card_contours(bgr)
+        present, patch, _ = self._select_novel_contour(bgr, rects)
+        return present, patch
+
+    def _match_felt_dual_corner(
+        self, frame: np.ndarray, templates: list[TemplateEntry]
+    ) -> tuple[TemplateEntry | None, float]:
+        """Match canonical 32x20 landscape felt card using top-left and 180°-rotated bottom-right rank corners."""
+        dual_tpls = [t for t in templates if t.felt_tl is not None and t.felt_br is not None]
+        if not dual_tpls:
+            return None, 0.0
+        q_tl, q_br = extract_felt_rank_views(frame)
+        if q_tl is None or q_br is None:
+            return None, 0.0
+        pad_tl = cv2.copyMakeBorder(q_tl, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=255)
+        pad_br = cv2.copyMakeBorder(q_br, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=255)
+        best_tpl: TemplateEntry | None = None
+        best_conf = 0.0
+        for tpl in dual_tpls:
+            assert tpl.felt_tl is not None and tpl.felt_br is not None
+            t_tl = tpl.felt_tl[1:-1, 1:-1]
+            t_br = tpl.felt_br[1:-1, 1:-1]
+            m_tl_tl = float(cv2.matchTemplate(pad_tl, t_tl, cv2.TM_CCOEFF_NORMED).max())
+            m_tl_br = float(cv2.matchTemplate(pad_tl, t_br, cv2.TM_CCOEFF_NORMED).max())
+            m_br_tl = float(cv2.matchTemplate(pad_br, t_tl, cv2.TM_CCOEFF_NORMED).max())
+            m_br_br = float(cv2.matchTemplate(pad_br, t_br, cv2.TM_CCOEFF_NORMED).max())
+            best_single = max(m_tl_tl, m_tl_br, m_br_tl, m_br_br)
+            dual = 0.55 * max(m_tl_tl, m_br_br) + 0.45 * min(m_tl_tl, m_br_br)
+            bonus = 0.04 if min(m_tl_tl, m_br_br) >= 0.58 else 0.0
+            score = min(0.99, max(best_single * 0.92, dual) + bonus)
+            if np.isfinite(score) and score > best_conf:
+                best_conf = score
+                best_tpl = tpl
+        if best_tpl is not None and best_conf >= self.cfg.min_felt_confidence:
+            return best_tpl, best_conf
+        return None, best_conf
+
+    def _match_patch(
+        self, frame: np.ndarray, templates: list[TemplateEntry], scales: tuple[float, ...]
+    ) -> tuple[TemplateEntry | None, float]:
+        if not templates or frame.size == 0:
+            return None, 0.0
+        fh, fw = frame.shape[:2]
+        best_tpl: TemplateEntry | None = None
+        best_conf = 0.0
+        if fw >= fh and fh >= 12 and fw >= 18:
+            dtpl, dconf = self._match_felt_dual_corner(frame, templates)
+            if dtpl is not None:
+                return dtpl, dconf
+            best_conf = max(best_conf, dconf)
+
+        angles = tuple(self.cfg.felt_motion.angles_deg)
+        tpl, conf = detect_best_single(
+            frame,
+            templates,
+            min_conf=self.cfg.min_felt_confidence,
+            angles=angles,
+            scales=scales,
+            require_contrast=True,
+            use_min_gray=True,
+        )
+        if tpl is not None and conf > best_conf:
+            best_tpl, best_conf = tpl, conf
+        elif conf > best_conf:
+            best_conf = conf
+        # Also probe top-left corner sub-patch in case full card pip/border dilutes small corner template
+        if fh >= 28 and fw >= 24:
+            corner = frame[: max(20, int(round(fh * 0.58))), : max(18, int(round(fw * 0.58)))]
+            ctpl, cconf = detect_best_single(
+                corner,
+                templates,
+                min_conf=self.cfg.min_felt_confidence,
+                angles=angles,
+                scales=scales,
+                require_contrast=True,
+                use_min_gray=True,
+            )
+            if ctpl is not None and cconf > best_conf:
+                best_tpl, best_conf = ctpl, cconf
+            elif cconf > best_conf:
+                best_conf = cconf
+        return best_tpl, best_conf
+
+    def detect_static_cards(self, bgr: np.ndarray) -> list[CardDetection]:
+        """Detect all static face-up cards currently visible inside a felt ROI snapshot."""
+        if bgr.size == 0:
+            return []
+        rects = self._find_card_contours(bgr)
+        if not rects:
+            return []
+        scales = tuple(self.cfg.felt_motion.scales) if self.cfg.felt_motion.scales else (1.0,)
+        out: list[CardDetection] = []
+        pad = 2
+        for x, y, w, h in rects:
+            x0 = max(0, x - pad)
+            y0 = max(0, y - pad)
+            x1 = min(bgr.shape[1], x + w + pad)
+            y1 = min(bgr.shape[0], y + h + pad)
+            patch = bgr[y0:y1, x0:x1]
+            tpl, conf = self._match_patch(patch, self.felt_bank.card_templates, scales)
+            if tpl is None and self.fallback_bank is not None:
+                fb_tpls = [t for t in self.fallback_bank.card_templates if t.rank != "BACK"]
+                fb_scales = tuple(sorted(set(scales) | {1.0, 1.15, 1.30, 1.45, 1.65}))
+                tpl, conf = self._match_patch(patch, fb_tpls, fb_scales)
+            if tpl is not None and tpl.rank != "BACK":
+                out.append(
+                    CardDetection(
+                        rank=tpl.rank,
+                        val=tpl.val,
+                        conf=conf,
+                        x=int(x),
+                        y=int(y),
+                        w=int(w),
+                        h=int(h),
+                    )
+                )
+        return out
+
+    def _finalize(self, ts: float, settled_in_place: bool = False) -> FeltObservation:
+        frame = self._best_frame
+        sharp = max(0.0, self._best_sharpness)
+        active_box = self._active_box
+        self.reset(clear_settled=not settled_in_place)
+        if settled_in_place and active_box is not None:
+            self._settled_boxes.append(active_box)
+        self._last_emit_ts = ts
+        if frame is None:
+            return FeltObservation(ts=ts, matched=False, rank=None, val=None, conf=0.0, sharpness=sharp, zone=self.zone)
+
+        scales = tuple(self.cfg.felt_motion.scales) if self.cfg.felt_motion.scales else (1.0,)
+        tpl, conf = self._match_patch(frame, self.felt_bank.card_templates, scales)
+        if tpl is None and self.fallback_bank is not None:
+            fb_tpls = [t for t in self.fallback_bank.card_templates if t.rank != "BACK"]
+            fb_scales = tuple(sorted(set(scales) | {1.0, 1.15, 1.30, 1.45, 1.65}))
+            tpl2, conf2 = self._match_patch(frame, fb_tpls, fb_scales)
+            if tpl2 is not None and conf2 >= self.cfg.min_felt_confidence:
+                tpl, conf = tpl2, conf2
+            elif conf2 > conf:
+                conf = conf2
+
+        if tpl is None:
+            return FeltObservation(ts=ts, matched=False, rank=None, val=None, conf=conf, sharpness=sharp, zone=self.zone)
+        return FeltObservation(
+            ts=ts,
+            matched=True,
+            rank=tpl.rank,
+            val=tpl.val,
+            conf=conf,
+            sharpness=sharp,
+            zone=self.zone,
+        )
+
+    def step(self, bgr: np.ndarray, ts: float | None = None) -> FeltObservation | None:
+        """Process one burst frame of felt ROI; emits FeltObservation when a card leaves or settles."""
+        now = ts if ts is not None else time.monotonic()
+        rects = self._find_card_contours(bgr)
+        if not rects:
+            self._empty_frames += 1
+            if self._active:
+                return self._finalize(now, settled_in_place=False)
+            if self._empty_frames >= 2:
+                self._settled_boxes.clear()
+            return None
+
+        self._empty_frames = 0
+        present, patch, full_rect = self._select_novel_contour(bgr, rects)
+
+        if present and patch is not None:
+            if not self._active:
+                if (now - self._last_emit_ts) < self.cfg.felt_motion.pulse_cooldown_sec:
+                    return None
+                self._active = True
+                self._start_ts = now
+                self._best_sharpness = -1.0
+                self._best_frame = None
+            self._active_box = full_rect
+
+            gray = _to_min_gray(patch)
+            sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            if sharp > self._best_sharpness:
+                self._best_sharpness = sharp
+                self._best_frame = patch.copy()
+
+            if (now - self._start_ts) >= self.cfg.felt_motion.settle_timeout_sec:
+                return self._finalize(now, settled_in_place=True)
+            return None
+
+        if self._active:
+            return self._finalize(now, settled_in_place=True)
+        return None
+
+
+def _find_white_card_clusters(roi_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Locate connected white Playtech card clusters inside an ROI, filtering non-card table text."""
+    if roi_bgr.size == 0:
+        return []
+    mb = _to_min_gray(roi_bgr)
+    mask = (mb > 155).astype(np.uint8)
+    num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    raw: list[tuple[int, int, int, int]] = []
+    caps: list[tuple[int, int, int, int]] = []
+    for i in range(1, num):
+        x, y, w, h, area = [int(v) for v in stats[i]]
+        fill = area / float(max(1, w * h))
+        patch_mb = mb[y : y + h, x : x + w]
+        if h < 13 or area < 105:
+            if 8 <= h <= 24 and w >= 5 and area >= 36 and fill >= 0.25 and float(np.mean(patch_mb > 160)) >= 0.25:
+                caps.append((x, y, w, h))
+            continue
+        if (w / max(1.0, float(h)) > 4.0 and fill < 0.45) or fill < 0.19:
+            continue
+        if float(np.mean(patch_mb > 165)) < 0.25:
+            continue
+        raw.append((x, y, w, h))
+    if not raw:
+        return []
+    raw.sort(key=lambda b: b[0])
+    merged: list[tuple[int, int, int, int]] = [raw[0]]
+    for x, y, w, h in raw[1:]:
+        px, py, pw, ph = merged[-1]
+        gap = x - (px + pw)
+        v_ov = min(py + ph, y + h) - max(py, y)
+        if gap <= 2 and v_ov >= int(round(0.55 * min(ph, h))):
+            nx = min(px, x)
+            ny = min(py, y)
+            nr = max(px + pw, x + w)
+            nb = max(py + ph, y + h)
+            merged[-1] = (nx, ny, nr - nx, nb - ny)
+        else:
+            merged.append((x, y, w, h))
+
+    # Merge any top-left white corner cap (where score badge severed the bottom of Card 0) into its right neighbor
+    if caps:
+        for cx, cy, cw, ch in caps:
+            for idx, (px, py, pw, ph) in enumerate(merged):
+                gap = px - (cx + cw)
+                if -2 <= gap <= 4 and abs(cy - py) <= 5 and ch < ph:
+                    nx = min(cx, px)
+                    ny = min(cy, py)
+                    nr = max(cx + cw, px + pw)
+                    nb = max(cy + ch, py + ph)
+                    merged[idx] = (nx, ny, nr - nx, nb - ny)
+                    break
+    return merged
+
+
+def _has_red_back_signature(bgr_patch: np.ndarray) -> bool:
+    """Return True when a BGR patch exhibits Playtech's red-checkered hole card pattern."""
+    if bgr_patch.size == 0 or bgr_patch.ndim != 3:
+        return False
+    b = bgr_patch[:, :, 0].astype(np.int16)
+    g = bgr_patch[:, :, 1].astype(np.int16)
+    r = bgr_patch[:, :, 2].astype(np.int16)
+    red_ratio = float(np.mean((r - np.maximum(b, g)) > 32))
+    dot_ratio = float(np.mean(bgr_patch.min(axis=2) > 150))
+    return red_ratio >= 0.24 and dot_ratio >= 0.10
+
+
+def _classify_suit(
+    norm_bgr: np.ndarray,
+    rank_x: int,
+    rank_w: int,
+    cw_norm: int,
+    suit_templates: list[TemplateEntry],
+) -> tuple[str | None, float]:
+    """Classify card suit (S, H, C, D) from canonical H=45 bottom pip slice directly below rank."""
+    if norm_bgr.ndim != 3 or not suit_templates:
+        return None, 0.0
+    ix0 = max(0, rank_x)
+    ix1 = min(cw_norm, rank_x + max(rank_w, 12))
+    x0 = max(0, rank_x - 3)
+    x1 = min(cw_norm, rank_x + max(rank_w, 16) + 3)
+    ink_zone_bot = norm_bgr[27:45, ix0:ix1]
+    ink_zone_top = norm_bgr[1:19, ix0:ix1]
+    suit_zone = norm_bgr[26:45, x0:x1]
+    if suit_zone.size == 0 or ink_zone_bot.size == 0:
+        return None, 0.0
+
+    # Classify red (H/D) vs black (S/C) strictly by red fraction of ink pixels directly inside card slice
+    def _ink_counts(patch: np.ndarray) -> tuple[int, int]:
+        if patch.size == 0 or patch.ndim != 3:
+            return 0, 0
+        b = patch[:, :, 0].astype(np.int16)
+        g = patch[:, :, 1].astype(np.int16)
+        r = patch[:, :, 2].astype(np.int16)
+        red_px = int(np.sum((r - np.maximum(b, g)) > 32))
+        ink_px = int(np.sum(patch.min(axis=2) < 175))
+        return red_px, ink_px
+
+    rb, ib = _ink_counts(ink_zone_bot)
+    rt, it = _ink_counts(ink_zone_top)
+    red_frac_bot = rb / max(1, ib)
+    red_frac_all = (rb + rt) / max(1, ib + it)
+    is_red = (rb >= 8 and red_frac_bot >= 0.42) or ((rb + rt) >= 12 and red_frac_all >= 0.42)
+    allowed = {"H", "D"} if is_red else {"S", "C"}
+    filtered = [t for t in suit_templates if t.rank in allowed] or suit_templates
+
+    suit_min = _to_min_gray(suit_zone)
+    zh, zw = suit_min.shape[:2]
+    best_suit: str | None = None
+    best_conf = 0.0
+    for tpl in filtered:
+        for sc in (0.88, 0.96, 1.0, 1.06, 1.12):
+            entry = _get_scaled_tpl_gray(tpl, sc, use_min_gray=True)
+            if entry is None:
+                continue
+            scaled, sw, sh = entry
+            if sw > zw or sh > zh:
+                continue
+            res = cv2.matchTemplate(suit_min, scaled, cv2.TM_CCOEFF_NORMED)
+            _, mval, _, _ = cv2.minMaxLoc(res)
+            if np.isfinite(mval) and float(mval) > best_conf:
+                best_conf = float(mval)
+                best_suit = tpl.rank
+
+    if best_suit is not None and best_conf >= 0.56:
+        return best_suit, best_conf
+    return None, best_conf
+
+
+def _detect_cluster_cards(
+    roi_bgr: np.ndarray,
+    cluster: tuple[int, int, int, int],
+    rank_templates: list[TemplateEntry],
+    suit_templates: list[TemplateEntry],
+    floor_conf: float,
+    is_dealer: bool,
+    min_hud_conf: float = 0.84,
+    ref_ch: float | None = None,
+) -> tuple[list[CardDetection], bool]:
+    """Detect cards and suits inside one normalized H=45 white card cluster."""
+    cx, cy, cw, ch = cluster
+    if ref_ch is not None and ch < 0.85 * ref_ch:
+        ch = max(ch, min(roi_bgr.shape[0] - cy, int(round(ref_ch))))
+    edge_clipped = (cx + cw) >= (roi_bgr.shape[1] - 1)
+    cluster_bgr = roi_bgr[cy : cy + ch, cx : cx + cw]
+    if cluster_bgr.size == 0 or not rank_templates:
+        return [], False
+
+    # Trim outer dark border rows before vertical normalization without cropping badge-occluded lower rows
+    cl_mb = _to_min_gray(cluster_bgr)
+    white_rows = np.where(np.mean(cl_mb > 155, axis=1) >= 0.12)[0]
+    if len(white_rows) >= 13 and (int(white_rows[-1]) + 1 - int(white_rows[0])) >= int(round(ch * 0.82)):
+        y_off = int(white_rows[0])
+        y_end = int(white_rows[-1]) + 1
+        cluster_bgr = cluster_bgr[y_off:y_end, :]
+        cy += y_off
+        ch = y_end - y_off
+
+    sc = 45.0 / float(ch)
+    cw_norm = max(1, int(round(cw * sc)))
+    interp = cv2.INTER_CUBIC if sc > 1.0 else cv2.INTER_AREA
+    norm_bgr = cluster_bgr if ch == 45 else cv2.resize(cluster_bgr, (cw_norm, 45), interpolation=interp)
+    norm_top = _to_min_gray(norm_bgr[:23, :])
+
+    eff_right = cw_norm
+    cluster_has_back = False
+    if is_dealer and cw_norm >= 28 and norm_bgr.ndim == 3:
+        # Playtech red-checkered BACK spans rank (10:19), divider gap (19:27), and lower pip (27:36) without white paper
+        band_full = norm_bgr[10:36, :]
+        bf_b = band_full[:, :, 0].astype(np.int16)
+        bf_g = band_full[:, :, 1].astype(np.int16)
+        bf_r = band_full[:, :, 2].astype(np.int16)
+        red_mask = (bf_r - np.maximum(bf_b, bf_g)) > 32
+        red_up = np.mean(red_mask[:9, :], axis=0)
+        red_gap = np.mean(red_mask[9:17, :], axis=0)
+        red_lo = np.mean(red_mask[17:, :], axis=0)
+        white_mid = np.mean(band_full.min(axis=2) > 165, axis=0)
+        for col in range(22, cw_norm - 5):
+            if (
+                float(np.mean(red_gap[col : col + 6])) >= 0.24
+                and float(np.mean(red_up[col : col + 6])) >= 0.20
+                and float(np.mean(red_lo[col : col + 6])) >= 0.20
+                and float(np.mean(white_mid[col : col + 6])) < 0.55
+            ):
+                eff_right = col
+                cluster_has_back = True
+                break
+
+    if eff_right < 14:
+        return [], cluster_has_back
+
+    def _is_back_column(x0: int, sw_check: int) -> bool:
+        if not is_dealer or norm_bgr.ndim != 3:
+            return False
+        mid_chk = norm_bgr[17:31, x0 : min(cw_norm, x0 + max(sw_check, 12))]
+        if mid_chk.size == 0:
+            return False
+        mb = mid_chk[:, :, 0].astype(np.int16)
+        mg = mid_chk[:, :, 1].astype(np.int16)
+        mr = mid_chk[:, :, 2].astype(np.int16)
+        red_r = float(np.mean((mr - np.maximum(mb, mg)) > 32))
+        white_r = float(np.mean(mid_chk.min(axis=2) > 165))
+        return red_r > 0.22 and white_r < 0.55
+
+    min_tail = 14 if (not cluster_has_back and not edge_clipped) else 12
+    peaks: list[tuple[float, CardDetection]] = []
+    roi_h, roi_w = norm_top.shape[:2]
+    for tpl in rank_templates:
+        for tsc in (0.90, 0.96, 1.0, 1.05, 1.10):
+            entry = _get_scaled_rank_tpl_entry(tpl, tsc, masked=False)
+            if entry is None:
+                continue
+            scaled, sw, sh, _, _, _ = entry
+            if sw > roi_w or sh > roi_h:
+                continue
+            max_x_for_tpl = eff_right - max(min_tail, sw)
+            if max_x_for_tpl < 0:
+                continue
+            res = cv2.matchTemplate(norm_top, scaled, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(res >= floor_conf)
+            for y_pos, x_pos in zip(ys.tolist(), xs.tolist()):
+                if y_pos > 8 or x_pos > max_x_for_tpl:
+                    continue
+                conf = float(res[y_pos, x_pos])
+                if not np.isfinite(conf):
+                    continue
+                # Reject dark/red score badges, fade frames, and dark borders lacking crisp paper+ink contrast
+                patch = norm_top[y_pos : y_pos + sh, x_pos : x_pos + sw]
+                if (
+                    float(np.mean(patch > 158)) < 0.26
+                    or (int(patch.max()) - int(patch.min())) < 70
+                    or float(np.mean(patch < 120)) < 0.07
+                ):
+                    continue
+                if _is_back_column(x_pos, sw):
+                    continue
+                priority = conf + (0.015 if tpl.rank == "10" else 0.0)
+                peaks.append(
+                    (
+                        priority,
+                        CardDetection(
+                            rank=tpl.rank,
+                            val=tpl.val,
+                            conf=conf,
+                            x=int(x_pos),
+                            y=int(y_pos),
+                            w=sw,
+                            h=sh,
+                        ),
+                    )
+                )
+
+    if not peaks:
+        kept: list[CardDetection] = []
+    else:
+        peaks.sort(key=lambda item: item[0], reverse=True)
+        kept = []
+        min_dx = 11
+        for _, cand in peaks:
+            if any(abs(cand.x - k.x) < min_dx for k in kept):
+                continue
+            kept.append(cand)
+        kept.sort(key=lambda d: d.x)
+
+    # Masked left-badge recovery when card 0's bottom-left corner is clipped by a circular score badge
+    if (kept and kept[0].x >= 11) or (not kept and cw_norm >= 12):
+        gap_w = kept[0].x if kept else min(20, cw_norm)
+        top_white = float(np.mean(norm_top[1:11, : min(18, gap_w)] > 158))
+        if top_white >= 0.20:
+            best_left: tuple[float, CardDetection] | None = None
+            mask_thr = max(0.75, floor_conf)
+            for tpl in rank_templates:
+                for tsc in (0.90, 0.96, 1.0, 1.05):
+                    entry = _get_scaled_rank_tpl_entry(tpl, tsc, masked=True)
+                    if entry is None:
+                        continue
+                    _, sw, sh, tm_base, t_norm, mask = entry
+                    if sw > norm_top.shape[1] or sh > norm_top.shape[0] or tm_base is None or mask is None:
+                        continue
+                    max_lx = min(8, max(1, gap_w - 10), norm_top.shape[1] - sw + 1)
+                    for y0 in range(0, min(6, norm_top.shape[0] - sh + 1)):
+                        for x0 in range(0, max_lx):
+                            if kept and abs(x0 - kept[0].x) < 11:
+                                continue
+                            p = norm_top[y0 : y0 + sh, x0 : x0 + sw]
+                            pm_raw = p[mask]
+                            if (
+                                pm_raw.size == 0
+                                or float(np.mean(pm_raw > 155)) < 0.24
+                                or (int(pm_raw.max()) - int(pm_raw.min())) < 65
+                                or float(np.mean(pm_raw < 125)) < 0.07
+                                or _is_back_column(x0, sw)
+                            ):
+                                continue
+                            pm = pm_raw.astype(np.float32)
+                            pm -= float(pm.mean())
+                            denom = float(np.linalg.norm(pm)) * t_norm
+                            sc_masked = float(np.dot(pm, tm_base) / denom) if denom > 1e-5 else 0.0
+                            prio = sc_masked + (0.015 if tpl.rank == "10" else 0.0)
+                            if sc_masked >= mask_thr and (best_left is None or prio > best_left[0]):
+                                best_left = (
+                                    prio,
+                                    CardDetection(
+                                        rank=tpl.rank,
+                                        val=tpl.val,
+                                        conf=sc_masked,
+                                        x=int(x0),
+                                        y=int(y0),
+                                        w=sw,
+                                        h=sh,
+                                    ),
+                                )
+            if best_left is not None:
+                kept.insert(0, best_left[1])
+
+    if not kept:
+        return [], cluster_has_back
+
+    out: list[CardDetection] = []
+    for d in kept:
+        suit, suit_conf = _classify_suit(norm_bgr, d.x, d.w, cw_norm, suit_templates)
+        if suit_templates:
+            sx0 = max(0, d.x - 2)
+            sx1 = min(cw_norm, d.x + max(d.w, 14) + 2)
+            sz = _to_min_gray(norm_bgr[26:45, sx0:sx1]) if norm_bgr.shape[0] >= 40 else np.empty((0, 0), dtype=np.uint8)
+            has_pip_body = (
+                sz.size > 0
+                and float(np.mean(sz > 155)) >= 0.30
+                and int(np.sum(sz < 145)) >= 5
+            )
+            # Score badge on player Card 0 covers lower-left (rows 26:45) with dark badge pixels
+            has_badge_occlusion = (
+                not is_dealer
+                and d.x <= 9
+                and sz.size > 0
+                and float(np.mean(sz < 140)) >= 0.25
+                and d.conf >= max(0.75, floor_conf)
+            )
+            if (not cluster_has_back and not edge_clipped) and not has_badge_occlusion:
+                rem_right = eff_right - d.x
+                if rem_right < 15:
+                    if d.conf < max(0.84, min_hud_conf) or (suit is None and not has_pip_body):
+                        continue
+                elif rem_right < 22:
+                    if d.conf < max(0.78, min_hud_conf - 0.06):
+                        continue
+                    if suit is None and (not has_pip_body or d.conf < max(0.82, min_hud_conf - 0.02)):
+                        continue
+            if suit is None and not has_badge_occlusion:
+                if not has_pip_body or suit_conf < 0.42 or d.conf < max(0.82, min_hud_conf - 0.02):
+                    continue
+            elif suit is not None and d.conf < max(0.78, min_hud_conf - 0.06) and suit_conf < 0.60:
+                continue
+        out.append(
+            CardDetection(
+                rank=d.rank,
+                val=d.val,
+                conf=d.conf,
+                x=cx + int(round(d.x / sc)),
+                y=cy + int(round(d.y / sc)),
+                w=max(4, int(round(d.w / sc))),
+                h=max(4, int(round(d.h / sc))),
+                suit=suit,
+                hand_index=0,
+            )
+        )
+    return out, cluster_has_back
+
+
+_RANK_SCALE_CACHE: dict[tuple[int, float, bool], tuple[np.ndarray, int, int, np.ndarray | None, float] | None] = {}
+
+
+def _get_scaled_rank_tpl_entry(
+    tpl: TemplateEntry, tsc: float, masked: bool = False
+) -> tuple[np.ndarray, int, int, np.ndarray | None, float, np.ndarray | None] | None:
+    """Return cached resized rank template (and precomputed corner mask/vector when masked=True)."""
+    key = ("r", tsc, masked)
+    if key in tpl._scale_cache:
+        return tpl._scale_cache[key]
+    t_img = tpl.min_gray if tpl.min_gray is not None else tpl.gray
+    th, tw = t_img.shape[:2]
+    sw = max(4, int(round(tw * tsc)))
+    sh = max(4, int(round(th * tsc)))
+    t_interp = cv2.INTER_AREA if tsc < 1.0 else cv2.INTER_CUBIC
+    scaled = t_img if tsc == 1.0 else cv2.resize(t_img, (sw, sh), interpolation=t_interp)
+    if float(np.std(scaled)) < 1.0:
+        tpl._scale_cache[key] = None
+        return None
+    if not masked:
+        val = (scaled, sw, sh, None, 0.0, None)
+        tpl._scale_cache[key] = val
+        return val
+    mask = np.ones((sh, sw), dtype=bool)
+    if sh > 8 and sw > 7:
+        mask[8:, :7] = False
+    tm_base = scaled[mask].astype(np.float32)
+    tm_base -= float(tm_base.mean())
+    t_norm = float(np.linalg.norm(tm_base))
+    if t_norm < 1e-5:
+        tpl._scale_cache[key] = None
+        return None
+    val = (scaled, sw, sh, tm_base, t_norm, mask)
+    tpl._scale_cache[key] = val
+    return val
+
+
+def _get_scaled_rank_tpl(
+    t_img: np.ndarray, tsc: float, masked: bool = False
+) -> tuple[np.ndarray, int, int, np.ndarray | None, float] | None:
+    """Backward-compatible wrapper for cached scaled rank templates."""
+    key = (id(t_img), tsc, masked)
+    cached = _RANK_SCALE_CACHE.get(key)
+    if cached is not None or key in _RANK_SCALE_CACHE:
+        return cached
+    th, tw = t_img.shape[:2]
+    sw = max(4, int(round(tw * tsc)))
+    sh = max(4, int(round(th * tsc)))
+    t_interp = cv2.INTER_AREA if tsc < 1.0 else cv2.INTER_CUBIC
+    scaled = t_img if tsc == 1.0 else cv2.resize(t_img, (sw, sh), interpolation=t_interp)
+    if float(np.std(scaled)) < 1.0:
+        _RANK_SCALE_CACHE[key] = None
+        return None
+    if not masked:
+        val = (scaled, sw, sh, None, 0.0)
+        _RANK_SCALE_CACHE[key] = val
+        return val
+    mask = np.ones((sh, sw), dtype=bool)
+    if sh > 8 and sw > 7:
+        mask[8:, :7] = False
+    tm_base = scaled[mask].astype(np.float32)
+    tm_base -= float(tm_base.mean())
+    t_norm = float(np.linalg.norm(tm_base))
+    if t_norm < 1e-5:
+        _RANK_SCALE_CACHE[key] = None
+        return None
+    val = (scaled, sw, sh, tm_base, t_norm)
+    _RANK_SCALE_CACHE[key] = val
+    return val
+
+
+_TOP_BANNER_SCALES = (
+    0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15,
+    1.21, 1.27, 1.33, 1.40, 1.48, 1.56, 1.65, 1.75, 1.85, 1.96, 2.08, 2.22, 2.38, 2.55,
+)
+_CENTER_BANNER_SCALES = (0.75, 0.88, 0.95, 1.0, 1.12, 1.25, 1.45, 1.65, 1.85, 2.05, 2.35)
+_PLACE_BETS_SCALES = (
+    0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.12, 1.20,
+    1.28, 1.36, 1.45, 1.56, 1.68, 1.80, 1.85, 1.95, 2.08, 2.25, 2.45,
+)
+
+
+class PlaytechDetector:
+    """Combines normalized HUD rank/suit detection with felt burst tracking and banner detection."""
+
+    def __init__(self, cfg: CompanionConfig, templates_root: Path | None = None) -> None:
+        self.cfg = cfg
+        root = templates_root or (COMPANION_DIR / "templates")
+        self.hud_bank = TemplateBank(root / "hud")
+        self.felt_bank = TemplateBank(root / "felt")
+        self.banner_bank = TemplateBank(root / "banner")
+        self.suit_bank = TemplateBank(root / "suit")
+        self.felt_monitor = FeltBurstMonitor(cfg, self.felt_bank, zone="community", fallback_bank=self.hud_bank)
+        self.dealer_felt_monitor = FeltBurstMonitor(cfg, self.felt_bank, zone="dealer", fallback_bank=self.hud_bank)
+        self._last_p_sig: bytes | None = None
+        self._last_d_sig: bytes | None = None
+        self._last_banner_sig: bytes | None = None
+        self._last_pb_sig: bytes | None = None
+        self._last_shuffle_sig: bytes | None = None
+        self._last_center_sig: bytes | None = None
+        self._last_shuffle_scan_ts: float = -999.0
+        self._last_center_scan_ts: float = -999.0
+        self._banner_scale_hint: float | None = None
+        self._banner_tpl_hints: dict[str, tuple[str, float]] = {}
+        self._cached_p: tuple[list[CardDetection], dict[int, list[CardDetection]], bool] = ([], {}, False)
+        self._cached_d: list[CardDetection] = []
+        self._cached_top_banner: tuple[str, float] = ("", 0.0)
+        self._cached_pb: tuple[float, bool] = (0.0, False)
+        self._cached_shuf: tuple[bool, float, str, float] = (False, 0.0, "", 0.0)
+        self._last_shuf_mode: tuple[bool, bool] = (False, False)
+        self._cached_center_banner: tuple[str, float, bool] = ("", 0.0, False)
+        self._cached_b: tuple[bool, float, str, float, float, str] = (False, 0.0, "", 0.0, 0.0, "")
+
+    @property
+    def _last_hud_hash(self) -> tuple[bytes | None, bytes | None, bytes | None, bytes | None] | None:
+        if (
+            self._last_p_sig is None
+            and self._last_d_sig is None
+            and self._last_banner_sig is None
+            and self._last_shuffle_sig is None
+        ):
+            return None
+        return (self._last_p_sig, self._last_d_sig, self._last_banner_sig, self._last_shuffle_sig)
+
+    @_last_hud_hash.setter
+    def _last_hud_hash(self, val: Any) -> None:
+        if val is None:
+            self.invalidate_cache()
+        elif isinstance(val, tuple) and len(val) == 4:
+            self._last_p_sig, self._last_d_sig, self._last_banner_sig, self._last_shuffle_sig = val
+        elif isinstance(val, tuple) and len(val) == 3:
+            self._last_p_sig, self._last_d_sig, self._last_banner_sig = val
+
+    def invalidate_cache(self, reset_scale_hint: bool = False) -> None:
+        self._last_p_sig = None
+        self._last_d_sig = None
+        self._last_banner_sig = None
+        self._last_pb_sig = None
+        self._last_shuffle_sig = None
+        self._last_center_sig = None
+        self._last_shuffle_scan_ts = -999.0
+        self._last_center_scan_ts = -999.0
+        self._cached_p = ([], {}, False)
+        self._cached_d = []
+        self._cached_top_banner = ("", 0.0)
+        self._cached_pb = (0.0, False)
+        self._cached_shuf = (False, 0.0, "", 0.0)
+        self._last_shuf_mode = (False, False)
+        self._cached_center_banner = ("", 0.0, False)
+        self._cached_b = (False, 0.0, "", 0.0, 0.0, "")
+        if reset_scale_hint:
+            self._banner_scale_hint = None
+            self._banner_tpl_hints.clear()
+
+    def is_center_scan_due(self, ts: float, cards_present: bool) -> bool:
+        """Return True when center betting-banner probe should run."""
+        return (not cards_present) or ((ts - self._last_center_scan_ts) >= 0.22)
+
+    def _detect_banner_with_hint(
+        self,
+        probe_img: np.ndarray,
+        templates: list[TemplateEntry],
+        min_conf: float,
+        scales: tuple[float, ...],
+        hint_key: str = "banner",
+    ) -> tuple[TemplateEntry | None, float]:
+        """Probe last matched (template, scale) first for speed, then scan all templates/scales cleanly."""
+        if not templates or probe_img.size == 0:
+            return None, 0.0
+        cached_hint = self._banner_tpl_hints.get(hint_key)
+        if cached_hint is not None and len(scales) > 6:
+            hint_name, hint_scale = cached_hint
+            hint_tpls = [t for t in templates if t.name == hint_name]
+            fast_scales = tuple(s for s in scales if abs(s - hint_scale) <= 0.10)
+            if hint_tpls and fast_scales:
+                ftpl, fconf, fscale = detect_best_single_with_scale(
+                    probe_img,
+                    hint_tpls,
+                    min_conf=min_conf,
+                    scales=fast_scales,
+                    require_contrast=True,
+                )
+                if ftpl is not None and fconf >= max(min_conf, 0.85):
+                    if fscale is not None:
+                        self._banner_tpl_hints[hint_key] = (ftpl.name, fscale)
+                        self._banner_scale_hint = fscale
+                    return ftpl, fconf
+
+        best_tpl, best_conf, best_scale = detect_best_single_with_scale(
+            probe_img,
+            templates,
+            min_conf=min_conf,
+            scales=scales,
+            require_contrast=True,
+        )
+        if best_tpl is not None and best_scale is not None:
+            self._banner_tpl_hints[hint_key] = (best_tpl.name, best_scale)
+            if len(scales) > 6:
+                self._banner_scale_hint = best_scale
+        return best_tpl, best_conf
+
+    def reload_templates(self) -> None:
+        self.hud_bank.reload()
+        self.felt_bank.reload()
+        self.banner_bank.reload()
+        self.suit_bank.reload()
+        self.invalidate_cache()
+
+    def _detect_hud_strip(
+        self, roi_img: np.ndarray, is_dealer: bool
+    ) -> tuple[list[CardDetection], dict[int, list[CardDetection]], bool]:
+        """Detect cards, suits, and optional horizontal splits inside player or dealer HUD ROI."""
+        if roi_img.size == 0 or not self.hud_bank.card_templates:
+            return [], {}, False
+
+        floor_conf = max(0.68, self.cfg.min_hud_confidence - 0.10)
+        rank_tpls = [t for t in self.hud_bank.card_templates if t.rank != "BACK"]
+        med_tpl_h = float(np.median([t.gray.shape[0] for t in rank_tpls])) if rank_tpls else 20.0
+        clusters = _find_white_card_clusters(roi_img) if med_tpl_h <= 23.0 else []
+
+        if clusters:
+            cluster_hits: list[tuple[tuple[int, int, int, int], list[CardDetection]]] = []
+            back_seen = False
+            ref_ch = float(max(cl[3] for cl in clusters)) if len(clusters) >= 2 else None
+            for cl in clusters:
+                dets, cl_back = _detect_cluster_cards(
+                    roi_img,
+                    cl,
+                    rank_tpls,
+                    self.suit_bank.suit_templates,
+                    floor_conf,
+                    is_dealer=is_dealer,
+                    min_hud_conf=self.cfg.min_hud_confidence,
+                    ref_ch=ref_ch,
+                )
+                back_seen = back_seen or cl_back
+                if dets:
+                    cluster_hits.append((cl, dets))
+
+            if cluster_hits:
+                if is_dealer:
+                    flat_d = [d for _, ds in cluster_hits for d in ds]
+                    flat_d.sort(key=lambda d: d.x)
+                    if len(flat_d) == 1:
+                        last_cl, _ = cluster_hits[-1]
+                        cx, cy, cw, ch = last_cl
+                        # Also probe immediately right of white upcard cluster for detached red-checkered BACK card
+                        if not back_seen and roi_img.ndim == 3:
+                            rx0 = min(roi_img.shape[1], cx + cw)
+                            rx1 = min(roi_img.shape[1], rx0 + max(14, int(round(ch * 0.72))))
+                            if rx1 - rx0 >= 8:
+                                back_seen = _has_red_back_signature(roi_img[cy : min(roi_img.shape[0], cy + ch), rx0:rx1])
+                        if back_seen:
+                            flat_d.append(
+                                CardDetection(
+                                    rank="BACK",
+                                    val=None,
+                                    conf=0.92,
+                                    x=cx + cw,
+                                    y=cy,
+                                    w=max(10, int(round(ch * 0.65))),
+                                    h=ch,
+                                )
+                            )
+                    return flat_d, {0: flat_d}, False
+
+                # Player horizontal multi-cluster split grouping
+                avg_ch = float(np.mean([cl[3] for cl, _ in cluster_hits]))
+                cl_sep_thr = max(4, int(round(avg_ch * 0.30)))
+                card_sep_thr = max(10, int(round(avg_ch * 0.60)))
+                hands: dict[int, list[CardDetection]] = {}
+                all_p: list[CardDetection] = []
+                cur_hand = 0
+                prev_cl: tuple[int, int, int, int] | None = None
+
+                for cl, ds in cluster_hits:
+                    if prev_cl is not None:
+                        cl_gap = cl[0] - (prev_cl[0] + prev_cl[2])
+                        if cl_gap >= cl_sep_thr:
+                            cur_hand += 1
+                    ds_sorted = sorted(ds, key=lambda d: d.x)
+                    for idx, det in enumerate(ds_sorted):
+                        if idx > 0 and (det.x - (ds_sorted[idx - 1].x + ds_sorted[idx - 1].w)) >= card_sep_thr:
+                            cur_hand += 1
+                        tagged = CardDetection(
+                            rank=det.rank,
+                            val=det.val,
+                            conf=det.conf,
+                            x=det.x,
+                            y=det.y,
+                            w=det.w,
+                            h=det.h,
+                            suit=det.suit,
+                            hand_index=cur_hand,
+                        )
+                        hands.setdefault(cur_hand, []).append(tagged)
+                        all_p.append(tagged)
+                    prev_cl = cl
+
+                return all_p, hands, len(hands) >= 2
+
+        # Fallback to direct unscaled NMS matching ONLY for legacy un-trimmed synthetic full-card templates (>23px tall)
+        if med_tpl_h <= 23.0:
+            return [], {}, False
+        min_dx_ratio = 4.2 if is_dealer else 3.8
+        dx = max(8, int(round(roi_img.shape[1] * (self.cfg.hud_nms_min_dx_ratio * min_dx_ratio))))
+        fallback = match_templates_nms(
+            roi_img, self.hud_bank.card_templates, floor_conf, min_dx=dx, scales=(0.94, 1.0, 1.06)
+        )
+        hands_fb: dict[int, list[CardDetection]] = {0: fallback} if fallback else {}
+        split_fb = False
+        if not is_dealer and len(fallback) >= 2 and roi_img.size:
+            max_gap = max(fallback[i + 1].x - fallback[i].x for i in range(len(fallback) - 1))
+            if max_gap > roi_img.shape[1] * 0.36:
+                split_fb = True
+        return fallback, hands_fb, split_fb
+
+    def process_crops(
+        self,
+        player_img: np.ndarray,
+        dealer_img: np.ndarray,
+        community_img: np.ndarray | None = None,
+        shuffle_img: np.ndarray | None = None,
+        banner_img: np.ndarray | None = None,
+        ts: float | None = None,
+        hud_refreshed: bool = True,
+        center_img: np.ndarray | None = None,
+        player_refreshed: bool = True,
+        dealer_refreshed: bool = True,
+        banner_refreshed: bool = True,
+        dealer_only: bool = False,
+        dealer_felt_img: np.ndarray | None = None,
+        place_bets_img: np.ndarray | None = None,
+    ) -> FrameObservation:
+        """Analyze cropped ROIs and return detections for a single tick."""
+        now = ts if ts is not None else time.monotonic()
+
+        if player_refreshed:
+            p_sig = (
+                cv2.resize(_to_min_gray(player_img), (96, 32), interpolation=cv2.INTER_AREA).tobytes()
+                if player_img.size
+                else b""
+            )
+            if p_sig == self._last_p_sig:
+                p_cards, p_hands, split_detected = self._cached_p
+            else:
+                self._last_p_sig = p_sig
+                p_cards, p_hands, split_detected = self._detect_hud_strip(player_img, is_dealer=False)
+                self._cached_p = (p_cards, p_hands, split_detected)
+        else:
+            p_cards, p_hands, split_detected = self._cached_p
+
+        if dealer_refreshed:
+            d_sig = (
+                cv2.resize(_to_min_gray(dealer_img), (80, 36), interpolation=cv2.INTER_AREA).tobytes()
+                if dealer_img.size
+                else b""
+            )
+            if d_sig == self._last_d_sig:
+                d_cards = self._cached_d
+            else:
+                self._last_d_sig = d_sig
+                d_cards, _, _ = self._detect_hud_strip(dealer_img, is_dealer=True)
+                self._cached_d = d_cards
+        else:
+            d_cards = self._cached_d
+
+        cards_present = bool(p_cards or d_cards)
+
+        if banner_refreshed:
+            # 1. Top banner_roi check (WAIT / LAST_BETS / NO_MORE_BETS / SHUFFLE; also supports legacy tall banner_roi)
+            has_sep_pb = place_bets_img is not None and place_bets_img.size > 0
+            ban_sig_h = 32 if (not has_sep_pb and banner_img is not None and banner_img.size and banner_img.shape[0] >= 80) else 16
+            ban_sig = (
+                cv2.resize(_to_gray(banner_img), (64, ban_sig_h), interpolation=cv2.INTER_AREA).tobytes()
+                if (banner_img is not None and banner_img.size)
+                else b""
+            )
+            if ban_sig == self._last_banner_sig:
+                top_banner_state, top_banner_conf = self._cached_top_banner
+            else:
+                self._last_banner_sig = ban_sig
+                top_banner_state = ""
+                top_banner_conf = 0.0
+                if banner_img is not None and banner_img.size and self.banner_bank.banner_templates:
+                    bh = banner_img.shape[0]
+                    is_tall_banner = (not has_sep_pb) and (bh >= 55) and (self.cfg.rois.get("banner_roi", (0.0, 0.0, 0.0, 0.0))[3] >= 0.18)
+                    if is_tall_banner:
+                        top_h = max(32, min(bh, int(round(bh * 0.35))))
+                        top_strip = banner_img[:top_h, :]
+                        btpl, bconf = self._detect_banner_with_hint(
+                            top_strip,
+                            self.banner_bank.banner_templates,
+                            self.cfg.min_banner_confidence,
+                            _TOP_BANNER_SCALES,
+                            hint_key="top_strip",
+                        )
+                        if btpl is None:
+                            lower_strip = banner_img[max(0, top_h - 12) :, :]
+                            center_tpls = [
+                                t
+                                for t in self.banner_bank.banner_templates
+                                if t.rank in ("PLACE_BETS", "LAST_BETS", "NO_MORE_BETS", "SHUFFLE")
+                            ]
+                            if center_tpls and lower_strip.size:
+                                btpl, bconf = self._detect_banner_with_hint(
+                                    lower_strip,
+                                    center_tpls,
+                                    self.cfg.min_banner_confidence,
+                                    _TOP_BANNER_SCALES,
+                                    hint_key="lower_strip",
+                                )
+                    else:
+                        btpl, bconf = self._detect_banner_with_hint(
+                            banner_img,
+                            self.banner_bank.banner_templates,
+                            self.cfg.min_banner_confidence,
+                            _TOP_BANNER_SCALES,
+                            hint_key="banner",
+                        )
+                    if btpl is not None:
+                        top_banner_state = btpl.rank
+                        top_banner_conf = bconf
+                self._cached_top_banner = (top_banner_state, top_banner_conf)
+
+            # 2. Independent shuffle_roi check (throttled during active cards so video noise doesn't choke FPS)
+            shuf_due = (not cards_present) or ((now - self._last_shuffle_scan_ts) >= 0.18)
+            shuf_mode = (cards_present, bool(top_banner_state))
+            if shuffle_img is not None and shuffle_img.size and shuf_due:
+                shuf_sig = cv2.resize(_to_gray(shuffle_img), (32, 20), interpolation=cv2.INTER_AREA).tobytes()
+                if shuf_sig == self._last_shuffle_sig and self._last_shuf_mode == shuf_mode:
+                    shuf_on, shuf_conf, shuf_ban_state, shuf_ban_conf = self._cached_shuf
+                else:
+                    self._last_shuffle_sig = shuf_sig
+                    self._last_shuf_mode = shuf_mode
+                    self._last_shuffle_scan_ts = now
+                    shuf_on = False
+                    shuf_conf = 0.0
+                    if self.hud_bank.shuffle_templates:
+                        stpl, sconf = detect_best_single(shuffle_img, self.hud_bank.shuffle_templates, min_conf=0.78)
+                        shuf_on = stpl is not None
+                        shuf_conf = sconf
+                    shuf_ban_state = ""
+                    shuf_ban_conf = 0.0
+                    if not top_banner_state and self.banner_bank.banner_templates:
+                        shuf_tpls = (
+                            [t for t in self.banner_bank.banner_templates if t.rank in ("SHUFFLE", "WAIT")]
+                            if cards_present
+                            else self.banner_bank.banner_templates
+                        )
+                        if shuf_tpls:
+                            btpl, bconf = self._detect_banner_with_hint(
+                                shuffle_img,
+                                shuf_tpls,
+                                self.cfg.min_banner_confidence,
+                                _TOP_BANNER_SCALES,
+                                hint_key="shuffle",
+                            )
+                            if btpl is not None:
+                                shuf_ban_state = btpl.rank
+                                shuf_ban_conf = bconf
+                    self._cached_shuf = (shuf_on, shuf_conf, shuf_ban_state, shuf_ban_conf)
+            else:
+                shuf_on, shuf_conf, shuf_ban_state, shuf_ban_conf = self._cached_shuf
+
+            banner_state = top_banner_state
+            banner_conf = top_banner_conf
+            banner_source = "banner_roi" if top_banner_state else ""
+            if not banner_state and shuf_ban_state:
+                if not cards_present or shuf_ban_state in ("SHUFFLE", "WAIT"):
+                    banner_state = shuf_ban_state
+                    banner_conf = shuf_ban_conf
+                    banner_source = "shuffle_roi"
+
+            # 3. Dedicated tight place_bets_roi check (runs clean full-res center probe when no cards present)
+            pb_conf = 0.0
+            if has_sep_pb and not cards_present and self.banner_bank.banner_templates:
+                pb_tpls = [t for t in self.banner_bank.banner_templates if t.rank == "PLACE_BETS"]
+                if pb_tpls:
+                    pb_sig = cv2.resize(_to_gray(place_bets_img), (48, 16), interpolation=cv2.INTER_AREA).tobytes()
+                    if pb_sig == self._last_pb_sig and not self._cached_pb[1]:
+                        pb_conf, _ = self._cached_pb
+                    else:
+                        self._last_pb_sig = pb_sig
+                        pb_min_conf = max(0.66, self.cfg.min_banner_confidence - 0.02)
+                        ptpl, pconf = self._detect_banner_with_hint(
+                            place_bets_img,
+                            pb_tpls,
+                            pb_min_conf,
+                            _PLACE_BETS_SCALES,
+                            hint_key="place_bets",
+                        )
+                        pb_conf = pconf if ptpl is not None else 0.0
+                        self._cached_pb = (pb_conf, False)
+                    if pb_conf > 0.0 and not banner_state:
+                        banner_state = "PLACE_BETS"
+                        banner_conf = pb_conf
+                        banner_source = "place_bets_roi"
+            else:
+                self._cached_pb = (0.0, cards_present)
+
+            # 4. Fallback throttled center probe (only when top, shuffle, and place_bets_roi are empty)
+            center_due = self.is_center_scan_due(now, cards_present)
+            if not banner_state and not has_sep_pb and self.banner_bank.banner_templates and center_due and center_img is not None and center_img.size:
+                c_sig = cv2.resize(_to_gray(center_img), (36, 18), interpolation=cv2.INTER_AREA).tobytes()
+                if c_sig == self._last_center_sig and self._cached_center_banner[2] == cards_present:
+                    c_st, c_cf, _ = self._cached_center_banner
+                    banner_state, banner_conf = c_st, c_cf
+                    if c_st:
+                        banner_source = "center_probe"
+                else:
+                    self._last_center_sig = c_sig
+                    self._last_center_scan_ts = now
+                    allowed_center = ("SHUFFLE",) if cards_present else ("PLACE_BETS", "LAST_BETS", "NO_MORE_BETS", "SHUFFLE")
+                    tall_tpls = [t for t in self.banner_bank.banner_templates if t.rank in allowed_center and t.gray.shape[0] >= 10]
+                    thin_tpls = [t for t in self.banner_bank.banner_templates if t.rank in allowed_center and t.gray.shape[0] < 10]
+                    c_st = ""
+                    c_cf = 0.0
+                    for group_tpls, min_c in (
+                        (tall_tpls, max(self.cfg.min_banner_confidence, 0.78)),
+                        (thin_tpls, max(self.cfg.min_banner_confidence, 0.78)),
+                    ):
+                        if not group_tpls:
+                            continue
+                        btpl, bconf = detect_best_single(
+                            center_img,
+                            group_tpls,
+                            min_conf=min_c,
+                            scales=_CENTER_BANNER_SCALES,
+                            require_contrast=True,
+                        )
+                        if btpl is not None and bconf > c_cf:
+                            c_st = btpl.rank
+                            c_cf = bconf
+                    self._cached_center_banner = (c_st, c_cf, cards_present)
+                    if c_st:
+                        banner_state = c_st
+                        banner_conf = c_cf
+                        banner_source = "center_probe"
+            elif not banner_state and not has_sep_pb:
+                c_st, c_cf, _ = self._cached_center_banner
+                if c_st and (not cards_present or c_st == "SHUFFLE"):
+                    banner_state, banner_conf = c_st, c_cf
+                    banner_source = "center_probe"
+
+            if banner_state == "SHUFFLE":
+                shuf_on = True
+                shuf_conf = max(shuf_conf, banner_conf)
+
+            self._cached_b = (shuf_on, shuf_conf, banner_state, banner_conf, pb_conf, banner_source)
+        else:
+            shuf_on, shuf_conf, banner_state, banner_conf, pb_conf, banner_source = self._cached_b
+
+        felt_events: list[FeltObservation] = []
+        if self.cfg.enable_felt_community and community_img is not None and community_img.size:
+            obs = self.felt_monitor.step(community_img, ts=now)
+            if obs is not None:
+                felt_events.append(obs)
+        if (
+            (self.cfg.enable_felt_community or self.cfg.enable_dealer_felt_fallback)
+            and dealer_felt_img is not None
+            and dealer_felt_img.size
+        ):
+            d_obs = self.dealer_felt_monitor.step(dealer_felt_img, ts=now)
+            if d_obs is not None:
+                felt_events.append(d_obs)
+
+        return FrameObservation(
+            ts=now,
+            player_cards=list(p_cards),
+            dealer_cards=list(d_cards),
+            player_hands={k: list(v) for k, v in p_hands.items()},
+            felt_events=felt_events,
+            banner_state=banner_state,
+            banner_conf=banner_conf,
+            shuffle_active=shuf_on,
+            shuffle_conf=shuf_conf,
+            split_detected=split_detected,
+            hud_refreshed=hud_refreshed,
+            dealer_only=dealer_only,
+            place_bets_conf=pb_conf,
+            banner_source=banner_source,
+        )
