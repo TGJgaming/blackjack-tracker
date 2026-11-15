@@ -178,4 +178,61 @@ const kaEvts = ka.step({
 });
 assert(refreshed && kaEvts.some((e) => e.event === "refreshing"), "Keepalive should trigger Safari reload during PLACE_BETS");
 
+console.log("5. Testing fromRGBA & IpadCompanionRuntime.ingestRGBA (non-square w != h)...");
+const emptyBadRgba = Engine.fromRGBA(null, 10, 10);
+assert.strictEqual(emptyBadRgba.w, 0, "Null RGBA should safely return empty image");
+const shortRgba = Engine.fromRGBA(new Uint8Array(8), 4, 4);
+assert.strictEqual(shortRgba.w, 0, "Short RGBA buffer should safely return empty image");
+
+const nonSqW = 5, nonSqH = 3;
+const testRgba = new Uint8Array(nonSqW * nonSqH * 4);
+for (let i = 0; i < nonSqW * nonSqH; i++) {
+  testRgba[i * 4] = 200;     // R
+  testRgba[i * 4 + 1] = 100; // G
+  testRgba[i * 4 + 2] = 50;  // B
+  testRgba[i * 4 + 3] = 255; // A
+}
+const bgrConv = Engine.fromRGBA(testRgba, nonSqW, nonSqH);
+assert.strictEqual(bgrConv.w, nonSqW);
+assert.strictEqual(bgrConv.h, nonSqH);
+assert.strictEqual(bgrConv.data[0], 50, "Channel 0 must be B");
+assert.strictEqual(bgrConv.data[1], 100, "Channel 1 must be G");
+assert.strictEqual(bgrConv.data[2], 200, "Channel 2 must be R");
+
+// Build non-square 1200x900 RGBA Split-View frame with left 16:9 game viewport + dark divider
+const rtW = 1200, rtH = 900;
+const rtRgba = new Uint8Array(rtW * rtH * 4);
+for (let y = 0; y < rtH; y++) {
+  for (let x = 0; x < rtW; x++) {
+    const p = (y * rtW + x) * 4;
+    let r = 8, g = 8, b = 10;
+    if (x < 720 && y >= 180 && y < 585) {
+      r = 40 + ((x * 13 + y * 7) % 85);
+      g = 65 + ((x * 5 + y * 11) % 110);
+      b = 35 + ((x * 7 + y * 3) % 90);
+    } else if (x >= 720 && x < 732) {
+      r = 2; g = 2; b = 2;
+    } else if (x >= 732) {
+      r = 48; g = 34; b = 28;
+    }
+    rtRgba[p] = r;
+    rtRgba[p + 1] = g;
+    rtRgba[p + 2] = b;
+    rtRgba[p + 3] = 255;
+  }
+}
+const rt = new Engine.IpadCompanionRuntime({ initialPack: pack });
+rt.ingestRGBA(rtRgba, rtW, rtH, 200.0);
+assert(rt.latestRawFrame, "ingestRGBA should populate latestRawFrame (arg order bug check)");
+assert.strictEqual(rt.latestRawFrame.w, rtW, "ingestRGBA must preserve non-square width");
+assert.strictEqual(rt.latestRawFrame.h, rtH, "ingestRGBA must preserve non-square height");
+let calibSnap = null;
+rt.handleClientMessage(
+  { readyState: 1, onmessage: ({ data }) => { calibSnap = JSON.parse(data); } },
+  JSON.stringify({ type: "calib_grab", anchorMode: "ipad_split_left" })
+);
+assert(calibSnap && calibSnap.type === "calib_snapshot", "calib_grab should succeed after ingestRGBA");
+assert(calibSnap.width <= 732, `Isolated split pane width ${calibSnap.width} should stay left of divider`);
+
 console.log("   All iPad JS CV & State Machine parity checks PASSED!");
+

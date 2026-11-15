@@ -193,14 +193,20 @@
   }
 
   function fromRGBA(rgba, w, h) {
-    const out = new Uint8Array(w * h * 3);
-    for (let i = 0, j = 0, n = w * h; i < n; i++, j += 3) {
+    const width = Math.max(0, w | 0);
+    const height = Math.max(0, h | 0);
+    const expected = width * height * 4;
+    if (!rgba || width === 0 || height === 0 || rgba.length < expected) {
+      return createImage(0, 0, 3);
+    }
+    const out = new Uint8Array(width * height * 3);
+    for (let i = 0, j = 0, n = width * height; i < n; i++, j += 3) {
       const p = i * 4;
       out[j] = rgba[p + 2];     // B
       out[j + 1] = rgba[p + 1]; // G
       out[j + 2] = rgba[p];     // R
     }
-    return { w, h, c: 3, data: out };
+    return { w: width, h: height, c: 3, data: out };
   }
 
   function toGray(img) {
@@ -2266,7 +2272,7 @@
     }
 
     startNativePolling() {
-      if (this._loopTimer || typeof fetch === "undefined") return;
+      if (this._loopTimer || typeof XMLHttpRequest === "undefined") return;
       const isNativeHost =
         typeof window !== "undefined" &&
         window.webkit &&
@@ -2274,35 +2280,61 @@
         window.webkit.messageHandlers.ipadCompanion;
       if (!isNativeHost) return;
 
+      const frameUrl =
+        typeof window !== "undefined" &&
+        window.location &&
+        window.location.protocol === "bjtracker:"
+          ? "/companion-frame/latest"
+          : "companion-frame://latest";
+
       const intervalMs = Math.max(50, Math.round(1000 / (this.cfg.fps || 10)));
-      this._loopTimer = setInterval(async () => {
+      this._loopTimer = setInterval(() => {
         if (this._busy || this.clients.size === 0) return;
         this._busy = true;
-        try {
-          const resp = await fetch("companion-frame://latest", { cache: "no-store" });
-          if (resp.ok) {
-            const buf = await resp.arrayBuffer();
-            if (buf && buf.byteLength > 16) {
-              const hdr = new Uint32Array(buf, 0, 4);
-              const seq = hdr[0];
-              const w = hdr[1];
-              const h = hdr[2];
-              const channels = hdr[3] || 4;
-              if (seq !== this._lastFrameSeq && w > 0 && h > 0) {
-                this._lastFrameSeq = seq;
-                const pixels = new Uint8Array(buf, 16);
-                if (channels === 4 && pixels.length >= w * h * 4) {
-                  this.ingestRGBA(pixels, w, h);
-                } else if (channels === 3 && pixels.length >= w * h * 3) {
-                  this.ingestFrameBgr({ w, h, c: 3, data: pixels });
+        const xhr = new XMLHttpRequest();
+        xhr.open("GET", frameUrl, true);
+        xhr.responseType = "arraybuffer";
+        xhr.timeout = 1000;
+        const done = () => {
+          this._busy = false;
+        };
+        xhr.onload = () => {
+          try {
+            if (xhr.status === 200 && xhr.response instanceof ArrayBuffer) {
+              const buf = xhr.response;
+              if (buf.byteLength > 16) {
+                const hdr = new Uint32Array(buf, 0, 4);
+                const seq = hdr[0];
+                const w = hdr[1];
+                const h = hdr[2];
+                const channels = hdr[3] || 4;
+                if (seq !== 0 && seq !== this._lastFrameSeq && w > 0 && h > 0 && w <= 4096 && h <= 4096) {
+                  const neededBytes = w * h * channels;
+                  if (buf.byteLength >= 16 + neededBytes) {
+                    this._lastFrameSeq = seq;
+                    const pixels = new Uint8Array(buf, 16, neededBytes);
+                    if (channels === 4) {
+                      this.ingestRGBA(pixels, w, h);
+                    } else if (channels === 3) {
+                      this.ingestFrameBgr({ w, h, c: 3, data: pixels });
+                    }
+                  }
                 }
               }
             }
+          } catch (_) {
+            // Silently ignore malformed or stale packet
+          } finally {
+            done();
           }
-        } catch (e) {
-          // Silently ignore if no frame is available yet
-        } finally {
-          this._busy = false;
+        };
+        xhr.onerror = done;
+        xhr.ontimeout = done;
+        xhr.onabort = done;
+        try {
+          xhr.send();
+        } catch (_) {
+          done();
         }
       }, intervalMs);
     }
@@ -2420,7 +2452,7 @@
     }
 
     ingestRGBA(rgbaBytes, width, height, now = performance.now() / 1000) {
-      const bgr = fromRGBA(width, height, rgbaBytes);
+      const bgr = fromRGBA(rgbaBytes, width, height);
       return this.ingestFrameBgr(bgr, now);
     }
 

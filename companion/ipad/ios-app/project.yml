@@ -21,19 +21,22 @@ targets:
     platform: iOS
     sources:
       - path: BlackjackTracker
+        excludes:
+          - "Info.plist"
+          - "*.entitlements"
       - path: ../../../index.html
         buildPhase: resources
       - path: ../default_pack.js
         buildPhase: resources
       - path: ../companion_engine.js
         buildPhase: resources
-    info:
-      path: BlackjackTracker/Info.plist
-    entitlements:
-      path: BlackjackTracker/BlackjackTracker.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tgjgaming.blackjacktracker
+        TARGETED_DEVICE_FAMILY: "2"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: BlackjackTracker/Info.plist
+        CODE_SIGN_ENTITLEMENTS: BlackjackTracker/BlackjackTracker.entitlements
     dependencies:
       - target: BroadcastExtension
         embed: true
@@ -45,14 +48,18 @@ targets:
     platform: iOS
     sources:
       - path: BroadcastExtension
+        excludes:
+          - "Info.plist"
+          - "*.entitlements"
       - path: BlackjackTracker/SharedFrameRing.swift
-    info:
-      path: BroadcastExtension/Info.plist
-    entitlements:
-      path: BroadcastExtension/BroadcastExtension.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tgjgaming.blackjacktracker.BroadcastExtension
+        TARGETED_DEVICE_FAMILY: "2"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: BroadcastExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: BroadcastExtension/BroadcastExtension.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
 
   SafariKeepaliveExtension:
     type: app-extension
@@ -63,10 +70,11 @@ targets:
         buildPhase: resources
       - path: SafariKeepaliveExtension/Resources/background.js
         buildPhase: resources
-    info:
-      path: SafariKeepaliveExtension/Info.plist
-    entitlements:
-      path: SafariKeepaliveExtension/SafariKeepaliveExtension.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tgjgaming.blackjacktracker.SafariKeepaliveExtension
+        TARGETED_DEVICE_FAMILY: "2"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: SafariKeepaliveExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: SafariKeepaliveExtension/SafariKeepaliveExtension.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES

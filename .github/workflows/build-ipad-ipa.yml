@@ -55,6 +55,65 @@ jobs:
           do
             test -f "$f" || { echo "Missing expected bundle file: $f" >&2; exit 1; }
           done
+          python3 - <<'PY'
+          import os, plistlib, sys
+
+          # 1. Verify source entitlements files were not clobbered by XcodeGen
+          for ent in [
+              "BlackjackTracker/BlackjackTracker.entitlements",
+              "BroadcastExtension/BroadcastExtension.entitlements",
+              "SafariKeepaliveExtension/SafariKeepaliveExtension.entitlements",
+          ]:
+              with open(ent, "rb") as fp:
+                  ed = plistlib.load(fp)
+              groups = ed.get("com.apple.security.application-groups") or []
+              assert "group.com.tgjgaming.blackjacktracker" in groups, f"Missing App Group in {ent}: {ed}"
+
+          # 2. Ensure zero .entitlements files were copied inside Payload/ resources
+          for root, _, files in os.walk("Payload"):
+              for fn in files:
+                  assert not fn.endswith(".entitlements"), f"Stray entitlements file inside Payload: {os.path.join(root, fn)}"
+
+          # 3. Verify main app Info.plist
+          with open("Payload/BlackjackTracker.app/Info.plist", "rb") as fp:
+              app_pl = plistlib.load(fp)
+          assert app_pl.get("UIDeviceFamily") == [2], f"Expected iPad-only UIDeviceFamily [2], got {app_pl.get('UIDeviceFamily')}"
+          assert isinstance(app_pl.get("UILaunchScreen"), dict), f"Missing UILaunchScreen in app Info.plist"
+          assert app_pl.get("UIRequiresFullScreen") is False, f"Expected UIRequiresFullScreen False for Split View"
+          expected_orients = {
+              "UIInterfaceOrientationLandscapeLeft",
+              "UIInterfaceOrientationLandscapeRight",
+              "UIInterfaceOrientationPortrait",
+              "UIInterfaceOrientationPortraitUpsideDown",
+          }
+          for key in ("UISupportedInterfaceOrientations", "UISupportedInterfaceOrientations~ipad"):
+              actual = set(app_pl.get(key) or [])
+              assert expected_orients.issubset(actual), f"{key} missing orientations: {expected_orients - actual}"
+          assert app_pl.get("CFBundleShortVersionString") == "1.0.0", f"Unexpected version: {app_pl.get('CFBundleShortVersionString')}"
+          assert app_pl.get("CFBundleDisplayName") == "BJ Tracker", f"Unexpected display name: {app_pl.get('CFBundleDisplayName')}"
+          assert str(app_pl.get("NSLocalNetworkUsageDescription") or "").strip(), "Missing NSLocalNetworkUsageDescription"
+          scene_manifest = app_pl.get("UIApplicationSceneManifest") or {}
+          assert scene_manifest.get("UIApplicationSupportsMultipleScenes") is False
+          role_cfgs = (scene_manifest.get("UISceneConfigurations") or {}).get("UIWindowSceneSessionRoleApplication") or []
+          assert role_cfgs and str(role_cfgs[0].get("UISceneDelegateClassName") or "").endswith(".SceneDelegate"), f"Missing SceneDelegate config: {role_cfgs}"
+
+          # 4. Verify BroadcastExtension Info.plist
+          with open("Payload/BlackjackTracker.app/PlugIns/BroadcastExtension.appex/Info.plist", "rb") as fp:
+              bc_pl = plistlib.load(fp)
+          assert bc_pl.get("UIDeviceFamily") == [2], f"BroadcastExtension UIDeviceFamily={bc_pl.get('UIDeviceFamily')}"
+          bc_ext = bc_pl.get("NSExtension") or {}
+          assert bc_ext.get("NSExtensionPointIdentifier") == "com.apple.broadcast-services-upload", f"Bad Broadcast NSExtension: {bc_ext}"
+          assert bc_ext.get("RPBroadcastProcessMode") == "RPBroadcastProcessModeSampleBuffer", f"Bad RPBroadcastProcessMode: {bc_ext}"
+
+          # 5. Verify SafariKeepaliveExtension Info.plist
+          with open("Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/Info.plist", "rb") as fp:
+              sk_pl = plistlib.load(fp)
+          assert sk_pl.get("UIDeviceFamily") == [2], f"SafariKeepaliveExtension UIDeviceFamily={sk_pl.get('UIDeviceFamily')}"
+          sk_ext = sk_pl.get("NSExtension") or {}
+          assert sk_ext.get("NSExtensionPointIdentifier") == "com.apple.Safari.web-extension", f"Bad Safari NSExtension: {sk_ext}"
+
+          print("All IPA bundle Info.plist & entitlement assertions PASSED!")
+          PY
           zip -qry BlackjackTracker.ipa Payload
           ls -lh BlackjackTracker.ipa
 

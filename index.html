@@ -496,6 +496,48 @@ let draft = null;
 let _lastCleared = null;
 const _isNativeIpadHost = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipadCompanion);
 const _isIpadUa = _isNativeIpadHost || (navigator.maxTouchPoints > 1 && /Macintosh|iPad/i.test(navigator.userAgent || ''));
+if(_isNativeIpadHost){
+  const _postIpadJsErr = (msg, source, line) => {
+    try{
+      window.webkit.messageHandlers.ipadCompanion.postMessage({
+        action: 'jsError',
+        message: String(msg || 'Unknown JS error').slice(0, 400),
+        source: String(source || ''),
+        line: Number(line || 0)
+      });
+    }catch(_){}
+  };
+  window.addEventListener('error', (ev) => {
+    _postIpadJsErr(ev && (ev.message || (ev.error && ev.error.message)), ev && ev.filename, ev && ev.lineno);
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    const reason = ev && ev.reason;
+    _postIpadJsErr((reason && (reason.message || reason)) || 'Unhandled promise rejection', 'promise', 0);
+  });
+}
+function downloadTrackerFile(filename, text, mimeType = 'application/octet-stream'){
+  if(_isNativeIpadHost){
+    try{
+      window.webkit.messageHandlers.ipadCompanion.postMessage({
+        action: 'exportFile',
+        filename: String(filename || 'export.txt'),
+        mimeType: String(mimeType),
+        text: String(text || '')
+      });
+      return true;
+    }catch(_){}
+  }
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  return true;
+}
 const _comp = {
   enabled: true,
   ipadMode: _isIpadUa && typeof IpadCompanionEngine !== 'undefined',
@@ -3644,12 +3686,7 @@ function renderHistory(){
         ].join(','));
       });
     }
-    const blob = new Blob(['\ufeff' + [hdr.join(','), ...rows].join('\n')], {type:'text/csv;charset=utf-8'});
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = filename;
-    document.body.appendChild(link); link.click(); link.remove();
-    setTimeout(() => URL.revokeObjectURL(link.href), 2000);
+    downloadTrackerFile(filename, '\ufeff' + [hdr.join(','), ...rows].join('\n'), 'text/csv;charset=utf-8');
   };
 
   const csvBtn = document.getElementById('exportCsvBtn');
@@ -3834,11 +3871,7 @@ function renderSettings(){
     startNewSession();
   };
   document.getElementById('exportBackupBtn').onclick = () => {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(S)], {type: 'application/json'}));
-    a.download = `bj-tracker-backup-${new Date().toISOString().slice(0,10)}.json`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    downloadTrackerFile(`bj-tracker-backup-${new Date().toISOString().slice(0,10)}.json`, JSON.stringify(S), 'application/json');
   };
   document.getElementById('importBackupBtn').onclick = () => document.getElementById('importBackupFile').click();
   document.getElementById('importBackupFile').onchange = async (e) => {
@@ -4393,15 +4426,7 @@ function handleCompanionMessage(msg){
   }
   if(msg.type === 'calib_pack_exported'){
     try{
-      const blob = new Blob([JSON.stringify(msg.pack, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `playtech_companion_pack_${new Date().toISOString().slice(0,10)}.json`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      downloadTrackerFile(`playtech_companion_pack_${new Date().toISOString().slice(0,10)}.json`, JSON.stringify(msg.pack, null, 2), 'application/json');
       _calib.status = '📦 Exported portable Companion Pack (.json) with ROIs + all 5 template banks.';
     }catch(e){
       _calib.error = 'Failed to export pack: ' + (e.message || e);
@@ -4547,8 +4572,8 @@ function grabCalibSnapshot(anchorOverride = null){
   renderCalibModal();
 }
 
-function triggerIpadBroadcastOrLoadFrame(){
-  if(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipadCompanion){
+function triggerIpadBroadcastOrLoadFrame(forceFile = false){
+  if(!forceFile && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipadCompanion){
     try{
       window.webkit.messageHandlers.ipadCompanion.postMessage({ action: 'startBroadcast' });
       if(draft) draft.lastMsg = '📺 Opening iPadOS Screen Broadcast picker — select BlackjackTracker Broadcast…';
@@ -4804,7 +4829,7 @@ function renderCalibModal(){
     grabCalibSnapshot('toolbar');
   };
   const loadImgBtn = document.getElementById('calibLoadImgBtn');
-  if(loadImgBtn) loadImgBtn.onclick = () => triggerIpadBroadcastOrLoadFrame();
+  if(loadImgBtn) loadImgBtn.onclick = () => triggerIpadBroadcastOrLoadFrame(true);
   const exportPackBtn = document.getElementById('calibExportPackBtn');
   if(exportPackBtn) exportPackBtn.onclick = () => {
     if(_comp.ws && _comp.ws.readyState === 1){
