@@ -3,7 +3,7 @@ name: Build iPad Tracker IPA
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, ipados ]
     paths:
       - 'index.html'
       - 'companion/ipad/**'
