@@ -336,7 +336,7 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
     private func setupBroadcastPicker() {
         let picker = RPSystemBroadcastPickerView(frame: .zero)
         picker.translatesAutoresizingMaskIntoConstraints = false
-        picker.preferredExtension = "com.tgjgaming.blackjacktracker.BroadcastExtension"
+        picker.preferredExtension = (Bundle.main.bundleIdentifier ?? "com.tgjgaming.blackjacktracker") + ".BroadcastExtension"
         picker.showsMicrophoneButton = false
         picker.alpha = 0.015
         picker.isUserInteractionEnabled = false

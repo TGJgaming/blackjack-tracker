@@ -2240,7 +2240,7 @@
       const initialPack =
         options.initialPack ||
         this._loadSavedPack() ||
-        (typeof globalScope.DEFAULT_COMPANION_PACK === "object" ? globalScope.DEFAULT_COMPANION_PACK : null);
+        (typeof globalThis.DEFAULT_COMPANION_PACK === "object" ? globalThis.DEFAULT_COMPANION_PACK : null);
 
       this.cfg = defaultConfig(initialPack && initialPack.config ? initialPack.config : {});
       if (!options.preserveDesktopAnchor && (!initialPack || !initialPack.config || initialPack.config.anchor_mode === "game_viewport")) {
@@ -2260,11 +2260,11 @@
       this._loopTimer = null;
       this._busy = false;
 
-      if (typeof globalScope !== "undefined") {
-        globalScope.__ipadCompanionReceiveRGBA = (rgbaBytes, width, height) => {
+      if (typeof globalThis !== "undefined") {
+        globalThis.__ipadCompanionReceiveRGBA = (rgbaBytes, width, height) => {
           this.ingestRGBA(rgbaBytes, width, height);
         };
-        globalScope.__ipadCompanionSetExtConnected = (connected) => {
+        globalThis.__ipadCompanionSetExtConnected = (connected) => {
           this.extConnected = !!connected;
           this.broadcast(this.buildStatusPayload());
         };

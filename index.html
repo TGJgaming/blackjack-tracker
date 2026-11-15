@@ -45,7 +45,7 @@
   h2{font-size:14px;margin:0 0 10px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.55px}
   h3{font-size:15px;margin:14px 0 6px}
   nav{display:flex;gap:6px;flex-wrap:wrap}
-  nav button{flex:1;min-width:80px;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--muted);font-weight:600;cursor:pointer;white-space:nowrap}
+  nav button{flex:1 1 auto;min-width:0;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--muted);font-weight:600;cursor:pointer;white-space:normal;overflow-wrap:anywhere;line-height:1.2}
   nav button.on{background:linear-gradient(135deg,#059669,#1d4ed8);border-color:#34d399;color:#fff}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px;margin:12px 0;min-width:0;max-width:100%}
   .mod-card.card{margin:0}
@@ -83,7 +83,7 @@
   /* Numpad */
   .numpad{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;margin-top:8px}
   .numpad button{min-width:0;padding:11px 3px;border-radius:11px;border:1px solid var(--line);background:var(--panel);color:var(--text);font-weight:700;font-size:15px;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.15;transition:transform .06s,background .08s,border-color .08s}
-  .numpad button .sub{font-size:10px;color:var(--muted);font-weight:600;margin-top:2px;white-space:nowrap}
+  .numpad button .sub{font-size:10px;color:var(--muted);font-weight:600;margin-top:2px;white-space:normal;overflow-wrap:anywhere;line-height:1.1}
   .numpad button:active,.numpad button.kflash{background:#2d3a54;border-color:var(--blue);transform:scale(.96)}
   .numpad button:disabled{opacity:.35;cursor:not-allowed;transform:none}
   .numpad button.low{border-color:#14532d;background:#0d2318;color:#bbf7d0}
@@ -223,6 +223,17 @@
   .calib-ranks button.has{border-color:#22c55e;background:#0e2819;color:#bbf7d0}
   .calib-ranks button .cnt{font-size:10px;opacity:.8}
   .calib-loupe{border:1px solid var(--line);border-radius:8px;background:#090b10;image-rendering:pixelated;width:140px;height:140px;display:block}
+  /* iPad / Split View overflow hardening */
+  .card,.mod-card,.row,.grid>*,.split-layout>*{min-width:0}
+  .btn,button{white-space:normal;overflow-wrap:anywhere;max-width:100%}
+  .card *,.mod-card *{overflow-wrap:anywhere}
+  .row{flex-wrap:wrap}
+  .tbl-wrap,table{max-width:100%}
+  .tbl-wrap{overflow-x:auto}
+  .modal,.modal *{max-width:100%}
+  @media (max-width:900px){ .dock-col .grid.g5{grid-template-columns:repeat(3,minmax(0,1fr))} }
+  @media (max-width:700px){ nav{flex-wrap:wrap} nav button{font-size:12px;padding:6px 6px} .grid.g4,.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))} h1{font-size:18px} }
+  @media (max-width:420px){ .grid.g3{grid-template-columns:repeat(2,minmax(0,1fr))} }
 </style>
 </head>
 <body>
@@ -3015,7 +3026,8 @@ function renderPlay(){
   const compIpadModeBtn = document.getElementById('compIpadModeBtn');
   if(compIpadModeBtn) compIpadModeBtn.onclick = (e) => {
     e.currentTarget.blur();
-    _comp.ipadMode = !_comp.ipadMode;
+    // Inside the native iPad app there is no desktop companion.py, so never fall back to ws://127.0.0.1:8765.
+    _comp.ipadMode = (typeof _isNativeIpadHost !== 'undefined' && _isNativeIpadHost) ? true : !_comp.ipadMode;
     _comp.enabled = true;
     disconnectCompanion();
     connectCompanion(true);
@@ -4749,7 +4761,7 @@ function renderCalibModal(){
           </div>
           <div class="row" style="margin-top:8px">
             <label class="small mut">Anchor Frame:
-              <select id="calibAnchorSel" style="width:auto;padding:3px 7px;margin-left:4px">
+              <select id="calibAnchorSel" style="width:auto;max-width:100%;padding:3px 7px;margin-left:4px">
                 <option value="ipad_split_left" ${_calib.anchorMode==='ipad_split_left'?'selected':''}>iPad Split-View Left Safari 16:9 (Recommended on iPad)</option>
                 <option value="game_viewport" ${_calib.anchorMode==='game_viewport'?'selected':''}>Auto Playtech 16:9 Frame (Desktop Recommended)</option>
                 <option value="window" ${_calib.anchorMode==='window'?'selected':''}>Full Browser Window</option>
@@ -5019,7 +5031,11 @@ function connectCompanion(immediate = false){
         _comp.backoffMs = Math.min(8000, Math.round(_comp.backoffMs * 1.5));
       }
     };
-  }catch(e){}
+  }catch(e){
+    console.error('connectCompanion failed', e);
+    try{ if(_isNativeIpadHost) window.webkit.messageHandlers.ipadCompanion.postMessage({action:'jsError', message:'connectCompanion: ' + String(e && e.stack || e), source:'index.html', line:0}); }catch(_){}
+    if(draft) draft.lastMsg = '⚠️ Companion engine failed to start: ' + (e && e.message || e);
+  }
 }
 
 if(!active()) startNewSession();
