@@ -21,11 +21,11 @@ targets:
     platform: iOS
     sources:
       - path: BlackjackTracker
-      - path: ../../../../index.html
+      - path: ../../../index.html
         buildPhase: resources
-      - path: ../../default_pack.js
+      - path: ../default_pack.js
         buildPhase: resources
-      - path: ../../companion_engine.js
+      - path: ../companion_engine.js
         buildPhase: resources
     info:
       path: BlackjackTracker/Info.plist
