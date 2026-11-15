@@ -253,6 +253,8 @@
 <div id="bjAlertToast" class="alert-toast" role="status" aria-live="polite"></div>
 <div id="calibModal" class="calib-backdrop hide"></div>
 
+<script src="companion/ipad/default_pack.js"></script>
+<script src="companion/ipad/companion_engine.js"></script>
 <script>
 /* ============================================================================
    Playtech Live Blackjack Advantage Engine
@@ -492,8 +494,12 @@ function ensureShoeMeta(s){
 
 let draft = null;
 let _lastCleared = null;
+const _isNativeIpadHost = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipadCompanion);
+const _isIpadUa = _isNativeIpadHost || (navigator.maxTouchPoints > 1 && /Macintosh|iPad/i.test(navigator.userAgent || ''));
 const _comp = {
   enabled: true,
+  ipadMode: _isIpadUa && typeof IpadCompanionEngine !== 'undefined',
+  broadcastActive: false,
   connected: false,
   windowFound: false,
   paused: false,
@@ -2432,8 +2438,8 @@ function renderPlay(){
       : _comp.paused
         ? '⏸ Auto Paused'
         : !_comp.windowFound
-          ? '🟡 Waiting Window'
-          : `🟢 Auto Live (${_comp.state || 'IDLE'})`;
+          ? (_comp.ipadMode ? '🟡 Tap 📺 Broadcast' : '🟡 Waiting Window')
+          : `🟢 ${_comp.ipadMode ? 'iPad' : 'Auto'} Live (${_comp.state || 'IDLE'})`;
   const compPillCls = _comp.enabled && _comp.connected && !_comp.paused && _comp.windowFound ? 'pinbtn on' : '';
   const compPromptHtml = draft.compPrompt ? (() => {
     const pr = draft.compPrompt;
@@ -2469,7 +2475,9 @@ function renderPlay(){
     title: `Shoe #${meta.shoeNum || 1} · Playtech Live Control Bar`,
     hdrExtra: `
       ${draft.phaseBanner ? `<span class="pill ${['WAIT','DEALING'].includes(draft.phaseBanner)?'green':['PLACE_BETS','LAST_BETS','NO_MORE_BETS'].includes(draft.phaseBanner)?'amber':'blue'}" title="Detected Playtech Table Banner Phase">${draft.phaseBanner==='WAIT'?'WAIT · RECORDING':draft.phaseBanner==='DEALING'?'DEALING · RECORDING':draft.phaseBanner.replace(/_/g,' ')}</span>` : ''}
-      <button class="btn xs ${compPillCls}" id="compToggleBtn" title="Toggle local desktop companion auto-tracking (ws://127.0.0.1:8765)">${compPillText}</button>
+      <button class="btn xs ${compPillCls}" id="compToggleBtn" title="Toggle local desktop or standalone iPad companion auto-tracking">${compPillText}</button>
+      ${typeof IpadCompanionEngine !== 'undefined' ? `<button class="btn xs ${_comp.ipadMode?'pinbtn on':''}" id="compIpadModeBtn" title="Switch between Standalone iPad Split-View Engine and Desktop WebSocket (ws://127.0.0.1:8765)">📱 iPad Mode</button>` : ''}
+      ${_comp.ipadMode ? `<button class="btn xs ${_comp.windowFound?'good':'primary'}" id="compBroadcastBtn" title="Start iPadOS ReplayKit Screen Broadcast (or load test frame)">📺 ${_comp.windowFound?'Broadcasting':'Broadcast Screen'}</button>` : ''}
       ${_comp.connected ? `<button class="btn xs ${getKeepaliveBadgeState().cls}" id="compKeepaliveBtn" title="${getKeepaliveBadgeState().title}">${getKeepaliveBadgeState().text}</button>${(_comp.keepalive && _comp.keepalive.enabled !== false && _comp.keepalive.mode !== 'off') ? `<button class="btn xs" id="compKeepaliveResetBtn" title="Reset Watch-mode inactivity timer">↺</button>` : ''}<button class="btn xs" id="compCalibBtn" title="Open fit-to-screen ROI & template calibrator">🎯 Calibrate</button><button class="btn xs" id="compPauseBtn" title="Pause/Resume companion">${_comp.paused?'▶ Resume':'⏸ Pause'}</button><button class="btn xs" id="compResyncBtn" title="Reset companion round sync">↻ Resync</button>` : ''}
       <button class="btn xs ${cfg().soundAlert?'pinbtn on':''}" id="toggleSoundBtn" title="Sound alerts (Wong, Deviations, Insurance, +EV Side Bets, Splits, Banner Phase)">${cfg().soundAlert?'🔔 Sound On':'🔕 Sound Off'}</button>
       <button class="btn xs" id="newShoeBtn" title="Archive current shoe and reset 416 cards">🔄 New Shoe</button>
@@ -2961,6 +2969,25 @@ function renderPlay(){
     if(_comp.enabled) connectCompanion(true);
     else disconnectCompanion();
     render();
+  };
+  const compIpadModeBtn = document.getElementById('compIpadModeBtn');
+  if(compIpadModeBtn) compIpadModeBtn.onclick = (e) => {
+    e.currentTarget.blur();
+    _comp.ipadMode = !_comp.ipadMode;
+    _comp.enabled = true;
+    disconnectCompanion();
+    connectCompanion(true);
+    if(draft){
+      draft.lastMsg = _comp.ipadMode
+        ? '📱 Switched to Standalone iPad Split-View Companion Engine (zero network/DOM hooks).'
+        : '🖥 Switched to Desktop Companion WebSocket (ws://127.0.0.1:8765).';
+    }
+    render();
+  };
+  const compBroadcastBtn = document.getElementById('compBroadcastBtn');
+  if(compBroadcastBtn) compBroadcastBtn.onclick = (e) => {
+    e.currentTarget.blur();
+    triggerIpadBroadcastOrLoadFrame();
   };
   const compPauseBtn = document.getElementById('compPauseBtn');
   if(compPauseBtn) compPauseBtn.onclick = (e) => {
@@ -4346,7 +4373,10 @@ function handleCompanionMessage(msg){
   if(msg.type === 'calib_snapshot'){
     _calib.loading = false;
     _calib.error = '';
-    _calib.status = `Loaded ${msg.width}×${msg.height} (${msg.anchorMode === 'game_viewport' ? 'Auto 16:9 Game Frame' : 'Full Browser Window'})`;
+    const modeLabel = msg.anchorMode === 'ipad_split_left'
+      ? 'iPad Split-View Left Safari (16:9)'
+      : (msg.anchorMode === 'game_viewport' ? 'Auto 16:9 Game Frame' : (msg.anchorMode === 'toolbar' ? 'Toolbar Strip' : 'Full Browser Window'));
+    _calib.status = `Loaded ${msg.width}×${msg.height} (${modeLabel})`;
     _calib.anchorMode = msg.anchorMode || 'game_viewport';
     _calib.width = msg.width;
     _calib.height = msg.height;
@@ -4361,11 +4391,37 @@ function handleCompanionMessage(msg){
     renderCalibModal();
     return;
   }
+  if(msg.type === 'calib_pack_exported'){
+    try{
+      const blob = new Blob([JSON.stringify(msg.pack, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `playtech_companion_pack_${new Date().toISOString().slice(0,10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      _calib.status = '📦 Exported portable Companion Pack (.json) with ROIs + all 5 template banks.';
+    }catch(e){
+      _calib.error = 'Failed to export pack: ' + (e.message || e);
+    }
+    renderCalibModal();
+    return;
+  }
+  if(msg.type === 'calib_pack_imported'){
+    if(msg.rois) _calib.rois = msg.rois;
+    if(msg.anchorMode) _calib.anchorMode = msg.anchorMode;
+    if(msg.templates) _calib.templates = Object.assign({ hud: {}, suit: {}, felt: {}, banner: {}, ui: {} }, msg.templates);
+    _calib.status = '📥 Imported Companion Pack (.json) cleanly! ROIs and all template banks updated.';
+    renderCalibModal();
+    return;
+  }
   if(msg.type === 'calib_saved'){
     if(msg.kind === 'rois'){
       _calib.rois = msg.rois || _calib.rois;
       _calib.anchorMode = msg.anchorMode || _calib.anchorMode;
-      _calib.status = '✅ Saved ROIs & anchor mode to config.json cleanly.';
+      _calib.status = '✅ Saved ROIs & anchor mode cleanly.';
     } else if(msg.kind === 'template'){
       _calib.templates = Object.assign({ hud: {}, suit: {}, felt: {}, banner: {}, ui: {} }, msg.templates || _calib.templates);
       if('reloadBtnOffset' in msg) _calib.reloadBtnOffset = msg.reloadBtnOffset;
@@ -4438,7 +4494,7 @@ const _calib = {
   selectedRoi: 'player_strip',
   tplBank: 'hud', // 'hud' | 'suit' | 'felt' | 'banner' | 'ui'
   autoTrim: true,
-  anchorMode: 'game_viewport',
+  anchorMode: _comp.ipadMode ? 'ipad_split_left' : 'game_viewport',
   img: null,
   width: 0,
   height: 0,
@@ -4465,6 +4521,9 @@ function openCalibrator(){
   _calib.open = true;
   _calib.error = '';
   _calib.testResult = null;
+  if(_comp.ipadMode && _calib.anchorMode === 'game_viewport'){
+    _calib.anchorMode = 'ipad_split_left';
+  }
   grabCalibSnapshot();
   renderCalibModal();
 }
@@ -4477,7 +4536,7 @@ function closeCalibrator(){
 
 function grabCalibSnapshot(anchorOverride = null){
   if(!_comp.ws || _comp.ws.readyState !== 1){
-    _calib.error = 'Companion offline — start companion.py first.';
+    _calib.error = 'Companion offline — start companion.py or enable 📱 iPad Mode first.';
     renderCalibModal();
     return;
   }
@@ -4486,6 +4545,45 @@ function grabCalibSnapshot(anchorOverride = null){
   const am = anchorOverride || _calib.anchorMode;
   _comp.ws.send(JSON.stringify({ type: 'calib_grab', anchorMode: am }));
   renderCalibModal();
+}
+
+function triggerIpadBroadcastOrLoadFrame(){
+  if(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipadCompanion){
+    try{
+      window.webkit.messageHandlers.ipadCompanion.postMessage({ action: 'startBroadcast' });
+      if(draft) draft.lastMsg = '📺 Opening iPadOS Screen Broadcast picker — select BlackjackTracker Broadcast…';
+      render();
+      return;
+    }catch(e){}
+  }
+  // Browser / Screenshot fallback for testing iPad Split-View detection on any image
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = 'image/*';
+  inp.onchange = (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    if(!file || typeof IpadCompanionEngine === 'undefined') return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const im = new Image();
+      im.onload = () => {
+        const cv = document.createElement('canvas');
+        cv.width = im.width;
+        cv.height = im.height;
+        const ctx = cv.getContext('2d');
+        ctx.drawImage(im, 0, 0);
+        const rgba = ctx.getImageData(0, 0, im.width, im.height).data;
+        const rt = IpadCompanionEngine.getSharedRuntime();
+        rt.ingestRGBA(rgba, im.width, im.height);
+        if(_calib.open) grabCalibSnapshot();
+        if(draft) draft.lastMsg = `🖼 Ingested test frame (${im.width}×${im.height}) into Standalone iPad Companion Engine.`;
+        render();
+      };
+      im.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  };
+  inp.click();
 }
 
 function drawCalibCanvas(){
@@ -4607,7 +4705,9 @@ function renderCalibModal(){
         <span class="sp"></span>
         <button class="btn xs ${_calib.mode==='roi'?'primary':''}" id="calibModeRoiBtn">1. ROI Boxes</button>
         <button class="btn xs ${_calib.mode==='tpl'?'primary':''}" id="calibModeTplBtn">2. Crop Card Templates</button>
-        <button class="btn xs" id="calibGrabToolbarBtn" title="Capture Brave top-left toolbar strip to calibrate Reload (⟳) icon">🔄 Grab Reload (⟳)</button>
+        <button class="btn xs" id="calibExportPackBtn" title="Export ROIs + all 5 template banks as a single portable JSON pack">📦 Export Pack</button>
+        <button class="btn xs" id="calibImportPackBtn" title="Import a portable Companion Pack JSON (Windows <-> iPad)">📥 Import Pack</button>
+        ${_comp.ipadMode ? `<button class="btn xs" id="calibLoadImgBtn" title="Load an iPad Split-View screenshot from Photos to test or calibrate">🖼 Load Screenshot</button>` : `<button class="btn xs" id="calibGrabToolbarBtn" title="Capture Brave top-left toolbar strip to calibrate Reload (⟳) icon">🔄 Grab Reload (⟳)</button>`}
         <button class="btn xs good" id="calibGrabBtn">${_calib.loading?'Capturing…':'📸 Fresh Snapshot'}</button>
         <button class="btn xs danger" id="calibCloseBtn">✕ Close</button>
       </div>
@@ -4620,19 +4720,20 @@ function renderCalibModal(){
           <div class="calib-canvas-wrap">
             ${_calib.img
               ? '<canvas id="calibCanvas"></canvas>'
-              : '<div class="small mut" style="padding:48px;text-align:center">Waiting for snapshot from Newport/Playtech window…</div>'}
+              : '<div class="small mut" style="padding:48px;text-align:center">Waiting for snapshot from Newport/Playtech window (or tap 🖼 Load Screenshot / 📺 Broadcast Screen on iPad)…</div>'}
           </div>
           <div class="row" style="margin-top:8px">
             <label class="small mut">Anchor Frame:
               <select id="calibAnchorSel" style="width:auto;padding:3px 7px;margin-left:4px">
-                <option value="game_viewport" ${_calib.anchorMode==='game_viewport'?'selected':''}>Auto Playtech 16:9 Frame (Recommended)</option>
+                <option value="ipad_split_left" ${_calib.anchorMode==='ipad_split_left'?'selected':''}>iPad Split-View Left Safari 16:9 (Recommended on iPad)</option>
+                <option value="game_viewport" ${_calib.anchorMode==='game_viewport'?'selected':''}>Auto Playtech 16:9 Frame (Desktop Recommended)</option>
                 <option value="window" ${_calib.anchorMode==='window'?'selected':''}>Full Browser Window</option>
                 <option value="toolbar" ${_calib.anchorMode==='toolbar'?'selected':''}>Brave Toolbar Only (Reload ⟳)</option>
               </select>
             </label>
             <span class="sp"></span>
             <button class="btn xs" id="calibTestBtn">🧪 Test Match on Snapshot</button>
-            <button class="btn xs primary" id="calibSaveRoisBtn" ${_calib.anchorMode==='toolbar'?'disabled title="Switch Anchor Frame back to Playtech Frame to save game ROIs"':''}>💾 Save ROIs to config.json</button>
+            <button class="btn xs primary" id="calibSaveRoisBtn" ${_calib.anchorMode==='toolbar'?'disabled title="Switch Anchor Frame back to Playtech Frame to save game ROIs"':''}>💾 Save ROIs</button>
           </div>
         </div>
 
@@ -4695,15 +4796,48 @@ function renderCalibModal(){
 
   document.getElementById('calibCloseBtn').onclick = closeCalibrator;
   document.getElementById('calibGrabBtn').onclick = () => grabCalibSnapshot();
-  document.getElementById('calibGrabToolbarBtn').onclick = () => {
+  const grabToolbarBtn = document.getElementById('calibGrabToolbarBtn');
+  if(grabToolbarBtn) grabToolbarBtn.onclick = () => {
     _calib.mode = 'tpl';
     _calib.tplBank = 'ui';
     _calib.cropBox = null;
     grabCalibSnapshot('toolbar');
   };
+  const loadImgBtn = document.getElementById('calibLoadImgBtn');
+  if(loadImgBtn) loadImgBtn.onclick = () => triggerIpadBroadcastOrLoadFrame();
+  const exportPackBtn = document.getElementById('calibExportPackBtn');
+  if(exportPackBtn) exportPackBtn.onclick = () => {
+    if(_comp.ws && _comp.ws.readyState === 1){
+      _comp.ws.send(JSON.stringify({ type: 'calib_export_pack' }));
+    }
+  };
+  const importPackBtn = document.getElementById('calibImportPackBtn');
+  if(importPackBtn) importPackBtn.onclick = () => {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.json,application/json';
+    inp.onchange = (ev) => {
+      const f = ev.target.files && ev.target.files[0];
+      if(!f) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try{
+          const pack = JSON.parse(reader.result);
+          if(_comp.ws && _comp.ws.readyState === 1){
+            _comp.ws.send(JSON.stringify({ type: 'calib_import_pack', pack }));
+          }
+        }catch(err){
+          _calib.error = 'Invalid JSON pack file: ' + (err.message || err);
+          renderCalibModal();
+        }
+      };
+      reader.readAsText(f);
+    };
+    inp.click();
+  };
   document.getElementById('calibModeRoiBtn').onclick = () => {
     _calib.mode = 'roi';
-    if(_calib.anchorMode === 'toolbar'){ grabCalibSnapshot('game_viewport'); return; }
+    if(_calib.anchorMode === 'toolbar'){ grabCalibSnapshot(_comp.ipadMode ? 'ipad_split_left' : 'game_viewport'); return; }
     renderCalibModal();
   };
   document.getElementById('calibModeTplBtn').onclick = () => { _calib.mode = 'tpl'; renderCalibModal(); };
@@ -4743,7 +4877,7 @@ function renderCalibModal(){
       }
       if(bank !== 'ui' && _calib.anchorMode === 'toolbar'){
         _calib.cropBox = null;
-        grabCalibSnapshot('game_viewport');
+        grabCalibSnapshot(_comp.ipadMode ? 'ipad_split_left' : 'game_viewport');
         return;
       }
       renderCalibModal();
@@ -4820,12 +4954,16 @@ function disconnectCompanion(){
 }
 
 function connectCompanion(immediate = false){
-  if(!_comp.enabled || typeof WebSocket === 'undefined') return;
+  if(!_comp.enabled) return;
   if(_comp.ws && (_comp.ws.readyState === 0 || _comp.ws.readyState === 1)) return;
   if(_comp.timer){ clearTimeout(_comp.timer); _comp.timer = null; }
   if(immediate) _comp.backoffMs = 2000;
   try{
-    const ws = new WebSocket('ws://127.0.0.1:8765');
+    const useIpadSocket = _comp.ipadMode && typeof IpadCompanionEngine !== 'undefined';
+    if(!useIpadSocket && typeof WebSocket === 'undefined') return;
+    const ws = useIpadSocket
+      ? new IpadCompanionEngine.IpadCompanionSocket()
+      : new WebSocket('ws://127.0.0.1:8765');
     _comp.ws = ws;
     ws.onopen = () => {
       _comp.connected = true;
@@ -4845,7 +4983,7 @@ function connectCompanion(immediate = false){
       _comp.windowFound = false;
       if(wasConnected){
         if(_comp.enabled){
-          triggerAlert('disconnect', '🔌 Companion Disconnected', 'Desktop companion WebSocket closed — reconnecting…', {
+          triggerAlert('disconnect', '🔌 Companion Disconnected', 'Companion connection closed — reconnecting…', {
             key: 'ws_close', cooldownMs: 8000, speak: 'Companion disconnected'
           });
         }

@@ -181,6 +181,55 @@ def detect_game_viewport_local(win_bgr: np.ndarray) -> tuple[int, int, int, int]
     return (x0, y0, vw, vh)
 
 
+def detect_split_view_left_pane(
+    win_bgr: np.ndarray,
+    default_split_ratio: float = 0.65,
+) -> tuple[int, int, int, int]:
+    """Isolate the left Safari pane in an iPadOS Split View frame, then detect the 16:9 Playtech game viewport inside it."""
+    h, w = win_bgr.shape[:2]
+    if h < 120 or w < 160:
+        return (0, 0, w, h)
+
+    gray = cv2.cvtColor(win_bgr, cv2.COLOR_BGR2GRAY) if win_bgr.ndim == 3 else win_bgr
+    # Search for the vertical black iPadOS Split View divider bar between 42% and 78% of screen width
+    search_x0 = int(w * 0.42)
+    search_x1 = int(w * 0.78)
+    y_band0 = int(h * 0.12)
+    y_band1 = max(y_band0 + 16, int(h * 0.88))
+
+    split_w = w
+    if search_x1 > search_x0 + 8:
+        band = gray[y_band0:y_band1, search_x0:search_x1]
+        col_p90 = np.percentile(band, 90, axis=0)
+        col_mean = np.mean(band, axis=0)
+        dark_cols = (col_p90 <= 22.0) & (col_mean <= 14.0)
+
+        best_run: tuple[int, int] | None = None
+        i = 0
+        n = len(dark_cols)
+        while i < n:
+            if dark_cols[i]:
+                j = i
+                while j < n and dark_cols[j]:
+                    j += 1
+                if (j - i) >= 4:
+                    if best_run is None or (j - i) > (best_run[1] - best_run[0]):
+                        best_run = (i, j)
+                i = j
+            else:
+                i += 1
+
+        if best_run is not None:
+            split_w = max(160, search_x0 + best_run[0])
+        elif (w / max(1, h)) >= 1.22:
+            # Full landscape iPad frame without an obvious black divider: default to left Split View ratio
+            split_w = max(160, int(round(w * default_split_ratio)))
+
+    left_bgr = win_bgr[:, :split_w]
+    vx, vy, vw, vh = detect_game_viewport_local(left_bgr)
+    return (vx, vy, min(vw, split_w - vx), vh)
+
+
 class ViewportSmoother:
     """Stabilizes detected game viewport bounds across frames with small jitter hysteresis."""
 
@@ -195,9 +244,11 @@ class ViewportSmoother:
 
     def resolve_anchor(self, win: WindowRect, win_bgr: np.ndarray, anchor_mode: str) -> tuple[WindowRect, tuple[int, int, int, int]]:
         """Return (absolute_screen_anchor_rect, local_viewport_rect_inside_win)."""
-        local = detect_game_viewport_local(win_bgr)
-        if anchor_mode != "game_viewport":
-            full_local = (0, 0, win.width, win.height)
+        if anchor_mode == "ipad_split_left":
+            local = detect_split_view_left_pane(win_bgr)
+        else:
+            local = detect_game_viewport_local(win_bgr)
+        if anchor_mode not in ("game_viewport", "ipad_split_left"):
             return win, local
 
         win_size = (win.width, win.height)

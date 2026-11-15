@@ -42,4 +42,34 @@ Add `--preview` only if you want a separate scaled debug overlay window (`Q` or 
 
 ```powershell
 uv run pytest -v
+node ipad/test_engine.js
 ```
+
+---
+
+## 4. Standalone iPadOS + Safari (Split View) Setup
+
+The tracker can run **100% standalone on an iPad** alongside Playtech / Newport in **Safari** using iPadOS **Split View** (Safari on the left, `BJ Tracker` app on the right) with **zero DOM injection, zero content scripts, and zero network hooks**.
+
+### How Anti-Detection Works on iPadOS
+1. **OS-Level ReplayKit Screen Broadcast (`RPBroadcastSampleHandler`)**: Captures hardware-composited screen frames at the OS level (`BroadcastSampleHandler.swift`), downscales to $\le 1280\text{px}$ width under 12 MB RAM, and writes to a lock-free memory-mapped App Group ring buffer (`SharedFrameRing.swift`). Safari WebKit does **not** expose `UIScreen.isCaptured` to web page JavaScript, and Playtech WebRTC/HLS canvas streams are not FairPlay DRM-encrypted.
+2. **Continuous Foreground Visibility via Split View**: Running Safari (left pane) and `BJ Tracker` (right pane) in iPadOS **Split View** keeps both apps active in the foreground (`document.visibilityState === "visible"`), preventing background tab throttling or visibility-change telemetry.
+3. **Split-View Left-Pane 16:9 Auto-Isolation (`ipad_split_left`)**: Automatically detects the vertical black iPadOS Split View divider, crops to the left Safari pane, and isolates the 16:9 Playtech game frame (`detectSplitViewLeftPane` in `companion/ipad/companion_engine.js` and `detect_split_view_left_pane` in `companion/win_anchor.py`).
+4. **Zero-DOM Safari Keep-Alive Extension**: Uses `browser.tabs.reload(tabId, { bypassCache: false })` only (`permissions: ["tabs", "alarms"]`, zero `content_scripts`, zero `host_permissions`), with automatic spoken/visual alert fallback during `PLACE_BETS` if Safari suspends the extension background worker.
+
+### Step-by-Step iPad Installation (No Mac Required)
+1. **Download `BlackjackTracker.ipa`**:
+   - Open your GitHub repository → **Actions** tab → **Build iPad Tracker IPA** workflow → download the **`BlackjackTracker-iPad-IPA`** artifact and unzip `BlackjackTracker.ipa` (or build locally on a Mac with `cd companion/ipad/ios-app && xcodegen generate && xcodebuild`).
+2. **Sideload onto your iPad (from Windows or Mac)**:
+   - Open **Sideloadly** or **AltStore** on your PC/Mac, connect your iPad, and install `BlackjackTracker.ipa` using your Apple ID.
+   - On iPad, go to **Settings → General → VPN & Device Management** and trust your developer certificate, then enable **Settings → Privacy & Security → Developer Mode**.
+3. **Enable the Safari Keep-Alive Extension (Optional)**:
+   - On iPad, go to **Settings → Safari → Extensions → Newport Keep-Alive (Safari)** and toggle it **On**.
+4. **Launch in iPad Split View**:
+   - Open **Safari** on the **left side** of your iPad screen and navigate to the Newport / Playtech *All Bets Blackjack* table.
+   - Drag **BJ Tracker** from the Dock to the **right side** of the screen in **Split View** (e.g., 2/3 Safari on the left, 1/3 Tracker on the right).
+   - In the Tracker top bar, tap **`📺 Broadcast Screen`** → select **`BJ Tracker Broadcast`** → tap **Start Broadcast**.
+5. **Calibrating or Syncing Templates (`📦 Export Pack` / `📥 Import Pack`)**:
+   - All 78 repository templates (`hud`, `felt`, `banner`, `suit`, `ui`) are pre-bundled out of the box in `companion/ipad/default_pack.js`.
+   - To transfer custom crops between Windows and iPad, open **`🎯 Calibrate`** and click **`📦 Export Pack`** / **`📥 Import Pack`**.
+

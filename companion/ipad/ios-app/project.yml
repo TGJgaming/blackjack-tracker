@@ -1,0 +1,68 @@
+name: BlackjackTracker
+options:
+  bundleIdPrefix: com.tgjgaming
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "2" # iPad (1,2 for Universal if desired)
+    SUPPORTS_MACCATALYST: NO
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGN_IDENTITY: ""
+
+targets:
+  BlackjackTracker:
+    type: application
+    platform: iOS
+    sources:
+      - path: BlackjackTracker
+      - path: ../../../../index.html
+        buildPhase: resources
+      - path: ../../default_pack.js
+        buildPhase: resources
+      - path: ../../companion_engine.js
+        buildPhase: resources
+    info:
+      path: BlackjackTracker/Info.plist
+    entitlements:
+      path: BlackjackTracker/BlackjackTracker.entitlements
+    dependencies:
+      - target: BroadcastExtension
+        embed: true
+      - target: SafariKeepaliveExtension
+        embed: true
+
+  BroadcastExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: BroadcastExtension
+      - path: BlackjackTracker/SharedFrameRing.swift
+    info:
+      path: BroadcastExtension/Info.plist
+    entitlements:
+      path: BroadcastExtension/BroadcastExtension.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tgjgaming.blackjacktracker.BroadcastExtension
+
+  SafariKeepaliveExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: SafariKeepaliveExtension/SafariWebExtensionHandler.swift
+      - path: SafariKeepaliveExtension/Resources
+        buildPhase: resources
+        type: folder
+    info:
+      path: SafariKeepaliveExtension/Info.plist
+    entitlements:
+      path: SafariKeepaliveExtension/SafariKeepaliveExtension.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tgjgaming.blackjacktracker.SafariKeepaliveExtension

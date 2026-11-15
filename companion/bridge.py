@@ -16,6 +16,7 @@ ALLOWED_ORIGINS = [
     re.compile(r"^null$"),
     re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$"),
     re.compile(r"^chrome-extension://[a-p]{32}$"),
+    re.compile(r"^safari-web-extension://[0-9a-fA-F-]+$"),
 ]
 
 MessageCallback = Callable[[dict[str, Any]], Any]

@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Newport Session Keep-Alive (Safari Split-View)",
+  "version": "1.0.0",
+  "description": "Zero-DOM Safari Web Extension that reloads the Playtech/Newport tab via browser.tabs.reload during Watch-mode breaks without content scripts or host permissions.",
+  "permissions": [
+    "tabs",
+    "alarms"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "persistent": false
+  }
+}

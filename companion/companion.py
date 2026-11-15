@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,14 @@ import cv2
 import numpy as np
 
 from bridge import CompanionBridge
-from calibrate import clear_bank_templates, delete_rank_templates, list_template_counts, save_template_crop
+from calibrate import (
+    clear_bank_templates,
+    delete_rank_templates,
+    export_companion_pack,
+    import_companion_pack,
+    list_template_counts,
+    save_template_crop,
+)
 from config import COMPANION_DIR, CompanionConfig, KeepaliveConfig, load_config, normalize_roi, save_config
 from detector import FrameObservation, PlaytechDetector
 from state_machine import CompanionStateMachine, WatchKeepaliveManager
@@ -22,6 +31,7 @@ from win_anchor import (
     WindowCapturer,
     WindowRect,
     detect_game_viewport_local,
+    detect_split_view_left_pane,
     disable_high_res_timer,
     enable_high_res_timer,
     find_target_window,
@@ -57,8 +67,8 @@ def _draw_preview(
     fh, fw = canvas.shape[:2]
     vx, vy, vw, vh = vp_local
 
-    # Highlight detected Playtech 16:9 game viewport inside Brave
-    if cfg.anchor_mode == "game_viewport":
+    # Highlight detected Playtech 16:9 game viewport inside Brave / iPad Split View
+    if cfg.anchor_mode in ("game_viewport", "ipad_split_left"):
         cv2.rectangle(canvas, (vx, vy), (vx + vw - 1, vy + vh - 1), (255, 255, 255), 1)
         ax, ay, aw, ah = vx, vy, vw, vh
     else:
@@ -104,8 +114,10 @@ def _draw_preview(
     disp_w, disp_h = max(320, int(round(cw * scale))), max(240, int(round(ch * scale)))
 
     win_name = "Playtech Companion Preview (Q=quit)"
-    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win_name, disp_w, disp_h)
+    has_gui = sys.platform == "win32" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if has_gui:
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win_name, disp_w, disp_h)
     cv2.imshow(win_name, combined)
     key = cv2.waitKey(1) & 0xFF
     return key not in (ord("q"), 27)
@@ -408,7 +420,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
 
         if mtype == "calib_grab":
             req_mode = msg.get("anchorMode")
-            if req_mode in ("game_viewport", "window", "toolbar"):
+            if req_mode in ("game_viewport", "ipad_split_left", "window", "toolbar"):
                 calib_anchor_mode = req_mode
             else:
                 calib_anchor_mode = cfg.anchor_mode
@@ -418,7 +430,11 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 return {"type": "calib_error", "error": "Casino window not found. Keep Newport/Playtech open (not minimized)."}
             win_cache = win
             win_bgr = capturer.grab_window(win)
-            vp_local = detect_game_viewport_local(win_bgr)
+            vp_local = (
+                detect_split_view_left_pane(win_bgr)
+                if calib_anchor_mode == "ipad_split_left"
+                else detect_game_viewport_local(win_bgr)
+            )
             calib_vp_local = vp_local
             calib_full_size = (win.width, win.height)
 
@@ -426,7 +442,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 tw = min(win_bgr.shape[1], 420)
                 th = min(win_bgr.shape[0], 160)
                 calib_snapshot = win_bgr[:th, :tw].copy()
-            elif calib_anchor_mode == "game_viewport":
+            elif calib_anchor_mode in ("game_viewport", "ipad_split_left"):
                 vx, vy, vw, vh = vp_local
                 calib_snapshot = win_bgr[vy : vy + vh, vx : vx + vw].copy()
             else:
@@ -455,7 +471,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 if k in cfg.rois:
                     cfg.rois[k] = normalize_roi(v)
             req_mode = msg.get("anchorMode")
-            if req_mode in ("game_viewport", "window"):
+            if req_mode in ("game_viewport", "ipad_split_left", "window"):
                 cfg.anchor_mode = req_mode
             save_config(cfg)
             vp_smoother.reset()
@@ -489,7 +505,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 rx, ry, rw, rh = norm_r
                 cx_px = int(round((rx + rw * 0.5) * sw))
                 cy_px = int(round((ry + rh * 0.5) * sh))
-                if calib_anchor_mode == "game_viewport":
+                if calib_anchor_mode in ("game_viewport", "ipad_split_left"):
                     cx_px += int(calib_vp_local[0])
                     cy_px += int(calib_vp_local[1])
                 cfg.keepalive.reload_btn_offset = [cx_px, cy_px]
@@ -549,6 +565,38 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
 
         if mtype == "calib_test_detect":
             return _run_calib_test(msg.get("rois"))
+
+        if mtype == "calib_export_pack":
+            pack = export_companion_pack(cfg)
+            return {"type": "calib_pack_exported", "pack": pack}
+
+        if mtype == "calib_import_pack":
+            pack_in = msg.get("pack")
+            if not isinstance(pack_in, dict):
+                return {"type": "calib_error", "error": "Invalid companion pack payload."}
+            try:
+                _, imported_cnt = import_companion_pack(
+                    pack_in,
+                    cfg,
+                    replace_existing=bool(msg.get("replaceExisting", True)),
+                )
+            except ValueError as exc:
+                return {"type": "calib_error", "error": str(exc)}
+            save_config(cfg)
+            vp_smoother.reset()
+            anchor_cache = None
+            last_vp_scan = 0.0
+            detector.reload_templates()
+            detector.invalidate_cache(reset_scale_hint=True)
+            return {
+                "type": "calib_saved",
+                "kind": "import_pack",
+                "imported": imported_cnt,
+                "anchorMode": cfg.anchor_mode,
+                "rois": {k: [round(x, 4) for x in v] for k, v in cfg.rois.items()},
+                "templates": list_template_counts(),
+                "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
+            }
 
         return None
 
@@ -696,7 +744,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                             vp_local_cache[1] : vp_local_cache[1] + vp_local_cache[3],
                             vp_local_cache[0] : vp_local_cache[0] + vp_local_cache[2],
                         ]
-                        if cfg.anchor_mode == "game_viewport"
+                        if cfg.anchor_mode in ("game_viewport", "ipad_split_left")
                         else full_win
                     )
                     last_player_img = _crop_norm(base_img, cfg.rois["player_strip"])

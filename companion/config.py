@@ -168,7 +168,7 @@ class CompanionConfig:
                 rois[k] = normalize_roi(v)
 
         anchor = str(raw.get("anchor_mode", "game_viewport"))
-        if anchor not in ("game_viewport", "window"):
+        if anchor not in ("game_viewport", "ipad_split_left", "window"):
             anchor = "game_viewport"
 
         return cls(

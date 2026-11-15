@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -211,6 +212,93 @@ def clear_bank_templates(bank_name: str, templates_root: Path | None = None) -> 
         png.unlink(missing_ok=True)
         removed += 1
     return removed
+
+
+def export_companion_pack(cfg: CompanionConfig, templates_root: Path | None = None) -> dict[str, Any]:
+    """Serialize ROIs/config and all template banks (.png base64) into a portable JSON pack for iPad/Desktop."""
+    import base64
+    import time
+
+    root = templates_root or (COMPANION_DIR / "templates")
+    banks_out: dict[str, list[dict[str, str]]] = {}
+    for bank in ("hud", "felt", "banner", "suit", "ui"):
+        folder = root / bank
+        items: list[dict[str, str]] = []
+        if folder.exists():
+            for png in sorted(folder.glob("*.png")):
+                raw = png.read_bytes()
+                if not raw:
+                    continue
+                items.append(
+                    {
+                        "name": png.name,
+                        "dataB64": base64.b64encode(raw).decode("ascii"),
+                    }
+                )
+        banks_out[bank] = items
+    return {
+        "version": 1,
+        "exportedAt": int(time.time()),
+        "config": cfg.to_dict(),
+        "templates": banks_out,
+    }
+
+
+def import_companion_pack(
+    pack: dict[str, Any],
+    cfg: CompanionConfig,
+    templates_root: Path | None = None,
+    replace_existing: bool = True,
+) -> tuple[CompanionConfig, int]:
+    """Restore config ROIs and template banks from a portable JSON pack; returns (updated_cfg, imported_count)."""
+    import base64
+    import re
+
+    if not isinstance(pack, dict):
+        raise ValueError("Invalid companion pack format (expected JSON object).")
+    root = templates_root or (COMPANION_DIR / "templates")
+    cfg_raw = pack.get("config")
+    if isinstance(cfg_raw, dict):
+        rois_raw = cfg_raw.get("rois")
+        if isinstance(rois_raw, dict):
+            for k, v in rois_raw.items():
+                if k in cfg.rois and isinstance(v, (list, tuple)) and len(v) == 4:
+                    cfg.rois[k] = normalize_roi(v)
+        anchor_in = cfg_raw.get("anchor_mode")
+        if anchor_in in ("game_viewport", "ipad_split_left", "window"):
+            cfg.anchor_mode = str(anchor_in)
+
+    tpls_raw = pack.get("templates")
+    imported = 0
+    safe_name_re = re.compile(r"^[A-Za-z0-9_.-]+\.png$")
+    if isinstance(tpls_raw, dict):
+        for bank in ("hud", "felt", "banner", "suit", "ui"):
+            entries = tpls_raw.get(bank)
+            if not isinstance(entries, list):
+                continue
+            folder = root / bank
+            folder.mkdir(parents=True, exist_ok=True)
+            if replace_existing:
+                for old_png in list(folder.glob("*.png")):
+                    old_png.unlink(missing_ok=True)
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                fname = str(item.get("name") or "").strip()
+                b64 = str(item.get("dataB64") or "").strip()
+                if not safe_name_re.match(fname) or not b64:
+                    continue
+                if "," in b64:
+                    b64 = b64.split(",", 1)[1]
+                try:
+                    raw_bytes = base64.b64decode(b64)
+                except Exception:
+                    continue
+                if len(raw_bytes) < 24:
+                    continue
+                (folder / fname).write_bytes(raw_bytes)
+                imported += 1
+    return cfg, imported
 
 
 def _fit_for_display(frame: np.ndarray, max_frac: float = 0.78) -> tuple[np.ndarray, float]:

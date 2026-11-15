@@ -1,0 +1,52 @@
+name: Build iPad Tracker IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'index.html'
+      - 'companion/ipad/**'
+      - '.github/workflows/build-ipad-ipa.yml'
+
+jobs:
+  build-ipa:
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+
+      - name: Generate Xcode Project & Build Unsigned iPadOS Archive
+        working-directory: companion/ipad/ios-app
+        run: |
+          xcodegen generate
+          xcodebuild \
+            -project BlackjackTracker.xcodeproj \
+            -scheme BlackjackTracker \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package BlackjackTracker.ipa for Sideloadly / AltStore
+        working-directory: companion/ipad/ios-app
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/BlackjackTracker.app Payload/
+          zip -qry BlackjackTracker.ipa Payload
+
+      - name: Upload BlackjackTracker.ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlackjackTracker-iPad-IPA
+          path: companion/ipad/ios-app/BlackjackTracker.ipa
+          if-no-files-found: error

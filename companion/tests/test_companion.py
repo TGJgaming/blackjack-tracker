@@ -2339,6 +2339,60 @@ def test_round_over_trigger_ext_bridge_and_escalation() -> None:
     assert any(m.get("type") == "browser_ext_hello" for m in ext_msgs)
 
 
+def test_ipad_split_view_viewport_and_companion_pack_roundtrip(tmp_path: Path) -> None:
+    """iPad Split View left-pane anchoring isolates Safari game frame from right-pane tracker UI and exports/imports packs."""
+    from calibrate import export_companion_pack, import_companion_pack, list_template_counts, save_template_crop
+    from win_anchor import ViewportSmoother, WindowRect, detect_split_view_left_pane
+
+    # 1. Construct synthetic iPad landscape Split View screen (1200x800):
+    #    - Left Safari pane: x=0..760 (top Safari bar y=0..90, Playtech 16:9 game y=140..568, black letterbox below)
+    #    - Vertical black Split View divider: x=760..772 (all 0s)
+    #    - Right Tracker UI pane: x=772..1200 (bright UI cards across full height y=40..780)
+    screen = np.zeros((800, 1200, 3), dtype=np.uint8)
+    screen[10:80, 0:760] = 45  # Safari address bar
+    screen[140:568, 0:760] = 85  # Playtech 16:9 game frame in left pane
+    screen[:, 760:772] = 0  # iPadOS Split View divider bar
+    screen[40:780, 772:1200] = 180  # Right pane Tracker UI (must be ignored!)
+
+    vx, vy, vw, vh = detect_split_view_left_pane(screen)
+    assert vx == 0
+    assert 745 <= vw <= 762
+    assert 125 <= vy <= 145
+    assert 415 <= vh <= 445
+
+    smoother = ViewportSmoother(tol_px=8)
+    win = WindowRect(hwnd=1, title="iPad ReplayKit Screen", left=0, top=0, width=1200, height=800)
+    abs_anchor, vp_local = smoother.resolve_anchor(win, screen, "ipad_split_left")
+    assert abs_anchor.width == vw and abs_anchor.height == vh
+    assert vp_local == (vx, vy, vw, vh)
+
+    # 2. Export & Import Companion Pack round-trip
+    src_root = tmp_path / "src_templates"
+    dst_root = tmp_path / "dst_templates"
+    save_template_crop("hud", "A", _make_card_glyph("A"), templates_root=src_root)
+    save_template_crop("suit", "S", _make_card_glyph("S", size=(16, 16)), templates_root=src_root)
+    save_template_crop("banner", "WAIT", _make_card_glyph("WAIT", size=(60, 18)), templates_root=src_root)
+
+    cfg_src = CompanionConfig(anchor_mode="ipad_split_left")
+    cfg_src.rois["player_strip"] = (0.40, 0.65, 0.34, 0.22)
+    pack = export_companion_pack(cfg_src, templates_root=src_root)
+    assert pack["version"] == 1
+    assert pack["config"]["anchor_mode"] == "ipad_split_left"
+    assert len(pack["templates"]["hud"]) == 1
+    assert len(pack["templates"]["suit"]) == 1
+    assert len(pack["templates"]["banner"]) == 1
+
+    cfg_dst = CompanionConfig()
+    cfg_dst, imported = import_companion_pack(pack, cfg_dst, templates_root=dst_root)
+    assert imported == 3
+    assert cfg_dst.anchor_mode == "ipad_split_left"
+    assert cfg_dst.rois["player_strip"] == (0.40, 0.65, 0.34, 0.22)
+    counts = list_template_counts(dst_root)
+    assert counts["hud"].get("A") == 1
+    assert counts["suit"].get("S") == 1
+    assert counts["banner"].get("WAIT") == 1
+
+
 
 
 
