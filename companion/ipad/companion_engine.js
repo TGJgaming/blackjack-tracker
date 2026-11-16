@@ -21,6 +21,11 @@
 })(typeof globalThis !== "undefined" ? globalThis : this, function (PRELOADED_PACK) {
   "use strict";
 
+  const _ENGINE_SCRIPT_URL =
+    typeof document !== "undefined" && document.currentScript && document.currentScript.src
+      ? String(document.currentScript.src)
+      : "";
+
   const RANK_TO_VAL = {
     "2": 2,
     "3": 3,
@@ -50,6 +55,14 @@
     0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.12, 1.20,
     1.28, 1.36, 1.45, 1.56, 1.68, 1.80, 1.85, 1.95, 2.08, 2.25, 2.45,
   ];
+
+  function normalizeRotationDeg(deg) {
+    const n = Number(deg);
+    if (!Number.isFinite(n)) return 0;
+    const rounded = Math.round(n / 90) * 90;
+    const mod = ((rounded % 360) + 360) % 360;
+    return (mod === 90 || mod === 180 || mod === 270) ? mod : 0;
+  }
 
   function normalizeRoi(coords) {
     if (!Array.isArray(coords) || coords.length !== 4) {
@@ -84,6 +97,7 @@
     return {
       window_titles: base.window_titles || ["Live Games", "All Bets Blackjack", "epicworld", "Playtech"],
       anchor_mode: base.anchor_mode || "ipad_split_left",
+      frame_rotation: normalizeRotationDeg(base.frame_rotation || 0),
       fps: Number(base.fps || 10.0),
       burst_fps: Number(base.burst_fps || 20.0),
       confirm_frames: Math.max(1, Number(base.confirm_frames ?? 3)),
@@ -330,6 +344,81 @@
     return { w, h, c, data: dst };
   }
 
+  function rotateImage(img, deg) {
+    if (!img || img.w === 0 || img.h === 0) return img;
+    const d = normalizeRotationDeg(deg);
+    if (d === 0) return img;
+    if (d === 180) return rotate180(img);
+    const w = img.w, h = img.h, c = img.c;
+    const src = img.data;
+    const dstW = h, dstH = w;
+    const dst = new Uint8Array(dstW * dstH * c);
+    if (d === 90) {
+      if (c === 3) {
+        for (let y = 0; y < h; y++) {
+          const dx = h - 1 - y;
+          let sOff = y * w * 3;
+          for (let x = 0; x < w; x++, sOff += 3) {
+            const dOff = (x * dstW + dx) * 3;
+            dst[dOff] = src[sOff];
+            dst[dOff + 1] = src[sOff + 1];
+            dst[dOff + 2] = src[sOff + 2];
+          }
+        }
+      } else if (c === 1) {
+        for (let y = 0; y < h; y++) {
+          const dx = h - 1 - y;
+          const sRow = y * w;
+          for (let x = 0; x < w; x++) {
+            dst[x * dstW + dx] = src[sRow + x];
+          }
+        }
+      } else {
+        for (let y = 0; y < h; y++) {
+          const dx = h - 1 - y;
+          for (let x = 0; x < w; x++) {
+            const sOff = (y * w + x) * c;
+            const dOff = (x * dstW + dx) * c;
+            for (let k = 0; k < c; k++) dst[dOff + k] = src[sOff + k];
+          }
+        }
+      }
+    } else {
+      // d === 270 CW (90 CCW)
+      if (c === 3) {
+        for (let y = 0; y < h; y++) {
+          const dx = y;
+          let sOff = y * w * 3;
+          for (let x = 0; x < w; x++, sOff += 3) {
+            const dy = w - 1 - x;
+            const dOff = (dy * dstW + dx) * 3;
+            dst[dOff] = src[sOff];
+            dst[dOff + 1] = src[sOff + 1];
+            dst[dOff + 2] = src[sOff + 2];
+          }
+        }
+      } else if (c === 1) {
+        for (let y = 0; y < h; y++) {
+          const dx = y;
+          const sRow = y * w;
+          for (let x = 0; x < w; x++) {
+            dst[(w - 1 - x) * dstW + dx] = src[sRow + x];
+          }
+        }
+      } else {
+        for (let y = 0; y < h; y++) {
+          const dx = y;
+          for (let x = 0; x < w; x++) {
+            const sOff = (y * w + x) * c;
+            const dOff = ((w - 1 - x) * dstW + dx) * c;
+            for (let k = 0; k < c; k++) dst[dOff + k] = src[sOff + k];
+          }
+        }
+      }
+    }
+    return { w: dstW, h: dstH, c, data: dst };
+  }
+
   function copyMakeBorder(img, pad, value = 255) {
     const nw = img.w + pad * 2;
     const nh = img.h + pad * 2;
@@ -383,20 +472,10 @@
     return vLo + (vHi - vLo) * (target - loIdx);
   }
 
-  /**
-   * Exact TM_CCOEFF_NORMED template matcher over 1-channel grayscale images.
-   * Returns { width, height, data: Float32Array, maxVal, maxX, maxY }.
-   */
-  function matchTemplateCCoeffNormed(srcGray, tplGray) {
-    const sw = srcGray.w, sh = srcGray.h;
-    const tw = tplGray.w, th = tplGray.h;
-    const rw = sw - tw + 1;
-    const rh = sh - th + 1;
-    if (rw <= 0 || rh <= 0) {
-      return { w: 0, h: 0, data: new Float32Array(0), maxVal: -1, maxX: 0, maxY: 0 };
-    }
-    const nTpl = tw * th;
+  function computeTplZeroMean(tplGray) {
+    const nTpl = tplGray.w * tplGray.h;
     const tData = tplGray.data;
+    if (nTpl === 0) return { tZero: new Float32Array(0), tNorm: 0 };
     let tSum = 0;
     for (let i = 0; i < nTpl; i++) tSum += tData[i];
     const tMean = tSum / nTpl;
@@ -407,31 +486,242 @@
       tZero[i] = d;
       tNormSq += d * d;
     }
-    const tNorm = Math.sqrt(tNormSq);
+    return { tZero, tNorm: Math.sqrt(tNormSq) };
+  }
+
+  function nextPow2(n) {
+    let p = 1;
+    while (p < n) p <<= 1;
+    return p;
+  }
+
+  const _fftPlans = new Map();
+  function getFftPlan(N) {
+    let plan = _fftPlans.get(N);
+    if (plan) return plan;
+    const bits = Math.round(Math.log2(N));
+    const rev = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+      let x = i, r = 0;
+      for (let b = 0; b < bits; b++) {
+        r = (r << 1) | (x & 1);
+        x >>= 1;
+      }
+      rev[i] = r;
+    }
+    const cosT = new Float64Array(N >> 1);
+    const sinT = new Float64Array(N >> 1);
+    for (let i = 0; i < (N >> 1); i++) {
+      const a = (-2 * Math.PI * i) / N;
+      cosT[i] = Math.cos(a);
+      sinT[i] = Math.sin(a);
+    }
+    plan = { N, rev, cosT, sinT };
+    _fftPlans.set(N, plan);
+    return plan;
+  }
+
+  function fft1d(re, im, plan, inverse) {
+    const N = plan.N, rev = plan.rev, cosT = plan.cosT, sinT = plan.sinT;
+    for (let i = 0; i < N; i++) {
+      const j = rev[i];
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    const sign = inverse ? -1 : 1;
+    for (let len = 2; len <= N; len <<= 1) {
+      const half = len >> 1;
+      const step = N / len;
+      if (len === 2) {
+        for (let i = 0; i < N; i += 2) {
+          const tr = re[i + 1], ti = im[i + 1];
+          re[i + 1] = re[i] - tr; im[i + 1] = im[i] - ti;
+          re[i] += tr; im[i] += ti;
+        }
+      } else if (len === 4) {
+        for (let i = 0; i < N; i += 4) {
+          const r0 = re[i], i0 = im[i], r2 = re[i + 2], i2 = im[i + 2];
+          re[i + 2] = r0 - r2; im[i + 2] = i0 - i2;
+          re[i] = r0 + r2; im[i] = i0 + i2;
+          const r1 = re[i + 1], i1 = im[i + 1], r3 = re[i + 3], i3 = im[i + 3];
+          const tr = sign * i3, ti = -sign * r3;
+          re[i + 3] = r1 - tr; im[i + 3] = i1 - ti;
+          re[i + 1] = r1 + tr; im[i + 1] = i1 + ti;
+        }
+      } else {
+        for (let i = 0; i < N; i += len) {
+          for (let j = 0, k = 0; j < half; j++, k += step) {
+            const wr = cosT[k], wi = sign * sinT[k];
+            const idx1 = i + j, idx2 = idx1 + half;
+            const r2 = re[idx2], i2 = im[idx2];
+            const tr = wr * r2 - wi * i2;
+            const ti = wr * i2 + wi * r2;
+            re[idx2] = re[idx1] - tr; im[idx2] = im[idx1] - ti;
+            re[idx1] += tr; im[idx1] += ti;
+          }
+        }
+      }
+    }
+    if (inverse) {
+      const inv = 1 / N;
+      for (let i = 0; i < N; i++) {
+        re[i] *= inv;
+        im[i] *= inv;
+      }
+    }
+  }
+
+  function rfft2RowsForward(re, im, planX, outRe, outIm, off0, off1, halfX) {
+    fft1d(re, im, planX, false);
+    const N = planX.N;
+    outRe[off0] = re[0]; outIm[off0] = 0;
+    outRe[off1] = im[0]; outIm[off1] = 0;
+    for (let k = 1; k < halfX - 1; k++) {
+      const rk = re[k], ik = im[k], rm = re[N - k], imk = im[N - k];
+      outRe[off0 + k] = 0.5 * (rk + rm);
+      outIm[off0 + k] = 0.5 * (ik - imk);
+      outRe[off1 + k] = 0.5 * (ik + imk);
+      outIm[off1 + k] = 0.5 * (rm - rk);
+    }
+    const mid = halfX - 1;
+    outRe[off0 + mid] = re[mid]; outIm[off0 + mid] = 0;
+    outRe[off1 + mid] = im[mid]; outIm[off1 + mid] = 0;
+  }
+
+  function rfft2RowsInverse(re, im, planX, inRe, inIm, off0, off1, halfX) {
+    const N = planX.N;
+    re[0] = inRe[off0];
+    im[0] = inRe[off1];
+    for (let k = 1; k < halfX - 1; k++) {
+      const ar = inRe[off0 + k], ai = inIm[off0 + k];
+      const br = inRe[off1 + k], bi = inIm[off1 + k];
+      re[k] = ar - bi;
+      im[k] = ai + br;
+      re[N - k] = ar + bi;
+      im[N - k] = br - ai;
+    }
+    const mid = halfX - 1;
+    re[mid] = inRe[off0 + mid];
+    im[mid] = inRe[off1 + mid];
+    fft1d(re, im, planX, true);
+  }
+
+  function prepareSourceForMatch(srcGray, buildFft = false) {
+    const sw = srcGray.w, sh = srcGray.h, d = srcGray.data;
+    const iw = sw + 1;
+    const sumS = new Float64Array(iw * (sh + 1));
+    const sumSqS = new Float64Array(iw * (sh + 1));
+    for (let y = 0; y < sh; y++) {
+      let rowS = 0, rowSq = 0;
+      const srcRow = y * sw, prevOff = y * iw, curOff = (y + 1) * iw;
+      for (let x = 0; x < sw; x++) {
+        const v = d[srcRow + x];
+        rowS += v;
+        rowSq += v * v;
+        sumS[curOff + x + 1] = sumS[prevOff + x + 1] + rowS;
+        sumSqS[curOff + x + 1] = sumSqS[prevOff + x + 1] + rowSq;
+      }
+    }
+    const prep = { srcGray, sw, sh, iw, d, sumS, sumSqS, fftReady: false };
+    if (buildFft) ensureSourceFft(prep);
+    return prep;
+  }
+
+  function ensureSourceFft(prep) {
+    if (prep.fftReady) return prep;
+    const sw = prep.sw, sh = prep.sh, d = prep.d;
+    const Fx = nextPow2(Math.max(2, sw));
+    const Fy = nextPow2(Math.max(2, sh));
+    const planX = getFftPlan(Fx);
+    const planY = getFftPlan(Fy);
+    const halfX = (Fx >> 1) + 1;
+    const specStride = halfX;
+    const specSize = specStride * Fy;
+    const srcRe = new Float64Array(specSize);
+    const srcIm = new Float64Array(specSize);
+    const rowRe = new Float64Array(Fx), rowIm = new Float64Array(Fx);
+    const colRe = new Float64Array(Fy), colIm = new Float64Array(Fy);
+
+    for (let y = 0; y < sh; y += 2) {
+      rowRe.fill(0);
+      rowIm.fill(0);
+      const sOff0 = y * sw;
+      for (let x = 0; x < sw; x++) rowRe[x] = d[sOff0 + x];
+      if (y + 1 < sh) {
+        const sOff1 = (y + 1) * sw;
+        for (let x = 0; x < sw; x++) rowIm[x] = d[sOff1 + x];
+        rfft2RowsForward(rowRe, rowIm, planX, srcRe, srcIm, y * specStride, (y + 1) * specStride, halfX);
+      } else {
+        fft1d(rowRe, rowIm, planX, false);
+        srcRe.set(rowRe.subarray(0, halfX), y * specStride);
+        srcIm.set(rowIm.subarray(0, halfX), y * specStride);
+      }
+    }
+    for (let x = 0; x < halfX; x++) {
+      for (let y = 0; y < Fy; y++) {
+        colRe[y] = srcRe[y * specStride + x];
+        colIm[y] = srcIm[y * specStride + x];
+      }
+      fft1d(colRe, colIm, planY, false);
+      for (let y = 0; y < Fy; y++) {
+        srcRe[y * specStride + x] = colRe[y];
+        srcIm[y * specStride + x] = colIm[y];
+      }
+    }
+
+    prep.Fx = Fx;
+    prep.Fy = Fy;
+    prep.halfX = halfX;
+    prep.specStride = specStride;
+    prep.planX = planX;
+    prep.planY = planY;
+    prep.srcRe = srcRe;
+    prep.srcIm = srcIm;
+    prep.tplRe = new Float64Array(specSize);
+    prep.tplIm = new Float64Array(specSize);
+    prep.rowRe = rowRe;
+    prep.rowIm = rowIm;
+    prep.colRe = colRe;
+    prep.colIm = colIm;
+    prep.fftReady = true;
+    return prep;
+  }
+
+  function matchSpatialIntegral(prep, tplGray, tZero, tNorm, maxXLimit = null, maxYLimit = null) {
+    const { sw, sh, iw, d, sumS, sumSqS } = prep;
+    const tw = tplGray.w, th = tplGray.h;
+    const rw = sw - tw + 1;
+    const rh = sh - th + 1;
+    if (rw <= 0 || rh <= 0) {
+      return { w: 0, h: 0, data: new Float32Array(0), maxVal: -1, maxX: 0, maxY: 0 };
+    }
     const out = new Float32Array(rw * rh);
     if (tNorm < 1e-5) {
       return { w: rw, h: rh, data: out, maxVal: 0, maxX: 0, maxY: 0 };
     }
-
-    const sData = srcGray.data;
+    const nTpl = tw * th;
+    const yLim = maxYLimit !== null ? Math.min(rh, Math.max(0, maxYLimit | 0)) : rh;
+    const xLim = maxXLimit !== null ? Math.min(rw, Math.max(0, maxXLimit | 0)) : rw;
     let maxVal = -Infinity;
     let maxX = 0, maxY = 0;
-
-    for (let y = 0; y < rh; y++) {
-      for (let x = 0; x < rw; x++) {
-        let pSum = 0;
-        let pSumSq = 0;
+    for (let y = 0; y < yLim; y++) {
+      const iTop = y * iw;
+      const iBot = (y + th) * iw;
+      const outOff = y * rw;
+      for (let x = 0; x < xLim; x++) {
         let dot = 0;
         let tIdx = 0;
         for (let ty = 0; ty < th; ty++) {
           let sIdx = (y + ty) * sw + x;
           for (let tx = 0; tx < tw; tx++, sIdx++, tIdx++) {
-            const sv = sData[sIdx];
-            pSum += sv;
-            pSumSq += sv * sv;
-            dot += sv * tZero[tIdx];
+            dot += d[sIdx] * tZero[tIdx];
           }
         }
+        const x1 = x + tw;
+        const pSum = sumS[iBot + x1] - sumS[iTop + x1] - sumS[iBot + x] + sumS[iTop + x];
+        const pSumSq = sumSqS[iBot + x1] - sumSqS[iTop + x1] - sumSqS[iBot + x] + sumSqS[iTop + x];
         const pVar = pSumSq - (pSum * pSum) / nTpl;
         let corr = 0;
         if (pVar > 1e-5) {
@@ -439,7 +729,7 @@
           if (corr > 1) corr = 1;
           else if (corr < -1) corr = -1;
         }
-        out[y * rw + x] = corr;
+        out[outOff + x] = corr;
         if (corr > maxVal) {
           maxVal = corr;
           maxX = x;
@@ -447,7 +737,164 @@
         }
       }
     }
+    if (maxVal === -Infinity) { maxVal = 0; }
     return { w: rw, h: rh, data: out, maxVal, maxX, maxY };
+  }
+
+  function matchFFTPacked(prep, tplGray, tZero, tNorm) {
+    ensureSourceFft(prep);
+    const { sw, sh, iw, sumS, sumSqS, Fx, Fy, halfX, specStride, planX, planY, srcRe, srcIm, tplRe, tplIm, rowRe, rowIm, colRe, colIm } = prep;
+    const tw = tplGray.w, th = tplGray.h;
+    const rw = sw - tw + 1;
+    const rh = sh - th + 1;
+    if (rw <= 0 || rh <= 0) {
+      return { w: 0, h: 0, data: new Float32Array(0), maxVal: -1, maxX: 0, maxY: 0 };
+    }
+    const nTpl = tw * th;
+    const out = new Float32Array(rw * rh);
+    if (tNorm < 1e-5) {
+      return { w: rw, h: rh, data: out, maxVal: 0, maxX: 0, maxY: 0 };
+    }
+
+    tplRe.fill(0);
+    tplIm.fill(0);
+    for (let ty = 0; ty < th; ty += 2) {
+      rowRe.fill(0);
+      rowIm.fill(0);
+      const tOff0 = ty * tw;
+      for (let tx = 0; tx < tw; tx++) rowRe[tx] = tZero[tOff0 + tx];
+      if (ty + 1 < th) {
+        const tOff1 = (ty + 1) * tw;
+        for (let tx = 0; tx < tw; tx++) rowIm[tx] = tZero[tOff1 + tx];
+        rfft2RowsForward(rowRe, rowIm, planX, tplRe, tplIm, ty * specStride, (ty + 1) * specStride, halfX);
+      } else {
+        fft1d(rowRe, rowIm, planX, false);
+        tplRe.set(rowRe.subarray(0, halfX), ty * specStride);
+        tplIm.set(rowIm.subarray(0, halfX), ty * specStride);
+      }
+    }
+    for (let x = 0; x < halfX; x++) {
+      for (let y = 0; y < Fy; y++) {
+        colRe[y] = tplRe[y * specStride + x];
+        colIm[y] = tplIm[y * specStride + x];
+      }
+      fft1d(colRe, colIm, planY, false);
+      for (let y = 0; y < Fy; y++) {
+        const idx = y * specStride + x;
+        const sr = srcRe[idx], si = srcIm[idx], tr = colRe[y], ti = colIm[y];
+        colRe[y] = sr * tr + si * ti;
+        colIm[y] = si * tr - sr * ti;
+      }
+      fft1d(colRe, colIm, planY, true);
+      for (let y = 0; y < rh; y++) {
+        const idx = y * specStride + x;
+        tplRe[idx] = colRe[y];
+        tplIm[idx] = colIm[y];
+      }
+    }
+
+    let maxVal = -Infinity;
+    let maxX = 0, maxY = 0;
+    for (let y = 0; y < rh; y += 2) {
+      if (y + 1 < rh) {
+        rfft2RowsInverse(rowRe, rowIm, planX, tplRe, tplIm, y * specStride, (y + 1) * specStride, halfX);
+        for (let pair = 0; pair < 2; pair++) {
+          const yy = y + pair;
+          const corrArr = pair === 0 ? rowRe : rowIm;
+          const iTop = yy * iw, iBot = (yy + th) * iw, outOff = yy * rw;
+          for (let x = 0; x < rw; x++) {
+            const x1 = x + tw;
+            const pSum = sumS[iBot + x1] - sumS[iTop + x1] - sumS[iBot + x] + sumS[iTop + x];
+            const pSumSq = sumSqS[iBot + x1] - sumSqS[iTop + x1] - sumSqS[iBot + x] + sumSqS[iTop + x];
+            const pVar = pSumSq - (pSum * pSum) / nTpl;
+            let corr = 0;
+            if (pVar > 1e-5) {
+              corr = corrArr[x] / (Math.sqrt(pVar) * tNorm);
+              if (corr > 1) corr = 1;
+              else if (corr < -1) corr = -1;
+            }
+            out[outOff + x] = corr;
+            if (corr > maxVal) {
+              maxVal = corr;
+              maxX = x;
+              maxY = yy;
+            }
+          }
+        }
+      } else {
+        const rOff = y * specStride;
+        rowRe[0] = tplRe[rOff];
+        rowIm[0] = tplIm[rOff];
+        for (let x = 1; x < halfX; x++) {
+          const re = tplRe[rOff + x], im = tplIm[rOff + x];
+          rowRe[x] = re;
+          rowIm[x] = im;
+          rowRe[Fx - x] = re;
+          rowIm[Fx - x] = -im;
+        }
+        fft1d(rowRe, rowIm, planX, true);
+        const iTop = y * iw, iBot = (y + th) * iw, outOff = y * rw;
+        for (let x = 0; x < rw; x++) {
+          const x1 = x + tw;
+          const pSum = sumS[iBot + x1] - sumS[iTop + x1] - sumS[iBot + x] + sumS[iTop + x];
+          const pSumSq = sumSqS[iBot + x1] - sumSqS[iTop + x1] - sumSqS[iBot + x] + sumSqS[iTop + x];
+          const pVar = pSumSq - (pSum * pSum) / nTpl;
+          let corr = 0;
+          if (pVar > 1e-5) {
+            corr = rowRe[x] / (Math.sqrt(pVar) * tNorm);
+            if (corr > 1) corr = 1;
+            else if (corr < -1) corr = -1;
+          }
+          out[outOff + x] = corr;
+          if (corr > maxVal) {
+            maxVal = corr;
+            maxX = x;
+            maxY = y;
+          }
+        }
+      }
+    }
+    return { w: rw, h: rh, data: out, maxVal, maxX, maxY };
+  }
+
+  function matchPreparedTemplate(prep, tplGray, tZero, tNorm, maxXLimit = null, maxYLimit = null) {
+    const tw = tplGray.w, th = tplGray.h;
+    const rw = prep.sw - tw + 1;
+    const rh = prep.sh - th + 1;
+    if (rw <= 0 || rh <= 0) {
+      return { w: 0, h: 0, data: new Float32Array(0), maxVal: -1, maxX: 0, maxY: 0 };
+    }
+    const effX = maxXLimit !== null ? Math.min(rw, Math.max(0, maxXLimit | 0)) : rw;
+    const effY = maxYLimit !== null ? Math.min(rh, Math.max(0, maxYLimit | 0)) : rh;
+    const work = effX * effY * tw * th;
+    if (work > 12000 && prep.sw >= 16 && prep.sh >= 16 && tw >= 4 && th >= 4 && (maxXLimit === null && maxYLimit === null ? true : work > 90000)) {
+      return matchFFTPacked(prep, tplGray, tZero, tNorm);
+    }
+    return matchSpatialIntegral(prep, tplGray, tZero, tNorm, maxXLimit, maxYLimit);
+  }
+
+  /**
+   * Exact TM_CCOEFF_NORMED template matcher over 1-channel grayscale images.
+   * Returns { w, h, data: Float32Array, maxVal, maxX, maxY }.
+   */
+  function matchTemplateCCoeffNormed(srcGray, tplGray) {
+    const sw = srcGray.w, sh = srcGray.h;
+    const tw = tplGray.w, th = tplGray.h;
+    const rw = sw - tw + 1;
+    const rh = sh - th + 1;
+    if (rw <= 0 || rh <= 0) {
+      return { w: 0, h: 0, data: new Float32Array(0), maxVal: -1, maxX: 0, maxY: 0 };
+    }
+    const { tZero, tNorm } = computeTplZeroMean(tplGray);
+    if (tNorm < 1e-5) {
+      return { w: rw, h: rh, data: new Float32Array(rw * rh), maxVal: 0, maxX: 0, maxY: 0 };
+    }
+    const work = rw * rh * tw * th;
+    const useFft = work > 25000 && sw >= 16 && sh >= 16;
+    const prep = prepareSourceForMatch(srcGray, useFft);
+    return useFft
+      ? matchFFTPacked(prep, tplGray, tZero, tNorm)
+      : matchSpatialIntegral(prep, tplGray, tZero, tNorm);
   }
 
   /**
@@ -865,7 +1312,12 @@
       tpl._scaleCache.set(key, null);
       return null;
     }
-    const res = { scaled, sw, sh };
+    const { tZero, tNorm } = computeTplZeroMean(scaled);
+    if (tNorm < 1e-5) {
+      tpl._scaleCache.set(key, null);
+      return null;
+    }
+    const res = { scaled, sw, sh, tZero, tNorm };
     tpl._scaleCache.set(key, res);
     return res;
   }
@@ -899,22 +1351,24 @@
         return [null, 0.0, null];
       }
     }
+    const prep = prepareSourceForMatch(gray, false);
     let bestTpl = null, bestConf = 0.0, bestScale = null;
     for (const tpl of templates) {
       for (const sc of scales) {
         const entry = getScaledTplGray(tpl, sc, useMinGray);
         if (!entry || entry.sw > gray.w || entry.sh > gray.h) continue;
-        const m = matchTemplateCCoeffNormed(gray, entry.scaled);
+        const m = matchPreparedTemplate(prep, entry.scaled, entry.tZero, entry.tNorm);
         if (!Number.isFinite(m.maxVal)) continue;
         if (requireContrast) {
+          if (m.maxVal < minConf || m.maxVal <= bestConf) continue;
           const patch = cropImage(gray, m.maxX, m.maxY, entry.sw, entry.sh);
           if (!hasLocalContrast(patch, useMinGray)) continue;
+        } else if (m.maxVal <= bestConf) {
+          continue;
         }
-        if (m.maxVal > bestConf) {
-          bestConf = m.maxVal;
-          bestTpl = tpl;
-          bestScale = sc;
-        }
+        bestConf = m.maxVal;
+        bestTpl = tpl;
+        bestScale = sc;
       }
     }
     if (bestTpl && bestConf >= minConf) return [bestTpl, bestConf, bestScale];
@@ -1027,12 +1481,13 @@
     const activeTpls = filtered.length ? filtered : suitTemplates;
 
     const suitMin = toMinGray(suitZone);
+    const suitPrep = prepareSourceForMatch(suitMin, false);
     let bestSuit = null, bestConf = 0.0;
     for (const tpl of activeTpls) {
       for (const sc of [0.88, 0.96, 1.0, 1.06, 1.12]) {
         const entry = getScaledTplGray(tpl, sc, true);
         if (!entry || entry.sw > suitMin.w || entry.sh > suitMin.h) continue;
-        const m = matchTemplateCCoeffNormed(suitMin, entry.scaled);
+        const m = matchPreparedTemplate(suitPrep, entry.scaled, entry.tZero, entry.tNorm);
         if (Number.isFinite(m.maxVal) && m.maxVal > bestConf) {
           bestConf = m.maxVal;
           bestSuit = tpl.rank;
@@ -1087,30 +1542,40 @@
     }
     if (effRight < 14) return [[], clusterHasBack];
 
+    const topPrep = prepareSourceForMatch(normTop, false);
     const minTail = !clusterHasBack && !edgeClipped ? 14 : 12;
     const peaks = [];
     for (const tpl of rankTemplates) {
       for (const tsc of [0.90, 0.96, 1.0, 1.05, 1.10]) {
         const entry = getScaledTplGray(tpl, tsc, true);
         if (!entry) continue;
-        const { scaled, sw, sh } = entry;
+        const { scaled, sw, sh, tZero, tNorm } = entry;
         if (sw > normTop.w || sh > normTop.h) continue;
         const maxXForTpl = effRight - Math.max(minTail, sw);
         if (maxXForTpl < 0) continue;
-        const m = matchTemplateCCoeffNormed(normTop, scaled);
-        for (let yPos = 0; yPos < Math.min(9, m.h); yPos++) {
-          for (let xPos = 0; xPos <= Math.min(maxXForTpl, m.w - 1); xPos++) {
+        const m = matchPreparedTemplate(topPrep, scaled, tZero, tNorm, maxXForTpl + 1, 9);
+        const yLim = Math.min(9, m.h);
+        const xLim = Math.min(maxXForTpl, m.w - 1);
+        for (let yPos = 0; yPos < yLim; yPos++) {
+          for (let xPos = 0; xPos <= xLim; xPos++) {
             const conf = m.data[yPos * m.w + xPos];
             if (conf < floorConf || !Number.isFinite(conf)) continue;
-            const patch = cropImage(normTop, xPos, yPos, sw, sh);
-            const st = arrayStats(patch.data);
-            if (st.max - st.min < 70) continue;
-            let gt158 = 0, lt120 = 0;
-            for (let k = 0; k < patch.data.length; k++) {
-              if (patch.data[k] > 158) gt158++;
-              if (patch.data[k] < 120) lt120++;
+            let pMin = 255, pMax = 0, gt158 = 0, lt120 = 0;
+            const pData = normTop.data;
+            const ntW = normTop.w;
+            for (let py = 0; py < sh; py++) {
+              let pOff = (yPos + py) * ntW + xPos;
+              for (let px = 0; px < sw; px++, pOff++) {
+                const v = pData[pOff];
+                if (v < pMin) pMin = v;
+                if (v > pMax) pMax = v;
+                if (v > 158) gt158++;
+                if (v < 120) lt120++;
+              }
             }
-            if (gt158 / patch.data.length < 0.26 || lt120 / patch.data.length < 0.07) continue;
+            if (pMax - pMin < 70) continue;
+            const nPatch = sw * sh;
+            if (gt158 / nPatch < 0.26 || lt120 / nPatch < 0.07) continue;
             const prio = conf + (tpl.rank === "10" ? 0.015 : 0.0);
             peaks.push([
               prio,
@@ -1169,17 +1634,104 @@
     return [out, clusterHasBack];
   }
 
+  function computeRoiSignature(img, gridW, gridH, useMinGray = false) {
+    if (!img || img.w === 0 || img.h === 0) {
+      return { w: 0, h: 0, gw: 0, gh: 0, bins: new Uint8Array(0) };
+    }
+    const w = img.w, h = img.h, c = img.c, src = img.data;
+    const gw = Math.max(1, Math.min(gridW, w));
+    const gh = Math.max(1, Math.min(gridH, h));
+    const nBins = gw * gh;
+    const sums = new Int32Array(nBins);
+    const cnts = new Int32Array(nBins);
+    const step = (w * h > 65000) ? 2 : 1;
+    for (let y = 0; y < h; y += step) {
+      const gy = Math.min(gh - 1, ((y * gh) / h) | 0);
+      const binRow = gy * gw;
+      const pxRow = y * w;
+      if (c === 1) {
+        for (let x = 0; x < w; x += step) {
+          const gx = Math.min(gw - 1, ((x * gw) / w) | 0);
+          const bIdx = binRow + gx;
+          sums[bIdx] += src[pxRow + x];
+          cnts[bIdx]++;
+        }
+      } else if (useMinGray) {
+        for (let x = 0; x < w; x += step) {
+          const p = (pxRow + x) * 3;
+          const b = src[p], g = src[p + 1], r = src[p + 2];
+          const v = b < g ? (b < r ? b : r) : (g < r ? g : r);
+          const gx = Math.min(gw - 1, ((x * gw) / w) | 0);
+          const bIdx = binRow + gx;
+          sums[bIdx] += v;
+          cnts[bIdx]++;
+        }
+      } else {
+        for (let x = 0; x < w; x += step) {
+          const p = (pxRow + x) * 3;
+          const v = (29 * src[p] + 150 * src[p + 1] + 77 * src[p + 2] + 128) >> 8;
+          const gx = Math.min(gw - 1, ((x * gw) / w) | 0);
+          const bIdx = binRow + gx;
+          sums[bIdx] += v;
+          cnts[bIdx]++;
+        }
+      }
+    }
+    const bins = new Uint8Array(nBins);
+    for (let i = 0; i < nBins; i++) {
+      bins[i] = cnts[i] > 0 ? Math.round(sums[i] / cnts[i]) : 0;
+    }
+    return { w, h, gw, gh, bins };
+  }
+
+  function roiSigDiff(sigA, sigB) {
+    if (!sigA || !sigB) return 255;
+    if (sigA.w !== sigB.w || sigA.h !== sigB.h || sigA.gw !== sigB.gw || sigA.gh !== sigB.gh) {
+      return 255;
+    }
+    const a = sigA.bins, b = sigB.bins, n = a.length;
+    let maxD = 0;
+    for (let i = 0; i < n; i++) {
+      const d = a[i] - b[i];
+      const ad = d < 0 ? -d : d;
+      if (ad > maxD) maxD = ad;
+    }
+    return maxD;
+  }
+
   class PlaytechDetector {
     constructor(cfg, initialPack = null) {
       this.cfg = cfg;
       this.banks = { hud: [], felt: [], banner: [], suit: [], ui: [] };
       this._bannerTplHints = new Map();
+      this.invalidateCaches();
       if (initialPack) this.loadPack(initialPack);
+    }
+
+    invalidateCaches() {
+      this._bannerTplHints.clear();
+      this._lastPSig = null;
+      this._cachedP = [[], {}, false];
+      this._pSigAge = 0;
+      this._lastDSig = null;
+      this._cachedD = [];
+      this._dSigAge = 0;
+      this._lastBannerSig = null;
+      this._cachedTopBanner = ["", 0.0];
+      this._bannerSigAge = 0;
+      this._lastShuffleSig = null;
+      this._lastShufMode = "";
+      this._cachedShuf = ["", 0.0];
+      this._shufSigAge = 0;
+      this._lastShuffleScanTs = null;
+      this._lastPbSig = null;
+      this._cachedPb = 0.0;
+      this._pbSigAge = 0;
     }
 
     loadPack(pack) {
       this.banks = { hud: [], felt: [], banner: [], suit: [], ui: [] };
-      this._bannerTplHints.clear();
+      this.invalidateCaches();
       if (!pack || !pack.templates) return;
       for (const bank of ["hud", "felt", "banner", "suit", "ui"]) {
         const items = pack.templates[bank] || [];
@@ -1227,7 +1779,7 @@
       const entry = createTemplateEntry(bankName, filename, outImg, "");
       if (!entry) throw new Error("Selected crop has insufficient contrast");
       this.banks[bankName].push(entry);
-      this._bannerTplHints.clear();
+      this.invalidateCaches();
       return { filename, w: outImg.w, h: outImg.h, entry };
     }
 
@@ -1237,7 +1789,7 @@
       const kept = list.filter((t) => t.rank !== tok);
       const removed = list.length - kept.length;
       this.banks[bankName] = kept;
-      this._bannerTplHints.clear();
+      this.invalidateCaches();
       return removed;
     }
 
@@ -1245,7 +1797,7 @@
       const list = this.banks[bankName] || [];
       const removed = list.length;
       this.banks[bankName] = [];
-      this._bannerTplHints.clear();
+      this.invalidateCaches();
       return removed;
     }
 
@@ -1380,44 +1932,93 @@
 
     processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, ts = null }) {
       const now = ts !== null ? ts : performance.now() / 1000;
-      const [pCards, pHands, splitDetected] = this.detectHudStrip(playerImg, false);
-      const [dCards] = this.detectHudStrip(dealerImg, true);
-      const cardsPresent = pCards.length > 0 || dCards.length > 0;
+      const REFRESH_PERIOD = 8;
+      const SIG_TOL = 4;
 
+      const pSig = computeRoiSignature(playerImg, 48, 24, true);
+      const pDiff = roiSigDiff(pSig, this._lastPSig);
+      let pCards, pHands, splitDetected;
+      if (this._lastPSig && (pDiff === 0 || (pDiff <= SIG_TOL && this._pSigAge < REFRESH_PERIOD))) {
+        [pCards, pHands, splitDetected] = this._cachedP;
+        if (pDiff > 0) this._pSigAge++;
+      } else {
+        this._lastPSig = pSig;
+        this._pSigAge = 0;
+        [pCards, pHands, splitDetected] = this.detectHudStrip(playerImg, false);
+        this._cachedP = [pCards, pHands, splitDetected];
+      }
+
+      const dSig = computeRoiSignature(dealerImg, 40, 24, true);
+      const dDiff = roiSigDiff(dSig, this._lastDSig);
+      let dCards;
+      if (this._lastDSig && (dDiff === 0 || (dDiff <= SIG_TOL && this._dSigAge < REFRESH_PERIOD))) {
+        dCards = this._cachedD;
+        if (dDiff > 0) this._dSigAge++;
+      } else {
+        this._lastDSig = dSig;
+        this._dSigAge = 0;
+        [dCards] = this.detectHudStrip(dealerImg, true);
+        this._cachedD = dCards;
+      }
+
+      const cardsPresent = pCards.length > 0 || dCards.length > 0;
       const bannerTpls = this.banks.banner || [];
       let bannerState = "";
       let bannerConf = 0.0;
       let bannerSource = "";
 
       if (bannerImg && bannerImg.w > 0 && bannerTpls.length) {
-        const [btpl, bconf] = this._detectBannerWithHint(
-          bannerImg,
-          bannerTpls,
-          this.cfg.min_banner_confidence,
-          TOP_BANNER_SCALES,
-          "banner"
-        );
-        if (btpl) {
-          bannerState = btpl.rank;
-          bannerConf = bconf;
-          bannerSource = "banner_roi";
+        const banSig = computeRoiSignature(bannerImg, 48, 12, false);
+        const banDiff = roiSigDiff(banSig, this._lastBannerSig);
+        if (this._lastBannerSig && (banDiff === 0 || (banDiff <= SIG_TOL && this._bannerSigAge < REFRESH_PERIOD))) {
+          [bannerState, bannerConf] = this._cachedTopBanner;
+          if (banDiff > 0) this._bannerSigAge++;
+        } else {
+          this._lastBannerSig = banSig;
+          this._bannerSigAge = 0;
+          const [btpl, bconf] = this._detectBannerWithHint(
+            bannerImg,
+            bannerTpls,
+            this.cfg.min_banner_confidence,
+            TOP_BANNER_SCALES,
+            "banner"
+          );
+          if (btpl) {
+            bannerState = btpl.rank;
+            bannerConf = bconf;
+          }
+          this._cachedTopBanner = [bannerState, bannerConf];
         }
+        if (bannerState) bannerSource = "banner_roi";
       }
 
       let shufOn = false;
       let shufConf = 0.0;
+      const shufDue = !cardsPresent || this._lastShuffleScanTs === null || (now - this._lastShuffleScanTs) >= 0.25;
       if (shuffleImg && shuffleImg.w > 0 && bannerTpls.length && !bannerState) {
-        const shufTpls = cardsPresent ? bannerTpls.filter((t) => t.rank === "SHUFFLE" || t.rank === "WAIT") : bannerTpls;
-        const [btpl, bconf] = this._detectBannerWithHint(
-          shuffleImg,
-          shufTpls,
-          this.cfg.min_banner_confidence,
-          TOP_BANNER_SCALES,
-          "shuffle"
-        );
-        if (btpl) {
-          bannerState = btpl.rank;
-          bannerConf = bconf;
+        const shufMode = cardsPresent ? "cards" : "empty";
+        if (shufDue) {
+          const shufSig = computeRoiSignature(shuffleImg, 32, 16, false);
+          const shufDiff = roiSigDiff(shufSig, this._lastShuffleSig);
+          const modeSame = this._lastShufMode === shufMode;
+          this._lastShuffleScanTs = now;
+          if (this._lastShuffleSig && modeSame && (shufDiff === 0 || (shufDiff <= SIG_TOL && this._shufSigAge < REFRESH_PERIOD))) {
+            if (shufDiff > 0) this._shufSigAge++;
+          } else {
+            this._lastShuffleSig = shufSig;
+            this._lastShufMode = shufMode;
+            this._shufSigAge = 0;
+            const shufTpls = cardsPresent ? bannerTpls.filter((t) => t.rank === "SHUFFLE" || t.rank === "WAIT") : bannerTpls;
+            const [btpl, bconf] = shufTpls.length
+              ? this._detectBannerWithHint(shuffleImg, shufTpls, this.cfg.min_banner_confidence, TOP_BANNER_SCALES, "shuffle")
+              : [null, 0.0];
+            this._cachedShuf = btpl ? [btpl.rank, bconf] : ["", 0.0];
+          }
+        }
+        const [cs, cc] = this._cachedShuf;
+        if (cs && (!cardsPresent || cs === "SHUFFLE" || cs === "WAIT")) {
+          bannerState = cs;
+          bannerConf = cc;
           bannerSource = "shuffle_roi";
         }
       }
@@ -1426,22 +2027,33 @@
       if (placeBetsImg && placeBetsImg.w > 0 && !cardsPresent && bannerTpls.length) {
         const pbTpls = bannerTpls.filter((t) => t.rank === "PLACE_BETS");
         if (pbTpls.length) {
-          const [ptpl, pconf] = this._detectBannerWithHint(
-            placeBetsImg,
-            pbTpls,
-            Math.max(0.66, this.cfg.min_banner_confidence - 0.02),
-            PLACE_BETS_SCALES,
-            "place_bets"
-          );
-          if (ptpl) {
-            pbConf = pconf;
-            if (!bannerState) {
-              bannerState = "PLACE_BETS";
-              bannerConf = pconf;
-              bannerSource = "place_bets_roi";
-            }
+          const pbSig = computeRoiSignature(placeBetsImg, 36, 12, false);
+          const pbDiff = roiSigDiff(pbSig, this._lastPbSig);
+          if (this._lastPbSig && (pbDiff === 0 || (pbDiff <= SIG_TOL && this._pbSigAge < REFRESH_PERIOD))) {
+            pbConf = this._cachedPb;
+            if (pbDiff > 0) this._pbSigAge++;
+          } else {
+            this._lastPbSig = pbSig;
+            this._pbSigAge = 0;
+            const [ptpl, pconf] = this._detectBannerWithHint(
+              placeBetsImg,
+              pbTpls,
+              Math.max(0.66, this.cfg.min_banner_confidence - 0.02),
+              PLACE_BETS_SCALES,
+              "place_bets"
+            );
+            pbConf = ptpl ? pconf : 0.0;
+            this._cachedPb = pbConf;
+          }
+          if (pbConf > 0.0 && !bannerState) {
+            bannerState = "PLACE_BETS";
+            bannerConf = pbConf;
+            bannerSource = "place_bets_roi";
           }
         }
+      } else {
+        this._lastPbSig = null;
+        this._cachedPb = 0.0;
       }
 
       if (bannerState === "SHUFFLE") {
@@ -2183,20 +2795,38 @@
   }
 
   class ViewportSmoother {
-    constructor(alpha = 0.35) {
+    constructor(alpha = 0.35, cacheInterval = 18) {
       this.alpha = alpha;
+      this.cacheInterval = Math.max(1, Number(cacheInterval) || 18);
       this._rect = null;
+      this._cachedArgs = null;
+      this._cachedRect = null;
+      this._framesSinceDetect = 0;
     }
 
     reset() {
       this._rect = null;
+      this._cachedArgs = null;
+      this._cachedRect = null;
+      this._framesSinceDetect = 0;
     }
 
     resolveAnchor(frameBgr, anchorMode = "ipad_split_left") {
       if (!frameBgr || frameBgr.w === 0 || frameBgr.h === 0) return [0, 0, 0, 0];
       if (anchorMode === "window") {
-        this._rect = null;
+        this.reset();
         return [0, 0, frameBgr.w, frameBgr.h];
+      }
+      if (
+        this._cachedRect &&
+        this._cachedArgs &&
+        this._cachedArgs[0] === frameBgr.w &&
+        this._cachedArgs[1] === frameBgr.h &&
+        this._cachedArgs[2] === anchorMode &&
+        this._framesSinceDetect < this.cacheInterval
+      ) {
+        this._framesSinceDetect++;
+        return this._cachedRect;
       }
       const detected =
         anchorMode === "ipad_split_left"
@@ -2217,7 +2847,10 @@
       const y = Math.max(0, Math.min(frameBgr.h - 1, ry));
       const w = Math.max(1, Math.min(frameBgr.w - x, rw));
       const h = Math.max(1, Math.min(frameBgr.h - y, rh));
-      return [x, y, w, h];
+      this._cachedArgs = [frameBgr.w, frameBgr.h, anchorMode];
+      this._cachedRect = [x, y, w, h];
+      this._framesSinceDetect = 0;
+      return this._cachedRect;
     }
   }
 
@@ -2227,69 +2860,89 @@
 
   const STORAGE_PACK_KEY = "bjPlaytechTracker.ipadCompanionPack.v1";
 
-  function bgrToDataUrl(bgrImg) {
-    if (typeof document === "undefined" || !bgrImg || bgrImg.w === 0 || bgrImg.h === 0) {
-      return "";
-    }
-    const cv = document.createElement("canvas");
-    cv.width = bgrImg.w;
-    cv.height = bgrImg.h;
-    const ctx = cv.getContext("2d");
-    const imgData = ctx.createImageData(bgrImg.w, bgrImg.h);
-    const dst = imgData.data;
-    const src = bgrImg.data;
+  function bgrToRGBA(bgrImg) {
+    if (!bgrImg || bgrImg.w === 0 || bgrImg.h === 0) return new Uint8Array(0);
     const n = bgrImg.w * bgrImg.h;
+    const out = new Uint8Array(n * 4);
+    const src = bgrImg.data;
     if (bgrImg.c === 1) {
       for (let i = 0, p = 0; i < n; i++, p += 4) {
         const v = src[i];
-        dst[p] = v;
-        dst[p + 1] = v;
-        dst[p + 2] = v;
-        dst[p + 3] = 255;
+        out[p] = v;
+        out[p + 1] = v;
+        out[p + 2] = v;
+        out[p + 3] = 255;
       }
     } else {
       for (let i = 0, j = 0, p = 0; i < n; i++, j += 3, p += 4) {
-        dst[p] = src[j + 2];
-        dst[p + 1] = src[j + 1];
-        dst[p + 2] = src[j];
-        dst[p + 3] = 255;
+        out[p] = src[j + 2];
+        out[p + 1] = src[j + 1];
+        out[p + 2] = src[j];
+        out[p + 3] = 255;
       }
     }
+    return out;
+  }
+
+  function rgbaToDataUrl(rgba, w, h) {
+    if (typeof document === "undefined" || !rgba || !w || !h) return "";
+    const cv = document.createElement("canvas");
+    cv.width = w;
+    cv.height = h;
+    const ctx = cv.getContext("2d");
+    const imgData = ctx.createImageData(w, h);
+    imgData.data.set(rgba.subarray(0, w * h * 4));
     ctx.putImageData(imgData, 0, 0);
     return cv.toDataURL("image/jpeg", 0.88);
   }
 
+  function bgrToDataUrl(bgrImg) {
+    if (typeof document === "undefined" || !bgrImg || bgrImg.w === 0 || bgrImg.h === 0) {
+      return "";
+    }
+    return rgbaToDataUrl(bgrToRGBA(bgrImg), bgrImg.w, bgrImg.h);
+  }
+
   class IpadCompanionRuntime {
     constructor(options = {}) {
+      this.options = options || {};
+      this.onSavePack = typeof this.options.onSavePack === "function" ? this.options.onSavePack : null;
+      this.onNativeAction = typeof this.options.onNativeAction === "function" ? this.options.onNativeAction : null;
+      this.onXhrBlocked = typeof this.options.onXhrBlocked === "function" ? this.options.onXhrBlocked : null;
+
       const initialPack =
-        options.initialPack ||
+        this.options.initialPack ||
+        this._parsePack(this.options.savedPack) ||
         this._loadSavedPack() ||
         PRELOADED_PACK ||
         (typeof globalThis.DEFAULT_COMPANION_PACK === "object" ? globalThis.DEFAULT_COMPANION_PACK : null);
 
       this.cfg = defaultConfig(initialPack && initialPack.config ? initialPack.config : {});
-      if (!options.preserveDesktopAnchor && (!initialPack || !initialPack.config || initialPack.config.anchor_mode === "game_viewport")) {
+      if (!this.options.preserveDesktopAnchor && (!initialPack || !initialPack.config || initialPack.config.anchor_mode === "game_viewport")) {
         this.cfg.anchor_mode = "ipad_split_left";
       }
       this.detector = new PlaytechDetector(this.cfg, initialPack);
       this.sm = new CompanionStateMachine(this.cfg);
       this.keepalive = new WatchKeepaliveManager(this.cfg);
-      this.smoother = new ViewportSmoother(0.35);
+      this.smoother = new ViewportSmoother(0.35, 18);
 
       this.clients = new Set();
+      this._unrotatedRawFrame = null;
       this.latestRawFrame = null;
       this.latestFrameTs = 0;
       this._lastFrameSeq = 0;
       this.broadcastActive = false;
       this.frameTransport = "idle";
+      this.frameInfo = "";
       this.hostInfo = null;
       this._sawNativeBroadcast = false;
       this._didNotifyNativeReady = false;
+      this._consecutiveXhrErrors = 0;
       this.extConnected = false;
       this._loopTimer = null;
       this._busy = false;
 
-      if (typeof globalThis !== "undefined") {
+      if (this.options.installGlobalHooks !== false && typeof globalThis !== "undefined") {
         globalThis.__ipadCompanionReceiveRGBA = (rgbaBytes, width, height) => {
           this.ingestRGBA(rgbaBytes, width, height);
         };
@@ -2306,28 +2959,72 @@
       }
     }
 
-    startNativePolling() {
-      if (this._loopTimer || typeof XMLHttpRequest === "undefined") return;
-      const isNativeHost =
+    _parsePack(raw) {
+      if (!raw) return null;
+      try {
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+        if (!parsed || typeof parsed !== "object" || !parsed.templates || typeof parsed.templates !== "object" || Object.keys(parsed.templates).length === 0) {
+          return null;
+        }
+        return parsed;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    _postNativeAction(payload) {
+      if (this.onNativeAction) {
+        try {
+          this.onNativeAction(payload);
+          return true;
+        } catch (_) {}
+      }
+      if (
         typeof window !== "undefined" &&
         window.webkit &&
         window.webkit.messageHandlers &&
-        window.webkit.messageHandlers.ipadCompanion;
+        window.webkit.messageHandlers.ipadCompanion
+      ) {
+        try {
+          window.webkit.messageHandlers.ipadCompanion.postMessage(payload);
+          return true;
+        } catch (_) {}
+      }
+      return false;
+    }
+
+    startNativePolling() {
+      if (this._loopTimer || typeof XMLHttpRequest === "undefined") return;
+      const hasWkHandler =
+        typeof window !== "undefined" &&
+        !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipadCompanion);
+      const isNativeHost =
+        this.options.isNativeHost !== undefined ? !!this.options.isNativeHost : hasWkHandler;
       if (!isNativeHost) return;
 
       if (!this._didNotifyNativeReady) {
         this._didNotifyNativeReady = true;
-        try {
-          window.webkit.messageHandlers.ipadCompanion.postMessage({ action: "companionReady" });
-        } catch (_) {}
+        this._postNativeAction({ action: "companionReady" });
       }
 
+      const proto =
+        (typeof globalThis !== "undefined" && globalThis.location && globalThis.location.protocol) ||
+        (typeof window !== "undefined" && window.location && window.location.protocol) ||
+        "";
       const frameUrlBase =
-        typeof window !== "undefined" &&
-        window.location &&
-        window.location.protocol === "bjtracker:"
-          ? "/companion-frame/latest"
-          : "companion-frame://latest";
+        this.options.frameUrlBase ||
+        (proto === "bjtracker:" ? "/companion-frame/latest" : "companion-frame://latest");
+
+      const noteXhrError = () => {
+        this._consecutiveXhrErrors++;
+        if (this._consecutiveXhrErrors >= 3 && this.onXhrBlocked) {
+          const cb = this.onXhrBlocked;
+          this.onXhrBlocked = null;
+          try {
+            cb();
+          } catch (_) {}
+        }
+      };
 
       const intervalMs = Math.max(50, Math.round(1000 / (this.cfg.fps || 10)));
       this._loopTimer = setInterval(() => {
@@ -2343,11 +3040,18 @@
         };
         xhr.onload = () => {
           try {
+            if (xhr.status === 0) {
+              noteXhrError();
+              return;
+            }
+            this._consecutiveXhrErrors = 0;
+
             const now = performance.now() / 1000;
             const hdrTransport = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-Transport")) || "";
             const hdrActive = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-Broadcast-Active")) || "";
             const hdrAppGroupOk = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-AppGroup-Ok")) || "";
             const hdrExtPresent = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-BroadcastExt-Present")) || "";
+            const hdrFrameInfo = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-Frame-Info")) || "";
 
             let statusDirty = false;
             if (hdrAppGroupOk || hdrExtPresent) {
@@ -2364,6 +3068,13 @@
             }
             if (hdrTransport && hdrTransport !== this.frameTransport) {
               this.frameTransport = hdrTransport;
+              statusDirty = true;
+            }
+            if (hdrFrameInfo && hdrFrameInfo !== this.frameInfo) {
+              this.frameInfo = hdrFrameInfo;
+              statusDirty = true;
+            } else if (!hdrFrameInfo && hdrActive === "0" && hdrTransport === "idle" && this.frameInfo) {
+              this.frameInfo = "";
               statusDirty = true;
             }
 
@@ -2427,12 +3138,16 @@
             done();
           }
         };
-        xhr.onerror = done;
+        xhr.onerror = () => {
+          noteXhrError();
+          done();
+        };
         xhr.ontimeout = done;
         xhr.onabort = done;
         try {
           xhr.send();
         } catch (_) {
+          noteXhrError();
           done();
         }
       }, intervalMs);
@@ -2448,13 +3163,7 @@
     _loadSavedPack() {
       try {
         if (typeof localStorage === "undefined") return null;
-        const raw = localStorage.getItem(STORAGE_PACK_KEY);
-        if (!raw) return null;
-        const parsed = JSON.parse(raw);
-        if (!parsed || typeof parsed !== "object" || !parsed.templates || typeof parsed.templates !== "object" || Object.keys(parsed.templates).length === 0) {
-          return null;
-        }
-        return parsed;
+        return this._parsePack(localStorage.getItem(STORAGE_PACK_KEY));
       } catch (e) {
         return null;
       }
@@ -2462,20 +3171,29 @@
 
     persistPack() {
       try {
-        if (typeof localStorage === "undefined") return;
         const pack = this.detector.exportPack();
-        localStorage.setItem(STORAGE_PACK_KEY, JSON.stringify(pack));
+        const raw = JSON.stringify(pack);
+        if (this.onSavePack) {
+          this.onSavePack(raw);
+          return;
+        }
+        if (typeof localStorage === "undefined") return;
+        localStorage.setItem(STORAGE_PACK_KEY, raw);
       } catch (e) {}
     }
 
     broadcast(payload) {
-      const dataStr = JSON.stringify(payload);
+      let dataStr = null;
       for (const ws of this.clients) {
-        if (ws.readyState === 1 && typeof ws.onmessage === "function") {
-          try {
+        if (ws.readyState !== 1) continue;
+        try {
+          if (typeof ws.onRawMessage === "function") {
+            ws.onRawMessage(payload);
+          } else if (typeof ws.onmessage === "function") {
+            if (dataStr === null) dataStr = JSON.stringify(payload);
             ws.onmessage({ data: dataStr });
-          } catch (e) {}
-        }
+          }
+        } catch (e) {}
       }
     }
 
@@ -2491,34 +3209,31 @@
         ipadMode: true,
         broadcastActive: this.broadcastActive,
         transport: this.frameTransport,
+        frameRotation: normalizeRotationDeg(this.cfg.frame_rotation || 0),
+        frameInfo: this.frameInfo || "",
         hostInfo: this.hostInfo,
         keepalive: this.keepalive.getStatus(now),
       };
     }
 
     triggerSafariReload() {
-      if (
-        typeof window !== "undefined" &&
-        window.webkit &&
-        window.webkit.messageHandlers &&
-        window.webkit.messageHandlers.ipadCompanion
-      ) {
-        try {
-          window.webkit.messageHandlers.ipadCompanion.postMessage({ action: "reloadLeftSafari" });
-          if (this.extConnected) return [true, "safari_ext_reload"];
-        } catch (e) {}
+      if (this._postNativeAction({ action: "reloadLeftSafari" }) && this.extConnected) {
+        return [true, "safari_ext_reload"];
       }
       return [false, "alert_fallback"];
     }
 
     ingestFrameBgr(frameBgr, now = performance.now() / 1000) {
       if (!frameBgr || frameBgr.w === 0 || frameBgr.h === 0) return [];
-      this.latestRawFrame = frameBgr;
+      this._unrotatedRawFrame = frameBgr;
+      const rot = normalizeRotationDeg(this.cfg.frame_rotation || 0);
+      const procFrame = rot !== 0 ? rotateImage(frameBgr, rot) : frameBgr;
+      this.latestRawFrame = procFrame;
       this.latestFrameTs = now;
       this.broadcastActive = true;
 
-      const [ax, ay, aw, ah] = this.smoother.resolveAnchor(frameBgr, this.cfg.anchor_mode);
-      const anchorImg = cropImage(frameBgr, ax, ay, aw, ah);
+      const [ax, ay, aw, ah] = this.smoother.resolveAnchor(procFrame, this.cfg.anchor_mode);
+      const anchorImg = cropImage(procFrame, ax, ay, aw, ah);
       if (anchorImg.w === 0 || anchorImg.h === 0) return [];
 
       const playerImg = cropNorm(anchorImg, this.cfg.player_strip);
@@ -2562,6 +3277,48 @@
       return this.ingestFrameBgr(bgr, now);
     }
 
+    _buildCalibSnapshot(reqAnchor) {
+      const rot = normalizeRotationDeg(this.cfg.frame_rotation || 0);
+      if (this._unrotatedRawFrame) {
+        this.latestRawFrame = rot !== 0 ? rotateImage(this._unrotatedRawFrame, rot) : this._unrotatedRawFrame;
+      }
+      if (!this.latestRawFrame) return null;
+      const [ax, ay, aw, ah] =
+        reqAnchor === "toolbar"
+          ? [0, 0, this.latestRawFrame.w, Math.min(this.latestRawFrame.h, 110)]
+          : this.smoother.resolveAnchor(this.latestRawFrame, reqAnchor);
+      const snap = cropImage(this.latestRawFrame, ax, ay, aw, ah);
+      this._calibSnapBgr = snap;
+      this._calibSnapMode = reqAnchor;
+      const hasDoc = typeof document !== "undefined";
+      const payload = {
+        type: "calib_snapshot",
+        anchorMode: reqAnchor,
+        width: snap.w,
+        height: snap.h,
+        frameRotation: rot,
+        frameInfo: this.frameInfo || "",
+        imageDataUrl: hasDoc ? bgrToDataUrl(snap) : "",
+        rois: {
+          player_strip: this.cfg.player_strip,
+          dealer_strip: this.cfg.dealer_strip,
+          community_roi: this.cfg.community_roi,
+          dealer_felt_roi: this.cfg.dealer_felt_roi,
+          banner_roi: this.cfg.banner_roi,
+          place_bets_roi: this.cfg.place_bets_roi,
+          shuffle_roi: this.cfg.shuffle_roi,
+        },
+        templates: this.detector.listTemplateCounts(),
+        reloadBtnOffset: this.cfg.reload_btn_client_offset,
+      };
+      if (!hasDoc) {
+        payload.snapRgba = bgrToRGBA(snap);
+        payload.snapW = snap.w;
+        payload.snapH = snap.h;
+      }
+      return payload;
+    }
+
     handleClientMessage(ws, rawData) {
       let msg;
       try {
@@ -2572,7 +3329,10 @@
       if (!msg || !msg.type) return;
 
       const reply = (obj) => {
-        if (ws && ws.readyState === 1 && typeof ws.onmessage === "function") {
+        if (!ws || ws.readyState !== 1) return;
+        if (typeof ws.onRawMessage === "function") {
+          ws.onRawMessage(obj);
+        } else if (typeof ws.onmessage === "function") {
           ws.onmessage({ data: JSON.stringify(obj) });
         }
       };
@@ -2600,42 +3360,47 @@
         this.broadcast(this.buildStatusPayload());
         return;
       }
+      if (mtype === "calib_set_rotation") {
+        this.cfg.frame_rotation = normalizeRotationDeg(msg.rotation);
+        this.smoother.reset();
+        this.detector.invalidateCaches();
+        if (this._unrotatedRawFrame) {
+          this.latestRawFrame =
+            this.cfg.frame_rotation !== 0
+              ? rotateImage(this._unrotatedRawFrame, this.cfg.frame_rotation)
+              : this._unrotatedRawFrame;
+        }
+        this.persistPack();
+        const reqAnchor = ["ipad_split_left", "game_viewport", "window", "toolbar"].includes(msg.anchorMode)
+          ? msg.anchorMode
+          : this.cfg.anchor_mode;
+        this.broadcast(this.buildStatusPayload());
+        const snapPayload = this._buildCalibSnapshot(reqAnchor);
+        if (snapPayload) {
+          reply(snapPayload);
+        } else {
+          reply({
+            type: "calib_saved",
+            kind: "rotation",
+            frameRotation: this.cfg.frame_rotation,
+          });
+        }
+        return;
+      }
       if (mtype === "calib_grab") {
         const reqAnchor = ["ipad_split_left", "game_viewport", "window", "toolbar"].includes(msg.anchorMode)
           ? msg.anchorMode
           : this.cfg.anchor_mode;
-        if (!this.latestRawFrame) {
+        this.smoother.reset();
+        const snapPayload = this._buildCalibSnapshot(reqAnchor);
+        if (!snapPayload) {
           reply({
             type: "calib_error",
             error: "No iPad Broadcast frame received yet — tap '📺 Broadcast Screen' in the top bar (or upload a test screenshot).",
           });
           return;
         }
-        const [ax, ay, aw, ah] =
-          reqAnchor === "toolbar"
-            ? [0, 0, this.latestRawFrame.w, Math.min(this.latestRawFrame.h, 110)]
-            : this.smoother.resolveAnchor(this.latestRawFrame, reqAnchor);
-        const snap = cropImage(this.latestRawFrame, ax, ay, aw, ah);
-        this._calibSnapBgr = snap;
-        this._calibSnapMode = reqAnchor;
-        reply({
-          type: "calib_snapshot",
-          anchorMode: reqAnchor,
-          width: snap.w,
-          height: snap.h,
-          imageDataUrl: bgrToDataUrl(snap),
-          rois: {
-            player_strip: this.cfg.player_strip,
-            dealer_strip: this.cfg.dealer_strip,
-            community_roi: this.cfg.community_roi,
-            dealer_felt_roi: this.cfg.dealer_felt_roi,
-            banner_roi: this.cfg.banner_roi,
-            place_bets_roi: this.cfg.place_bets_roi,
-            shuffle_roi: this.cfg.shuffle_roi,
-          },
-          templates: this.detector.listTemplateCounts(),
-          reloadBtnOffset: this.cfg.reload_btn_client_offset,
-        });
+        reply(snapPayload);
         return;
       }
       if (mtype === "calib_save_rois") {
@@ -2647,8 +3412,9 @@
         }
         if (["ipad_split_left", "game_viewport", "window"].includes(msg.anchorMode)) {
           this.cfg.anchor_mode = msg.anchorMode;
-          this.smoother.reset();
         }
+        this.smoother.reset();
+        this.detector.invalidateCaches();
         this.persistPack();
         reply({
           type: "calib_saved",
@@ -2663,6 +3429,7 @@
             shuffle_roi: this.cfg.shuffle_roi,
           },
           anchorMode: this.cfg.anchor_mode,
+          frameRotation: normalizeRotationDeg(this.cfg.frame_rotation || 0),
         });
         return;
       }
@@ -2730,8 +3497,17 @@
           if (pack.config) {
             Object.assign(this.cfg, defaultConfig(pack.config));
           }
+          this.cfg.frame_rotation = normalizeRotationDeg(this.cfg.frame_rotation || 0);
+          this.smoother.reset();
           this.detector.loadPack(pack);
+          if (this._unrotatedRawFrame) {
+            this.latestRawFrame =
+              this.cfg.frame_rotation !== 0
+                ? rotateImage(this._unrotatedRawFrame, this.cfg.frame_rotation)
+                : this._unrotatedRawFrame;
+          }
           this.persistPack();
+          this.broadcast(this.buildStatusPayload());
           reply({
             type: "calib_pack_imported",
             summary: { templates: this.detector.listTemplateCounts() },
@@ -2745,6 +3521,7 @@
               shuffle_roi: this.cfg.shuffle_roi,
             },
             anchorMode: this.cfg.anchor_mode,
+            frameRotation: this.cfg.frame_rotation,
             templates: this.detector.listTemplateCounts(),
           });
         } catch (err) {
@@ -2765,6 +3542,7 @@
         const pbRoi = normalizeRoi(rois.place_bets_roi || this.cfg.place_bets_roi);
         const shRoi = normalizeRoi(rois.shuffle_roi || this.cfg.shuffle_roi);
 
+        this.detector.invalidateCaches();
         const obs = this.detector.processCrops({
           playerImg: cropNorm(snap, pRoi),
           dealerImg: cropNorm(snap, dRoi),
@@ -2862,12 +3640,357 @@
     }
   }
 
+  class WorkerCompanionSocket {
+    constructor(options = {}) {
+      this.options = options || {};
+      this.readyState = 0; // CONNECTING
+      this.onopen = null;
+      this.onmessage = null;
+      this.onerror = null;
+      this.onclose = null;
+
+      this._closed = false;
+      this._worker = null;
+      this._workerReady = false;
+      this._fallback = null;
+      this._fallbackPromoted = false;
+      this.fallbackReason = "";
+      this._bootTimer = null;
+
+      this._lastHostInfo = null;
+      this._lastExtConnected = null;
+      this._lastSyncMsg = null;
+      this._lastKaConfigMsg = null;
+
+      this._installGlobalHooks();
+      this._startBoot();
+    }
+
+    _installGlobalHooks() {
+      if (typeof globalThis === "undefined") return;
+      globalThis.__ipadCompanionReceiveRGBA = (rgbaBytes, width, height) => {
+        if (this._closed) return;
+        if (this._fallbackPromoted && this._fallback) {
+          this._fallback.runtime.ingestRGBA(rgbaBytes, width, height);
+          return;
+        }
+        if (this._worker && rgbaBytes) {
+          let copy;
+          if (rgbaBytes instanceof Uint8Array) {
+            copy = new Uint8Array(rgbaBytes);
+          } else if (ArrayBuffer.isView(rgbaBytes)) {
+            copy = new Uint8Array(rgbaBytes.buffer.slice(rgbaBytes.byteOffset, rgbaBytes.byteOffset + rgbaBytes.byteLength));
+          } else {
+            copy = new Uint8Array(rgbaBytes);
+          }
+          try {
+            this._worker.postMessage({ type: "ingest_rgba", rgba: copy, w: width, h: height }, [copy.buffer]);
+          } catch (_) {}
+        }
+      };
+      globalThis.__ipadCompanionSetExtConnected = (connected) => {
+        this._lastExtConnected = !!connected;
+        if (this._closed) return;
+        if (this._fallbackPromoted && this._fallback) {
+          this._fallback.runtime.extConnected = !!connected;
+          this._fallback.runtime.broadcast(this._fallback.runtime.buildStatusPayload());
+        } else if (this._workerReady && this._worker) {
+          try {
+            this._worker.postMessage({ type: "set_ext_connected", connected: !!connected });
+          } catch (_) {}
+        }
+      };
+      globalThis.__ipadCompanionSetHostInfo = (info) => {
+        if (info && typeof info === "object") {
+          this._lastHostInfo = Object.assign({}, this._lastHostInfo || {}, info);
+        }
+        if (this._closed || !this._lastHostInfo) return;
+        if (this._fallbackPromoted && this._fallback) {
+          this._fallback.runtime.hostInfo = Object.assign({}, this._fallback.runtime.hostInfo || {}, this._lastHostInfo);
+          this._fallback.runtime.broadcast(this._fallback.runtime.buildStatusPayload());
+        } else if (this._workerReady && this._worker) {
+          try {
+            this._worker.postMessage({ type: "set_host_info", info: this._lastHostInfo });
+          } catch (_) {}
+        }
+      };
+    }
+
+    _resolveWorkerUrl() {
+      if (this.options.workerUrl) return String(this.options.workerUrl);
+      if (_ENGINE_SCRIPT_URL) {
+        try {
+          return new URL("companion_worker.js", _ENGINE_SCRIPT_URL).toString();
+        } catch (_) {}
+      }
+      const proto = (typeof location !== "undefined" && location && location.protocol) || "";
+      return proto === "bjtracker:" ? "/companion/ipad/companion_worker.js" : "companion/ipad/companion_worker.js";
+    }
+
+    _startBoot() {
+      const WorkerCtor = this.options.WorkerClass || (typeof Worker === "function" ? Worker : null);
+      const isFileProto = typeof location !== "undefined" && location && location.protocol === "file:";
+      if (!WorkerCtor || (isFileProto && !this.options.WorkerClass)) {
+        setTimeout(() => this._promoteFallback("worker_unavailable"), 0);
+        return;
+      }
+
+      let workerUrl;
+      try {
+        workerUrl = this._resolveWorkerUrl();
+      } catch (_) {
+        setTimeout(() => this._promoteFallback("worker_url_error"), 0);
+        return;
+      }
+
+      const timeoutMs = Math.max(50, Number(this.options.bootTimeoutMs) || 600);
+      this._bootTimer = setTimeout(() => {
+        if (!this._workerReady && !this._closed && !this._fallbackPromoted) {
+          this._promoteFallback("boot_timeout");
+        }
+      }, timeoutMs);
+
+      let worker;
+      try {
+        worker = new WorkerCtor(workerUrl);
+      } catch (_) {
+        clearTimeout(this._bootTimer);
+        this._bootTimer = null;
+        setTimeout(() => this._promoteFallback("worker_construct_failed"), 0);
+        return;
+      }
+      this._worker = worker;
+
+      worker.onmessage = (ev) => {
+        if (this._closed || this._fallbackPromoted) return;
+        const msg = ev && ev.data;
+        if (!msg || !msg.type) return;
+
+        if (msg.type === "worker_ready") {
+          if (this._bootTimer) {
+            clearTimeout(this._bootTimer);
+            this._bootTimer = null;
+          }
+          this._workerReady = true;
+          if (this._lastHostInfo !== null) {
+            try { worker.postMessage({ type: "set_host_info", info: this._lastHostInfo }); } catch (_) {}
+          }
+          if (this._lastExtConnected !== null) {
+            try { worker.postMessage({ type: "set_ext_connected", connected: this._lastExtConnected }); } catch (_) {}
+          }
+          if (this.readyState === 0) {
+            this.readyState = 1;
+            if (typeof this.onopen === "function") {
+              this.onopen({});
+            }
+          }
+          if (msg.status && typeof this.onmessage === "function" && this.readyState === 1) {
+            this.onmessage({ data: JSON.stringify(msg.status) });
+          }
+          return;
+        }
+
+        if (msg.type === "worker_save_pack") {
+          try {
+            if (typeof localStorage !== "undefined" && typeof msg.packJson === "string") {
+              localStorage.setItem(STORAGE_PACK_KEY, msg.packJson);
+            }
+          } catch (_) {}
+          return;
+        }
+
+        if (msg.type === "worker_native_action") {
+          if (this.options.onNativeAction) {
+            try { this.options.onNativeAction(msg.payload); } catch (_) {}
+          } else if (
+            typeof window !== "undefined" &&
+            window.webkit &&
+            window.webkit.messageHandlers &&
+            window.webkit.messageHandlers.ipadCompanion
+          ) {
+            try {
+              window.webkit.messageHandlers.ipadCompanion.postMessage(msg.payload);
+            } catch (_) {}
+          }
+          return;
+        }
+
+        if (msg.type === "worker_fallback") {
+          this._promoteFallback(msg.reason || "worker_fallback");
+          return;
+        }
+
+        if (msg.type === "ws_message_str") {
+          if (this.readyState === 1 && typeof this.onmessage === "function") {
+            this.onmessage({ data: msg.data });
+          }
+          return;
+        }
+
+        if (msg.type === "ws_message_snapshot") {
+          if (this.readyState === 1 && typeof this.onmessage === "function") {
+            const payload = Object.assign({}, msg.payload || {});
+            if (!payload.imageDataUrl && msg.snapRgba && payload.snapW && payload.snapH) {
+              payload.imageDataUrl = rgbaToDataUrl(msg.snapRgba, payload.snapW, payload.snapH);
+            }
+            this.onmessage({ data: JSON.stringify(payload) });
+          }
+        }
+      };
+
+      worker.onerror = () => {
+        if (!this._closed && !this._fallbackPromoted) {
+          this._promoteFallback("worker_error");
+        }
+      };
+
+      const hasWkHandler =
+        typeof window !== "undefined" &&
+        !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipadCompanion);
+      const proto = (typeof location !== "undefined" && location && location.protocol) || "";
+      const frameUrlBase =
+        this.options.frameUrlBase ||
+        (proto === "bjtracker:" ? "/companion-frame/latest" : "companion-frame://latest");
+      let savedPack = "";
+      try {
+        if (typeof localStorage !== "undefined") {
+          savedPack = localStorage.getItem(STORAGE_PACK_KEY) || "";
+        }
+      } catch (_) {}
+
+      try {
+        worker.postMessage({
+          type: "init",
+          isNativeHost: this.options.isNativeHost !== undefined ? !!this.options.isNativeHost : hasWkHandler,
+          frameUrlBase,
+          savedPack,
+          preserveDesktopAnchor: !!this.options.preserveDesktopAnchor,
+        });
+      } catch (_) {
+        this._promoteFallback("worker_init_post_failed");
+      }
+    }
+
+    _replayToFallback(fb) {
+      if (!fb || !fb.runtime) return;
+      if (this._lastExtConnected !== null) {
+        fb.runtime.extConnected = !!this._lastExtConnected;
+      }
+      if (this._lastHostInfo) {
+        fb.runtime.hostInfo = Object.assign({}, fb.runtime.hostInfo || {}, this._lastHostInfo);
+      }
+      if (this._lastSyncMsg !== null) {
+        fb.runtime.handleClientMessage(fb, this._lastSyncMsg);
+      }
+      if (this._lastKaConfigMsg !== null) {
+        fb.runtime.handleClientMessage(fb, this._lastKaConfigMsg);
+      }
+    }
+
+    _promoteFallback(reason = "fallback") {
+      if (this._closed || this._fallbackPromoted) return;
+      this._fallbackPromoted = true;
+      this.fallbackReason = reason;
+      if (this._bootTimer) {
+        clearTimeout(this._bootTimer);
+        this._bootTimer = null;
+      }
+      if (this._worker) {
+        try {
+          if (typeof this._worker.terminate === "function") this._worker.terminate();
+        } catch (_) {}
+        this._worker = null;
+      }
+
+      const wasOpen = this.readyState === 1;
+      const fb = new IpadCompanionSocket(this.options.fallbackRuntime || null);
+      this._fallback = fb;
+      fb.onopen = () => {
+        if (this._closed) return;
+        this._replayToFallback(fb);
+        if (!wasOpen) {
+          this.readyState = 1;
+          if (typeof this.onopen === "function") {
+            this.onopen({});
+          }
+        }
+      };
+      fb.onmessage = (ev) => {
+        if (this._closed) return;
+        if (typeof this.onmessage === "function") {
+          this.onmessage(ev);
+        }
+      };
+      fb.onerror = (ev) => {
+        if (!this._closed && typeof this.onerror === "function") {
+          this.onerror(ev);
+        }
+      };
+      fb.onclose = (ev) => {
+        if (this._closed) return;
+        this.readyState = 3;
+        if (typeof this.onclose === "function") {
+          this.onclose(ev);
+        }
+      };
+    }
+
+    send(data) {
+      if (this.readyState !== 1 || this._closed) return;
+      try {
+        const parsed = typeof data === "string" ? JSON.parse(data) : data;
+        if (parsed && parsed.type === "sync_state") {
+          this._lastSyncMsg = data;
+        } else if (parsed && parsed.type === "keepalive_action" && (parsed.action === "set_config" || parsed.action === "configure")) {
+          this._lastKaConfigMsg = data;
+        }
+      } catch (_) {}
+
+      if (this._fallbackPromoted && this._fallback) {
+        this._fallback.send(data);
+        return;
+      }
+      if (this._worker) {
+        try {
+          this._worker.postMessage({ type: "ws_send", data });
+        } catch (_) {}
+      }
+    }
+
+    close() {
+      if (this.readyState === 3) return;
+      this.readyState = 3; // CLOSED
+      this._closed = true;
+      if (this._bootTimer) {
+        clearTimeout(this._bootTimer);
+        this._bootTimer = null;
+      }
+      if (this._worker) {
+        try { this._worker.postMessage({ type: "shutdown" }); } catch (_) {}
+        try {
+          if (typeof this._worker.terminate === "function") this._worker.terminate();
+        } catch (_) {}
+        this._worker = null;
+      }
+      if (this._fallback) {
+        this._fallback.onclose = null;
+        this._fallback.close();
+        this._fallback = null;
+      }
+      if (typeof this.onclose === "function") {
+        this.onclose({});
+      }
+    }
+  }
+
   return {
     RANK_TO_VAL,
     normalizeRoi,
+    normalizeRotationDeg,
     defaultConfig,
     createImage,
     fromRGBA,
+    bgrToRGBA,
     toGray,
     toMinGray,
     grayToBGR,
@@ -2875,7 +3998,10 @@
     cropNorm,
     resizeImage,
     rotate180,
+    rotateImage,
     copyMakeBorder,
+    prepareSourceForMatch,
+    matchPreparedTemplate,
     matchTemplateCCoeffNormed,
     connectedComponentsWithStats,
     detectGameViewportLocal,
@@ -2892,6 +4018,7 @@
     ViewportSmoother,
     IpadCompanionRuntime,
     IpadCompanionSocket,
+    WorkerCompanionSocket,
     getSharedRuntime,
   };
 });

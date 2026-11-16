@@ -69,7 +69,7 @@
   .big{font-size:30px!important}
   .pos{color:var(--green)} .neg{color:var(--red)} .warn{color:var(--amber)} .mut{color:var(--muted)} .purp{color:#c084fc} .cyan{color:#22d3ee}
   button,.btn{font:inherit}
-  button,.btn,.numpad button,.seg button{touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+  button,.btn,.numpad button,.seg button,.handbox,.calib-ranks button,.sb-chip,.split-pill,.split-res-btns button{touch-action:manipulation;-webkit-tap-highlight-color:transparent}
   .btn{padding:10px 14px;border-radius:11px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;font-weight:600}
   .btn.sm{padding:6px 10px;font-size:12px;border-radius:8px}
   .btn.xs{padding:3px 7px;font-size:11px;border-radius:7px;line-height:1.3}
@@ -568,6 +568,8 @@ const _comp = {
   ipadMode: _isIpadUa && typeof IpadCompanionEngine !== 'undefined',
   broadcastActive: false,
   transport: 'idle',
+  frameRotation: 0,
+  frameInfo: '',
   hostInfo: null,
   announcedFirstBroadcast: false,
   connected: false,
@@ -2543,14 +2545,17 @@ function renderPlay(){
   const compTransport = _comp.transport || 'idle';
   const hostInfo = _comp.hostInfo || null;
   const broadcastExtMissing = !!(_comp.ipadMode && hostInfo && hostInfo.broadcastExtPresent === false);
+  const compFrameSuffix = _comp.frameInfo
+    ? ` (${_comp.frameInfo}${_comp.frameRotation ? ` · rot ${_comp.frameRotation}°` : ''})`
+    : (_comp.frameRotation ? ` (rot ${_comp.frameRotation}°)` : '');
   const compTransportHint = !_comp.ipadMode
     ? 'Toggle local desktop or standalone iPad companion auto-tracking'
     : (broadcastExtMissing
         ? 'BroadcastExtension.appex is missing from this build (uncheck Sideloadly Remove extensions and reinstall)'
         : compTransport === 'appgroup'
-          ? 'Live broadcast streaming via App Group shared memory'
+          ? `Live broadcast streaming via App Group shared memory${compFrameSuffix}`
           : (compTransport === 'loopback' || compTransport === 'loopback_waiting')
-            ? 'Live broadcast streaming via loopback TCP (127.0.0.1:8766)'
+            ? `Live broadcast streaming via loopback TCP (127.0.0.1:8766)${compFrameSuffix}`
             : (hostInfo && hostInfo.appGroupAvailable === false)
               ? 'Ready for live broadcast via loopback TCP (127.0.0.1:8766 — App Group not required)'
               : 'Toggle standalone iPad companion auto-tracking');
@@ -4282,12 +4287,22 @@ function handleCompanionMessage(msg){
     const prevTransport = _comp.transport || 'idle';
     const prevAppGrp = !!(_comp.hostInfo && _comp.hostInfo.appGroupAvailable);
     const prevExtPres = _comp.hostInfo ? _comp.hostInfo.broadcastExtPresent : null;
-    const prevKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${prevKaMode}|${prevKaEnabled}|${prevExt}|${prevTransport}|${prevAppGrp}|${prevExtPres}`;
+    const prevRot = Number(_comp.frameRotation || 0);
+    const prevFrameInfo = _comp.frameInfo || '';
+    const prevKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${prevKaMode}|${prevKaEnabled}|${prevExt}|${prevTransport}|${prevAppGrp}|${prevExtPres}|${prevRot}|${prevFrameInfo}`;
     _comp.windowFound = !!msg.windowFound;
     _comp.paused = !!msg.paused;
     _comp.state = msg.state || 'IDLE';
     _comp.extConnected = !!msg.extConnected;
     if(typeof msg.transport === 'string') _comp.transport = msg.transport;
+    if(typeof msg.frameRotation === 'number'){
+      _comp.frameRotation = msg.frameRotation;
+      if(typeof _calib !== 'undefined' && _calib) _calib.rotation = msg.frameRotation;
+    }
+    if(typeof msg.frameInfo === 'string'){
+      _comp.frameInfo = msg.frameInfo;
+      if(typeof _calib !== 'undefined' && _calib) _calib.frameInfo = msg.frameInfo;
+    }
     if(msg.hostInfo && typeof msg.hostInfo === 'object'){
       _comp.hostInfo = { ...(_comp.hostInfo || {}), ...msg.hostInfo };
     }
@@ -4316,7 +4331,7 @@ function handleCompanionMessage(msg){
     }
     const curAppGrp = !!(_comp.hostInfo && _comp.hostInfo.appGroupAvailable);
     const curExtPres = _comp.hostInfo ? _comp.hostInfo.broadcastExtPresent : null;
-    const nextKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${(_comp.keepalive || {}).mode}|${(_comp.keepalive || {}).enabled}|${!!_comp.extConnected}|${_comp.transport || 'idle'}|${curAppGrp}|${curExtPres}`;
+    const nextKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${(_comp.keepalive || {}).mode}|${(_comp.keepalive || {}).enabled}|${!!_comp.extConnected}|${_comp.transport || 'idle'}|${curAppGrp}|${curExtPres}|${Number(_comp.frameRotation || 0)}|${_comp.frameInfo || ''}`;
     if(prevKey !== nextKey) render();
     else updateKeepaliveBadge();
     return;
@@ -4514,10 +4529,17 @@ function handleCompanionMessage(msg){
   if(msg.type === 'calib_snapshot'){
     _calib.loading = false;
     _calib.error = '';
+    if(typeof msg.frameRotation === 'number'){
+      _calib.rotation = msg.frameRotation;
+      _comp.frameRotation = msg.frameRotation;
+    }
+    if(typeof msg.frameInfo === 'string') _calib.frameInfo = msg.frameInfo;
     const modeLabel = msg.anchorMode === 'ipad_split_left'
       ? 'iPad Split-View Left Safari (16:9)'
       : (msg.anchorMode === 'game_viewport' ? 'Auto 16:9 Game Frame' : (msg.anchorMode === 'toolbar' ? 'Toolbar Strip' : 'Full Browser Window'));
-    _calib.status = `Loaded ${msg.width}×${msg.height} (${modeLabel})`;
+    const rotTag = _calib.rotation ? ` · Rot ${_calib.rotation}°` : '';
+    const infoTag = msg.frameInfo ? ` · ${msg.frameInfo}` : '';
+    _calib.status = `Loaded ${msg.width}×${msg.height} (${modeLabel}${rotTag}${infoTag})`;
     _calib.anchorMode = msg.anchorMode || 'game_viewport';
     _calib.width = msg.width;
     _calib.height = msg.height;
@@ -4526,9 +4548,23 @@ function handleCompanionMessage(msg){
     if('reloadBtnOffset' in msg) _calib.reloadBtnOffset = msg.reloadBtnOffset;
     if(_calib.anchorMode === 'toolbar'){ _calib.mode = 'tpl'; _calib.tplBank = 'ui'; }
     _calib.testResult = null;
+    let imgSrc = msg.imageDataUrl;
+    if(!imgSrc && msg.snapRgba && msg.snapW && msg.snapH){
+      try{
+        const cv = document.createElement('canvas');
+        cv.width = msg.snapW;
+        cv.height = msg.snapH;
+        const ctx = cv.getContext('2d');
+        const id = ctx.createImageData(msg.snapW, msg.snapH);
+        const u8 = msg.snapRgba instanceof Uint8Array ? msg.snapRgba : new Uint8Array(msg.snapRgba);
+        id.data.set(u8.subarray(0, msg.snapW * msg.snapH * 4));
+        ctx.putImageData(id, 0, 0);
+        imgSrc = cv.toDataURL('image/jpeg', 0.88);
+      }catch(_){}
+    }
     const im = new Image();
     im.onload = () => { _calib.img = im; renderCalibModal(); };
-    im.src = msg.imageDataUrl;
+    if(imgSrc) im.src = imgSrc;
     renderCalibModal();
     return;
   }
@@ -4545,16 +4581,29 @@ function handleCompanionMessage(msg){
   if(msg.type === 'calib_pack_imported'){
     if(msg.rois) _calib.rois = msg.rois;
     if(msg.anchorMode) _calib.anchorMode = msg.anchorMode;
+    if(typeof msg.frameRotation === 'number'){
+      _calib.rotation = msg.frameRotation;
+      _comp.frameRotation = msg.frameRotation;
+    }
     if(msg.templates) _calib.templates = Object.assign({ hud: {}, suit: {}, felt: {}, banner: {}, ui: {} }, msg.templates);
     _calib.status = '📥 Imported Companion Pack (.json) cleanly! ROIs and all template banks updated.';
     renderCalibModal();
     return;
   }
   if(msg.type === 'calib_saved'){
+    _calib.loading = false;
     if(msg.kind === 'rois'){
       _calib.rois = msg.rois || _calib.rois;
       _calib.anchorMode = msg.anchorMode || _calib.anchorMode;
+      if(typeof msg.frameRotation === 'number'){
+        _calib.rotation = msg.frameRotation;
+        _comp.frameRotation = msg.frameRotation;
+      }
       _calib.status = '✅ Saved ROIs & anchor mode cleanly.';
+    } else if(msg.kind === 'rotation'){
+      _calib.rotation = Number(msg.frameRotation || 0);
+      _comp.frameRotation = _calib.rotation;
+      _calib.status = `🔄 Frame rotation set to ${_calib.rotation}° (no frame captured yet).`;
     } else if(msg.kind === 'template'){
       _calib.templates = Object.assign({ hud: {}, suit: {}, felt: {}, banner: {}, ui: {} }, msg.templates || _calib.templates);
       if('reloadBtnOffset' in msg) _calib.reloadBtnOffset = msg.reloadBtnOffset;
@@ -4623,6 +4672,8 @@ const CALIB_UI_KEYS = ['RELOAD_BTN'];
 const _calib = {
   open: false,
   loading: false,
+  rotation: 0,
+  frameInfo: '',
   mode: 'roi', // 'roi' | 'tpl'
   selectedRoi: 'player_strip',
   tplBank: 'hud', // 'hud' | 'suit' | 'felt' | 'banner' | 'ui'
@@ -4654,6 +4705,7 @@ function openCalibrator(){
   _calib.open = true;
   _calib.error = '';
   _calib.testResult = null;
+  _calib.rotation = Number(_comp.frameRotation || 0);
   if(_comp.ipadMode && _calib.anchorMode === 'game_viewport'){
     _calib.anchorMode = 'ipad_split_left';
   }
@@ -4706,8 +4758,12 @@ function triggerIpadBroadcastOrLoadFrame(forceFile = false){
         const ctx = cv.getContext('2d');
         ctx.drawImage(im, 0, 0);
         const rgba = ctx.getImageData(0, 0, im.width, im.height).data;
-        const rt = IpadCompanionEngine.getSharedRuntime();
-        rt.ingestRGBA(rgba, im.width, im.height);
+        if(typeof window.__ipadCompanionReceiveRGBA === 'function'){
+          window.__ipadCompanionReceiveRGBA(rgba, im.width, im.height);
+        } else {
+          const rt = IpadCompanionEngine.getSharedRuntime();
+          rt.ingestRGBA(rgba, im.width, im.height);
+        }
         if(_calib.open) grabCalibSnapshot();
         if(draft) draft.lastMsg = `🖼 Ingested test frame (${im.width}×${im.height}) into Standalone iPad Companion Engine.`;
         render();
@@ -4840,7 +4896,7 @@ function renderCalibModal(){
         <button class="btn xs ${_calib.mode==='tpl'?'primary':''}" id="calibModeTplBtn">2. Crop Card Templates</button>
         <button class="btn xs" id="calibExportPackBtn" title="Export ROIs + all 5 template banks as a single portable JSON pack">📦 Export Pack</button>
         <button class="btn xs" id="calibImportPackBtn" title="Import a portable Companion Pack JSON (Windows <-> iPad)">📥 Import Pack</button>
-        ${_comp.ipadMode ? `<button class="btn xs" id="calibLoadImgBtn" title="Load an iPad Split-View screenshot from Photos to test or calibrate">🖼 Load Screenshot</button>` : `<button class="btn xs" id="calibGrabToolbarBtn" title="Capture Brave top-left toolbar strip to calibrate Reload (⟳) icon">🔄 Grab Reload (⟳)</button>`}
+        ${_comp.ipadMode ? `<button class="btn xs" id="calibRotateBtn" title="Rotate incoming broadcast frame 90° clockwise and save">${`↻ Rotate ${_calib.rotation || 0}°`}</button><button class="btn xs" id="calibLoadImgBtn" title="Load an iPad Split-View screenshot from Photos to test or calibrate">🖼 Load Screenshot</button>` : `<button class="btn xs" id="calibGrabToolbarBtn" title="Capture Brave top-left toolbar strip to calibrate Reload (⟳) icon">🔄 Grab Reload (⟳)</button>`}
         <button class="btn xs good" id="calibGrabBtn">${_calib.loading?'Capturing…':'📸 Fresh Snapshot'}</button>
         <button class="btn xs danger" id="calibCloseBtn">✕ Close</button>
       </div>
@@ -4935,6 +4991,19 @@ function renderCalibModal(){
     _calib.tplBank = 'ui';
     _calib.cropBox = null;
     grabCalibSnapshot('toolbar');
+  };
+  const rotateBtn = document.getElementById('calibRotateBtn');
+  if(rotateBtn) rotateBtn.onclick = () => {
+    const nextRot = ((_calib.rotation || 0) + 90) % 360;
+    if(_comp.ws && _comp.ws.readyState === 1){
+      _calib.loading = true;
+      _calib.error = '';
+      _comp.ws.send(JSON.stringify({ type: 'calib_set_rotation', rotation: nextRot, anchorMode: _calib.anchorMode }));
+      renderCalibModal();
+    } else {
+      _calib.error = 'Companion offline — cannot rotate frame yet.';
+      renderCalibModal();
+    }
   };
   const loadImgBtn = document.getElementById('calibLoadImgBtn');
   if(loadImgBtn) loadImgBtn.onclick = () => triggerIpadBroadcastOrLoadFrame(true);
@@ -5095,7 +5164,9 @@ function connectCompanion(immediate = false){
     const useIpadSocket = _comp.ipadMode && typeof IpadCompanionEngine !== 'undefined';
     if(!useIpadSocket && typeof WebSocket === 'undefined') return;
     const ws = useIpadSocket
-      ? new IpadCompanionEngine.IpadCompanionSocket()
+      ? (IpadCompanionEngine.WorkerCompanionSocket
+          ? new IpadCompanionEngine.WorkerCompanionSocket()
+          : new IpadCompanionEngine.IpadCompanionSocket())
       : new WebSocket('ws://127.0.0.1:8765');
     _comp.ws = ws;
     ws.onopen = () => {

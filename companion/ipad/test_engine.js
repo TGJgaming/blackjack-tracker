@@ -300,6 +300,7 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
           "X-BJ-Broadcast-Active": "1",
           "X-BJ-AppGroup-Ok": "0",
           "X-BJ-BroadcastExt-Present": "1",
+          "X-BJ-Frame-Info": "900x1200,ori=6->120x90",
         };
       }
       if (this.onload) this.onload();
@@ -352,6 +353,8 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   await new Promise((r) => setTimeout(r, 140));
   assert(pollRt.latestRawFrame && pollRt.latestRawFrame.w === 120, "Native poll should ingest 200 RGBA frame");
   assert.strictEqual(pollRt._lastFrameSeq, 42);
+  assert.strictEqual(pollRt.frameInfo, "900x1200,ori=6->120x90", "Poll must parse X-BJ-Frame-Info");
+  assert.strictEqual(pollRt.buildStatusPayload().frameInfo, "900x1200,ori=6->120x90");
   await new Promise((r) => setTimeout(r, 140));
   assert(requestedUrls.some((u) => u.endsWith("?since=42")), "Subsequent polls must pass ?since=42 to skip duplicate buffers");
 
@@ -359,9 +362,321 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   await new Promise((r) => setTimeout(r, 140));
   assert.strictEqual(pollRt.broadcastActive, false, "Returning to idle must clear broadcastActive");
   assert.strictEqual(pollRt._lastFrameSeq, 0, "Returning to idle must reset _lastFrameSeq");
-
+  assert.strictEqual(pollRt.frameInfo, "", "Returning to idle must clear frameInfo");
   sock.close();
-  console.log("   All iPad JS CV, Socket, Loopback Polling & State Machine checks PASSED!");
+
+  console.log("8. Testing FFT CCoeffNormed numerical parity (< 1e-5) vs spatial baseline...");
+  {
+    // Non-power-of-two grayscale image with patterned card-like features and flat border
+    const srcW = 97, srcH = 61;
+    const srcGray = Engine.createImage(srcW, srcH, 1, 0);
+    let seed = 1337;
+    const randByte = () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return (seed >>> 16) & 255;
+    };
+    for (let y = 0; y < srcH; y++) {
+      for (let x = 0; x < srcW; x++) {
+        srcGray.data[y * srcW + x] = (y < 10 && x < 10) ? 128 : randByte();
+      }
+    }
+    const tplW = 19, tplH = 15;
+    const tplGray = Engine.createImage(tplW, tplH, 1, 0);
+    for (let y = 0; y < tplH; y++) {
+      for (let x = 0; x < tplW; x++) {
+        tplGray.data[y * tplW + x] = srcGray.data[(22 + y) * srcW + (41 + x)];
+      }
+    }
+    // Reference exact double-precision scalar CCoeffNormed
+    let tSum = 0;
+    const nTpl = tplW * tplH;
+    for (let i = 0; i < nTpl; i++) tSum += tplGray.data[i];
+    const tMean = tSum / nTpl;
+    const tZero = new Float32Array(nTpl);
+    let tSq = 0;
+    for (let i = 0; i < nTpl; i++) {
+      const d = tplGray.data[i] - tMean;
+      tZero[i] = d;
+      tSq += d * d;
+    }
+    const tNorm = Math.sqrt(tSq);
+
+    const prepGray = Engine.prepareSourceForMatch(srcGray, false);
+    const fftRes = Engine.matchPreparedTemplate(prepGray, tplGray, tZero, tNorm);
+    const scalarRes = Engine.matchTemplateCCoeffNormed(srcGray, tplGray);
+    assert.strictEqual(fftRes.w, scalarRes.w);
+    assert.strictEqual(fftRes.h, scalarRes.h);
+    let maxErr = 0;
+    for (let y = 0; y < scalarRes.h; y++) {
+      for (let x = 0; x < scalarRes.w; x++) {
+        const idx = y * scalarRes.w + x;
+        let pSum = 0;
+        for (let ty = 0; ty < tplH; ty++) {
+          for (let tx = 0; tx < tplW; tx++) {
+            pSum += srcGray.data[(y + ty) * srcW + (x + tx)];
+          }
+        }
+        const pMean = pSum / nTpl;
+        let num = 0, pVar = 0;
+        for (let ty = 0; ty < tplH; ty++) {
+          for (let tx = 0; tx < tplW; tx++) {
+            const pd = srcGray.data[(y + ty) * srcW + (x + tx)] - pMean;
+            const td = tZero[ty * tplW + tx];
+            num += pd * td;
+            pVar += pd * pd;
+          }
+        }
+        const ref = (tNorm > 1e-6 && pVar > 1e-6) ? Math.max(-1, Math.min(1, num / (tNorm * Math.sqrt(pVar)))) : 0;
+        maxErr = Math.max(maxErr, Math.abs(fftRes.data[idx] - ref), Math.abs(scalarRes.data[idx] - ref));
+      }
+    }
+    console.log(`   Max FFT/Spatial CCoeffNormed error vs exact scalar: ${maxErr.toExponential(2)}`);
+    assert(maxErr < 1e-5, `Expected CCoeffNormed maxErr < 1e-5, got ${maxErr}`);
+    assert(fftRes.maxVal > 0.999 && fftRes.maxX === 41 && fftRes.maxY === 22, "Exact template match location mismatch");
+
+    // Flat template guard + oversized template guard
+    const flatTpl = Engine.createImage(5, 5, 1, 77);
+    const flatMatch = Engine.matchTemplateCCoeffNormed(srcGray, flatTpl);
+    assert.strictEqual(flatMatch.maxVal, 0);
+    const bigTpl = Engine.createImage(200, 200, 1, 50);
+    const bigMatch = Engine.matchTemplateCCoeffNormed(srcGray, bigTpl);
+    assert.strictEqual(bigMatch.maxVal, -1);
+
+    // Small-work spatial-integral path check (work <= 12000)
+    const smSrc = Engine.cropImage(srcGray, 10, 10, 23, 17);
+    const smTpl = Engine.cropImage(srcGray, 15, 13, 6, 5);
+    const smPrep = Engine.prepareSourceForMatch(smSrc, false);
+    const { tZero: smZ, tNorm: smN } = (() => {
+      let s = 0;
+      const n = smTpl.w * smTpl.h;
+      for (let i = 0; i < n; i++) s += smTpl.data[i];
+      const m = s / n;
+      const z = new Float32Array(n);
+      let q = 0;
+      for (let i = 0; i < n; i++) {
+        const d = smTpl.data[i] - m;
+        z[i] = d;
+        q += d * d;
+      }
+      return { tZero: z, tNorm: Math.sqrt(q) };
+    })();
+    const smRes = Engine.matchPreparedTemplate(smPrep, smTpl, smZ, smN);
+    assert(smRes.maxVal > 0.999 && smRes.maxX === 5 && smRes.maxY === 3);
+  }
+
+  console.log("9. Testing rotateImage (0/90/180/270) & calib_set_rotation persistence...");
+  {
+    const img = Engine.createImage(5, 3, 3, 0);
+    for (let y = 0; y < 3; y++) {
+      for (let x = 0; x < 5; x++) {
+        const p = (y * 5 + x) * 3;
+        img.data[p] = x;
+        img.data[p + 1] = y;
+        img.data[p + 2] = y * 10 + x;
+      }
+    }
+    const r0 = Engine.rotateImage(img, 0);
+    assert.strictEqual(r0.w, 5);
+    assert.strictEqual(r0.h, 3);
+    const r90 = Engine.rotateImage(img, 90);
+    assert.strictEqual(r90.w, 3);
+    assert.strictEqual(r90.h, 5);
+    // Original top-left (0, 0) moves to top-right (w'=2, y'=0) on 90° CW
+    assert.strictEqual(r90.data[(0 * 3 + 2) * 3 + 2], 0);
+    // Original bottom-left (0, 2) moves to top-left (x'=0, y'=0) on 90° CW
+    assert.strictEqual(r90.data[(0 * 3 + 0) * 3 + 2], 20);
+    // Four 90° CW rotations equal identity
+    const r360 = Engine.rotateImage(Engine.rotateImage(Engine.rotateImage(r90, 90), 90), 90);
+    assert.strictEqual(r360.w, 5);
+    assert.strictEqual(r360.h, 3);
+    assert.deepStrictEqual(Array.from(r360.data), Array.from(img.data));
+
+    // Persistence + headless snapRgba output
+    memStore.delete("bjPlaytechTracker.ipadCompanionPack.v1");
+    const rotRt = new Engine.IpadCompanionRuntime({ initialPack: pack, isNativeHost: false });
+    const frameW = 240, frameH = 180;
+    const rawFrame = Engine.createImage(frameW, frameH, 3, 30);
+    fillRect(rawFrame, 10, 10, 60, 40, 200, 180, 160);
+    rotRt.ingestFrameBgr(rawFrame, 50.0);
+
+    let rotSnap = null;
+    const rotClient = {
+      readyState: 1,
+      onRawMessage(obj) { rotSnap = obj; },
+      onmessage({ data }) { rotSnap = JSON.parse(data); },
+    };
+    rotRt.clients.add(rotClient);
+    rotRt.handleClientMessage(rotClient, JSON.stringify({ type: "calib_set_rotation", rotation: 90, anchorMode: "window" }));
+    assert(rotSnap && rotSnap.type === "calib_snapshot", "calib_set_rotation must emit rotated calib_snapshot");
+    assert.strictEqual(rotSnap.frameRotation, 90);
+    assert.strictEqual(rotSnap.width, frameH, "90° CW rotation must swap width and height");
+    assert.strictEqual(rotSnap.height, frameW);
+    assert(rotSnap.snapRgba instanceof Uint8Array && rotSnap.snapRgba.length === frameH * frameW * 4, "Headless calib_grab must emit snapRgba");
+
+    // Rotate back 270 -> preserves clean unrotated dimensions
+    rotRt.handleClientMessage(rotClient, JSON.stringify({ type: "calib_set_rotation", rotation: 270, anchorMode: "window" }));
+    assert.strictEqual(rotRt._unrotatedRawFrame.w, frameW, "_unrotatedRawFrame must stay unrotated");
+    assert.strictEqual(rotSnap.width, frameH);
+    rotRt.handleClientMessage(rotClient, JSON.stringify({ type: "calib_set_rotation", rotation: 90, anchorMode: "window" }));
+
+    // Fresh runtime loads saved rotation from localStorage
+    const restoredRt = new Engine.IpadCompanionRuntime({ isNativeHost: false });
+    assert.strictEqual(restoredRt.cfg.frame_rotation, 90, "New runtime must restore persisted frame_rotation");
+    memStore.delete("bjPlaytechTracker.ipadCompanionPack.v1");
+  }
+
+  console.log("10. Testing ViewportSmoother & PlaytechDetector ROI caches...");
+  {
+    const smth = new Engine.ViewportSmoother(0.35, 18);
+    smth.resolveAnchor(fullScreen, "ipad_split_left");
+    assert.strictEqual(smth._framesSinceDetect, 0);
+    smth.resolveAnchor(fullScreen, "ipad_split_left");
+    assert.strictEqual(smth._framesSinceDetect, 1, "Second resolveAnchor must reuse steady cached rect");
+    smth.reset();
+    assert.strictEqual(smth._rect, null);
+    assert.strictEqual(smth._cachedRect, null);
+    assert.strictEqual(smth._cachedArgs, null);
+    assert.strictEqual(smth._framesSinceDetect, 0);
+
+    const cachedDet = new Engine.PlaytechDetector(cfg, pack);
+    const dummyImg = Engine.createImage(160, 40, 3, 20);
+    const r1 = cachedDet.processCrops({
+      playerImg: hudStrip,
+      dealerImg: dummyImg,
+      shuffleImg: dummyImg,
+      bannerImg: dummyImg,
+      placeBetsImg: dummyImg,
+      ts: 10.0,
+    });
+    assert.strictEqual(r1.player_cards.length, 2);
+    // Spy on detectHudStrip to ensure static frame hits cache instead of rescanning
+    let hudScanCalls = 0;
+    const origDetectHud = cachedDet.detectHudStrip.bind(cachedDet);
+    cachedDet.detectHudStrip = (...args) => { hudScanCalls++; return origDetectHud(...args); };
+
+    const r2 = cachedDet.processCrops({
+      playerImg: hudStrip,
+      dealerImg: dummyImg,
+      shuffleImg: dummyImg,
+      bannerImg: dummyImg,
+      placeBetsImg: dummyImg,
+      ts: 10.2,
+    });
+    assert.strictEqual(hudScanCalls, 0, "Identical ROI frames must hit signature cache without calling detectHudStrip");
+    assert.strictEqual(r2.player_cards.length, 2);
+
+    // Changing HUD strip (clearing cards) must invalidate signature cache immediately
+    const r3 = cachedDet.processCrops({
+      playerImg: dummyImg,
+      dealerImg: dummyImg,
+      shuffleImg: dummyImg,
+      bannerImg: dummyImg,
+      placeBetsImg: dummyImg,
+      ts: 10.4,
+    });
+    assert.strictEqual(hudScanCalls, 1, "Changing ROI content must bypass cache and rescan immediately");
+    assert.strictEqual(r3.player_cards.length, 0);
+  }
+
+  console.log("11. Testing WorkerCompanionSocket fallback + mock Worker zero-copy snapshot...");
+  {
+    // Node has no global Worker -> promotes cleanly to IpadCompanionSocket
+    const fbRt = new Engine.IpadCompanionRuntime({ initialPack: pack, isNativeHost: false });
+    const fbSock = new Engine.WorkerCompanionSocket({ fallbackRuntime: fbRt, isNativeHost: false });
+    const fbMsgs = [];
+    fbSock.onmessage = ({ data }) => fbMsgs.push(JSON.parse(data));
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(fbSock.readyState, 1);
+    assert.strictEqual(fbSock.fallbackReason, "worker_unavailable");
+    assert(fbMsgs.some((m) => m.type === "status"));
+    globalThis.__ipadCompanionSetHostInfo({ broadcastExtPresent: true, appGroupAvailable: false });
+    globalThis.__ipadCompanionSetExtConnected(true);
+    assert.strictEqual(fbRt.extConnected, true);
+    fbSock.close();
+
+    // Mock Worker + mock canvas toDataURL -> verifies worker_ready, snapshot reconstruction, and xhr_blocked fallback
+    let activeMockWorker = null;
+    class MockWorker {
+      constructor(url) {
+        this.url = url;
+        this.posted = [];
+        this.terminated = false;
+        activeMockWorker = this;
+      }
+      postMessage(msg) {
+        this.posted.push(msg);
+        if (msg.type === "init") {
+          setTimeout(() => {
+            if (this.terminated || !this.onmessage) return;
+            this.onmessage({
+              data: {
+                type: "worker_ready",
+                status: { type: "status", connected: true, windowFound: false, paused: false, state: "IDLE", ipadMode: true, frameRotation: 0 },
+              },
+            });
+          }, 10);
+        }
+      }
+      terminate() {
+        this.terminated = true;
+      }
+    }
+    const prevDoc = global.document;
+    global.document = {
+      createElement(tag) {
+        assert.strictEqual(tag, "canvas");
+        return {
+          width: 0,
+          height: 0,
+          getContext() {
+            return {
+              createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4) }),
+              putImageData() {},
+            };
+          },
+          toDataURL: () => "data:image/jpeg;base64,MOCKSNAP",
+        };
+      },
+    };
+    const wSock = new Engine.WorkerCompanionSocket({
+      WorkerClass: MockWorker,
+      workerUrl: "companion_worker.js",
+      isNativeHost: true,
+    });
+    const wMsgs = [];
+    wSock.onmessage = ({ data }) => wMsgs.push(JSON.parse(data));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.strictEqual(wSock.readyState, 1, "WorkerCompanionSocket should open after worker_ready");
+    assert(wMsgs.some((m) => m.type === "status"));
+
+    wSock.send(JSON.stringify({ type: "sync_state", playMode: "bet" }));
+    assert(activeMockWorker.posted.some((m) => m.type === "ws_send"));
+
+    activeMockWorker.onmessage({
+      data: {
+        type: "ws_message_snapshot",
+        payload: { type: "calib_snapshot", width: 4, height: 3, anchorMode: "window", rois: {}, templates: {}, snapW: 4, snapH: 3 },
+        snapRgba: new Uint8Array(4 * 3 * 4),
+      },
+    });
+    const wSnap = wMsgs.find((m) => m.type === "calib_snapshot");
+    assert(wSnap && wSnap.imageDataUrl === "data:image/jpeg;base64,MOCKSNAP", "Main thread must decode ws_message_snapshot into imageDataUrl");
+
+    // Trigger worker_fallback ("xhr_blocked") and verify seamless replay to fallback runtime
+    const fbFromWorkerRt = new Engine.IpadCompanionRuntime({ initialPack: pack, isNativeHost: false });
+    wSock.options.fallbackRuntime = fbFromWorkerRt;
+    globalThis.__ipadCompanionSetExtConnected(true);
+    activeMockWorker.onmessage({ data: { type: "worker_fallback", reason: "xhr_blocked" } });
+    await new Promise((r) => setTimeout(r, 35));
+    assert.strictEqual(wSock.fallbackReason, "xhr_blocked");
+    assert.strictEqual(fbFromWorkerRt.extConnected, true, "Fallback promotion must replay extConnected");
+    assert.strictEqual(fbFromWorkerRt.sm.sync_play_mode, "bet", "Fallback promotion must replay sync_state");
+
+    wSock.close();
+    global.document = prevDoc;
+  }
+
+  console.log("   All iPad JS CV, Rotation, Cache, Worker & Loopback Polling checks PASSED!");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

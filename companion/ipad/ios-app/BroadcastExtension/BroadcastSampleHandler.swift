@@ -133,6 +133,36 @@ private final class LoopbackFrameSender {
         conn.start(queue: queue)
     }
 
+    func sendAuxiliaryRecord(_ wireData: Data) {
+        lock.lock()
+        guard ready, let conn = connection else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        queue.async { [weak self, weak conn] in
+            guard let self = self, let conn = conn else { return }
+            conn.send(content: wireData, completion: .contentProcessed { [weak self, weak conn] err in
+                guard let self = self, let conn = conn else { return }
+                if let err = err {
+                    self.lock.lock()
+                    let isCurrent = (self.connection === conn)
+                    if isCurrent {
+                        self.ready = false
+                        self.sending = false
+                        self.connection = nil
+                    }
+                    self.lock.unlock()
+                    if isCurrent {
+                        self.logger.error("Loopback meta send error: \(String(describing: err), privacy: .public)")
+                        conn.cancel()
+                    }
+                }
+            })
+        }
+    }
+
     func sendFrameRecord(_ wireData: Data) {
         lock.lock()
         guard ready, !sending, let conn = connection else {
@@ -203,8 +233,8 @@ private final class LoopbackFrameSender {
 
 /// Lightweight ReplayKit Broadcast Upload Extension (`RPBroadcastSampleHandler`).
 /// Strictly engineered to stay well below iPadOS's 50 MB extension limit:
-/// - Throttles capture to 12 FPS
-/// - Applies `RPVideoSampleOrientationKey` and normalizes extent origin before scaling
+/// - Throttles capture to 6 FPS and skips duplicate static frames between 1.2s heartbeats
+/// - Remaps `RPVideoSampleOrientationKey` to EXIF `CIImage.oriented(_:)` (swapping `.left` <-> `.right`) and normalizes extent origin
 /// - Downscales incoming `CMSampleBuffer` to <= 1280x960 using hardware CIContext
 /// - Writes RGBA bytes directly into `SharedFrameRing` (when App Group exists) OR
 ///   streams directly over loopback TCP (`127.0.0.1:8766`) when App Group is stripped
@@ -222,9 +252,48 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
     private var seq: UInt32 = 0
     private var frameCount: UInt64 = 0
     private var lastFrameTs: CFTimeInterval = 0
-    private let minFrameInterval: CFTimeInterval = 1.0 / 12.0
+    private let minFrameInterval: CFTimeInterval = 1.0 / 6.0
+    private let duplicateHeartbeatInterval: CFTimeInterval = 1.2
+    private var hasSentFrame = false
+    private var lastSentFrameHash: UInt64 = 0
+    private var lastSentDims: (Int, Int) = (0, 0)
+    private var lastSentFrameTs: CFTimeInterval = 0
+    private var lastMeta: (rawW: Int, rawH: Int, rawOri: UInt32, dstW: Int, dstH: Int)?
     private var loggedFirstFrame = false
     private var frameBuffer = [UInt8](repeating: 0, count: FrameIPCConstants.tcpHeaderBytes + SharedFrameRing.capacityBytes)
+
+    /// ReplayKit's `RPVideoSampleOrientationKey` indicates the clockwise correction needed
+    /// (`.left` = 8 for +90° CW, `.right` = 6 for 270° CW), which is the opposite of EXIF /
+    /// `CIImage.oriented(_:)` where `.right` (6) rotates +90° CW and `.left` (8) rotates 90° CCW.
+    private static func ciOrientation(forReplayKitOrientation rpOrientation: CGImagePropertyOrientation) -> CGImagePropertyOrientation {
+        switch rpOrientation {
+        case .left:
+            return .right
+        case .right:
+            return .left
+        case .leftMirrored:
+            return .rightMirrored
+        case .rightMirrored:
+            return .leftMirrored
+        default:
+            return rpOrientation
+        }
+    }
+
+    private static func computeStridedPixelHash(_ raw: UnsafeRawPointer, byteCount: Int) -> UInt64 {
+        let pixelCount = byteCount / 4
+        guard pixelCount > 0 else { return 0 }
+        let stride = max(1, pixelCount / 1024)
+        var h: UInt64 = 14695981039346656037
+        var i = 0
+        while i < pixelCount {
+            let word = raw.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)
+            h ^= UInt64(word)
+            h &*= 1099511628211
+            i += stride
+        }
+        return h
+    }
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         logger.info("Broadcast started")
@@ -240,6 +309,11 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
         seq = (seed == 0) ? 1 : seed
         frameCount = 0
         lastFrameTs = 0
+        hasSentFrame = false
+        lastSentFrameHash = 0
+        lastSentDims = (0, 0)
+        lastSentFrameTs = 0
+        lastMeta = nil
         loggedFirstFrame = false
     }
 
@@ -264,6 +338,11 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
         }
         ring = nil
         attemptedRingInit = false
+        hasSentFrame = false
+        lastSentFrameHash = 0
+        lastSentDims = (0, 0)
+        lastSentFrameTs = 0
+        lastMeta = nil
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
@@ -281,22 +360,25 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
         lastFrameTs = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let rawW = CVPixelBufferGetWidth(pixelBuffer)
+        let rawH = CVPixelBufferGetHeight(pixelBuffer)
 
         autoreleasepool {
             var ciImage = CIImage(cvPixelBuffer: pixelBuffer)
 
-            var orientation: CGImagePropertyOrientation = .up
+            var rpOrientation: CGImagePropertyOrientation = .up
             if let orientationAttachment = CMGetAttachment(
                 sampleBuffer,
                 key: RPVideoSampleOrientationKey as CFString,
                 attachmentModeOut: nil
             ) as? NSNumber,
                let parsedOrientation = CGImagePropertyOrientation(rawValue: orientationAttachment.uint32Value) {
-                orientation = parsedOrientation
+                rpOrientation = parsedOrientation
             }
 
-            if orientation != .up {
-                ciImage = ciImage.oriented(orientation)
+            let ciOrientation = Self.ciOrientation(forReplayKitOrientation: rpOrientation)
+            if ciOrientation != .up {
+                ciImage = ciImage.oriented(ciOrientation)
             }
 
             let orientedExtent = ciImage.extent
@@ -337,7 +419,25 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
             let bounds = CGRect(x: 0, y: 0, width: dstW, height: dstH)
             let pixelOffset = FrameIPCConstants.tcpHeaderBytes + SharedFrameRing.headerBytes
 
+            let curMeta = (rawW: rawW, rawH: rawH, rawOri: rpOrientation.rawValue, dstW: dstW, dstH: dstH)
+            let metaChanged: Bool
+            if let prevMeta = lastMeta,
+               prevMeta.rawW == curMeta.rawW,
+               prevMeta.rawH == curMeta.rawH,
+               prevMeta.rawOri == curMeta.rawOri,
+               prevMeta.dstW == curMeta.dstW,
+               prevMeta.dstH == curMeta.dstH {
+                metaChanged = false
+            } else {
+                metaChanged = true
+                lastMeta = curMeta
+                logger.info("Broadcast geometry: raw=\(rawW)x\(rawH) rpOri=\(rpOrientation.rawValue) ciOri=\(ciOrientation.rawValue) dst=\(dstW)x\(dstH)")
+            }
+
             var loopbackRecordData: Data?
+            var loopbackMetaData: Data?
+            var skippedDuplicate = false
+
             frameBuffer.withUnsafeMutableBytes { rawPtr in
                 guard let baseAddress = rawPtr.baseAddress else { return }
                 let pixelPtr = baseAddress.advanced(by: pixelOffset)
@@ -350,6 +450,18 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
                     format: .RGBA8,
                     colorSpace: srgbColorSpace
                 )
+
+                let frameHash = Self.computeStridedPixelHash(pixelPtr, byteCount: rgbaCount)
+                if hasSentFrame && !metaChanged && (dstW, dstH) == lastSentDims && frameHash == lastSentFrameHash && (now - lastSentFrameTs) < duplicateHeartbeatInterval {
+                    skippedDuplicate = true
+                    return
+                }
+
+                hasSentFrame = true
+                lastSentFrameHash = frameHash
+                lastSentDims = (dstW, dstH)
+                lastSentFrameTs = now
+
                 seq &+= 1
                 if seq == 0 { seq = 1 }
 
@@ -362,6 +474,15 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
                         seq: seq
                     )
                 } else {
+                    if metaChanged {
+                        loopbackMetaData = FrameIPCConstants.makeMetaRecord(
+                            rawW: rawW,
+                            rawH: rawH,
+                            rawOrientation: rpOrientation.rawValue,
+                            dstW: dstW,
+                            dstH: dstH
+                        )
+                    }
                     FrameIPCConstants.writeUInt32LE(FrameIPCConstants.recordMagic, to: baseAddress, offset: 0)
                     FrameIPCConstants.writeUInt32LE(FrameIPCConstants.msgFrame, to: baseAddress, offset: 4)
                     FrameIPCConstants.writeUInt32LE(UInt32(packetBytes), to: baseAddress, offset: 8)
@@ -376,10 +497,14 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
                 if !loggedFirstFrame {
                     loggedFirstFrame = true
                     let mode = (ring != nil) ? "appGroup" : "loopback"
-                    logger.info("Rendered first broadcast frame \(dstW)x\(dstH) via \(mode, privacy: .public) (rawOrientation=\(orientation.rawValue))")
+                    logger.info("Rendered first broadcast frame \(dstW)x\(dstH) via \(mode, privacy: .public) (rawOrientation=\(rpOrientation.rawValue), ciOrientation=\(ciOrientation.rawValue))")
                 }
             }
 
+            if skippedDuplicate { return }
+            if let metaData = loopbackMetaData {
+                loopbackSender.sendAuxiliaryRecord(metaData)
+            }
             if let recordData = loopbackRecordData {
                 loopbackSender.sendFrameRecord(recordData)
             }

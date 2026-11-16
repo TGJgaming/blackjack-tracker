@@ -48,6 +48,7 @@ jobs:
             Payload/BlackjackTracker.app/index.html \
             Payload/BlackjackTracker.app/default_pack.js \
             Payload/BlackjackTracker.app/companion_engine.js \
+            Payload/BlackjackTracker.app/companion_worker.js \
             Payload/BlackjackTracker.app/PlugIns/BroadcastExtension.appex/Info.plist \
             Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/Info.plist \
             Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/manifest.json \

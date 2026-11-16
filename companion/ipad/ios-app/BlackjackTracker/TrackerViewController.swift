@@ -23,6 +23,7 @@ final class LoopbackFrameReceiver {
     private var listener: NWListener?
     private var activeSession: Session?
     private var latestPacket: Data?
+    private var latestFrameMeta: (rawW: Int, rawH: Int, rawOrientation: UInt32, dstW: Int, dstH: Int)?
     private var broadcastActive = false
     private var hasConnectedOnce = false
     private var loggedFrameDims: (Int, Int) = (0, 0)
@@ -133,14 +134,16 @@ final class LoopbackFrameReceiver {
 
     private func processBuffer(for session: Session) {
         let maxRecordBytes = FrameIPCConstants.tcpHeaderBytes + SharedFrameRing.capacityBytes
-        var newestFrame: Data?
+        var readOffset = 0
+        var newestFrameRange: Range<Int>?
+        var newestMeta: (rawW: Int, rawH: Int, rawOrientation: UInt32, dstW: Int, dstH: Int)?
         var sawStarted = false
         var sawFinished = false
 
-        while session.rxBuffer.count >= FrameIPCConstants.tcpHeaderBytes {
-            let magic = FrameIPCConstants.readUInt32LE(from: session.rxBuffer, offset: 0)
-            let msgType = FrameIPCConstants.readUInt32LE(from: session.rxBuffer, offset: 4)
-            let payloadLen = Int(FrameIPCConstants.readUInt32LE(from: session.rxBuffer, offset: 8))
+        while (session.rxBuffer.count - readOffset) >= FrameIPCConstants.tcpHeaderBytes {
+            let magic = FrameIPCConstants.readUInt32LE(from: session.rxBuffer, offset: readOffset)
+            let msgType = FrameIPCConstants.readUInt32LE(from: session.rxBuffer, offset: readOffset + 4)
+            let payloadLen = Int(FrameIPCConstants.readUInt32LE(from: session.rxBuffer, offset: readOffset + 8))
 
             if magic != FrameIPCConstants.recordMagic || payloadLen < 0 || (FrameIPCConstants.tcpHeaderBytes + payloadLen) > maxRecordBytes {
                 logger.error("Corrupt loopback record header (magic=\(magic), len=\(payloadLen)); resetting session")
@@ -149,35 +152,47 @@ final class LoopbackFrameReceiver {
             }
 
             let totalLen = FrameIPCConstants.tcpHeaderBytes + payloadLen
-            if session.rxBuffer.count < totalLen {
+            if (session.rxBuffer.count - readOffset) < totalLen {
                 break
             }
 
-            let payloadStart = session.rxBuffer.startIndex + FrameIPCConstants.tcpHeaderBytes
+            let payloadRelOffset = readOffset + FrameIPCConstants.tcpHeaderBytes
+            let payloadStart = session.rxBuffer.startIndex + payloadRelOffset
             let payloadEnd = payloadStart + payloadLen
             if msgType == FrameIPCConstants.msgFrame {
                 if payloadLen >= SharedFrameRing.headerBytes {
-                    newestFrame = session.rxBuffer.subdata(in: payloadStart..<payloadEnd)
+                    newestFrameRange = payloadStart..<payloadEnd
                     sawStarted = true
                     sawFinished = false
+                }
+            } else if msgType == FrameIPCConstants.msgMeta {
+                if let meta = FrameIPCConstants.readMetaPayload(from: session.rxBuffer, offset: payloadRelOffset) {
+                    newestMeta = meta
                 }
             } else if msgType == FrameIPCConstants.msgBroadcastStarted {
                 sawStarted = true
                 sawFinished = false
             } else if msgType == FrameIPCConstants.msgBroadcastFinished {
                 sawFinished = true
-                newestFrame = nil
+                newestFrameRange = nil
+                newestMeta = nil
             }
 
-            if session.rxBuffer.count == totalLen {
-                session.rxBuffer.removeAll(keepingCapacity: false)
-            } else {
-                session.rxBuffer = session.rxBuffer.subdata(in: payloadEnd..<session.rxBuffer.endIndex)
-            }
+            readOffset += totalLen
         }
 
-        if newestFrame != nil || sawStarted || sawFinished {
+        let newestFrame = newestFrameRange.map { session.rxBuffer.subdata(in: $0) }
+        if readOffset >= session.rxBuffer.count {
+            session.rxBuffer.removeAll(keepingCapacity: true)
+        } else if readOffset > 0 {
+            session.rxBuffer.removeSubrange(session.rxBuffer.startIndex..<(session.rxBuffer.startIndex + readOffset))
+        }
+
+        if newestFrame != nil || newestMeta != nil || sawStarted || sawFinished {
             stateLock.lock()
+            if let meta = newestMeta {
+                latestFrameMeta = meta
+            }
             if let pkt = newestFrame {
                 latestPacket = pkt
                 broadcastActive = true
@@ -189,6 +204,7 @@ final class LoopbackFrameReceiver {
                 }
             } else if sawFinished {
                 latestPacket = nil
+                latestFrameMeta = nil
                 broadcastActive = false
             } else if sawStarted {
                 broadcastActive = true
@@ -206,14 +222,20 @@ final class LoopbackFrameReceiver {
             stateLock.lock()
             broadcastActive = false
             latestPacket = nil
+            latestFrameMeta = nil
             stateLock.unlock()
             logger.info("BroadcastExtension loopback session closed")
         }
     }
 
-    func latestState() -> (packet: Data?, broadcastActive: Bool, hasConnectedOnce: Bool) {
+    func latestState() -> (
+        packet: Data?,
+        meta: (rawW: Int, rawH: Int, rawOrientation: UInt32, dstW: Int, dstH: Int)?,
+        broadcastActive: Bool,
+        hasConnectedOnce: Bool
+    ) {
         stateLock.lock()
-        let result = (latestPacket, broadcastActive, hasConnectedOnce)
+        let result = (latestPacket, latestFrameMeta, broadcastActive, hasConnectedOnce)
         stateLock.unlock()
         return result
     }
@@ -323,13 +345,23 @@ final class CompanionSchemeHandler: NSObject, WKURLSchemeHandler {
                 }
             }
 
+            var frameInfoStr = ""
+            if let meta = loopbackState.meta {
+                frameInfoStr = "\(meta.rawW)x\(meta.rawH),ori=\(meta.rawOrientation)->\(meta.dstW)x\(meta.dstH)"
+            } else if let packet = selectedPacket, packet.count >= SharedFrameRing.headerBytes {
+                let pw = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 4))
+                let ph = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 8))
+                frameInfoStr = "\(pw)x\(ph)"
+            }
+
             let diagHeaders: [String: String] = [
                 "Cache-Control": "no-store",
                 "Access-Control-Allow-Origin": "*",
                 "X-BJ-Transport": transport,
                 "X-BJ-Broadcast-Active": activeFlag ? "1" : "0",
                 "X-BJ-AppGroup-Ok": (appGroupId != nil) ? "1" : "0",
-                "X-BJ-BroadcastExt-Present": broadcastExtensionPresent ? "1" : "0"
+                "X-BJ-BroadcastExt-Present": broadcastExtensionPresent ? "1" : "0",
+                "X-BJ-Frame-Info": frameInfoStr
             ]
 
             if let packet = selectedPacket, packet.count >= SharedFrameRing.headerBytes {
@@ -385,6 +417,8 @@ final class CompanionSchemeHandler: NSObject, WKURLSchemeHandler {
                 asset = ("default_pack", "js", "application/javascript; charset=utf-8")
             case "/companion/ipad/companion_engine.js":
                 asset = ("companion_engine", "js", "application/javascript; charset=utf-8")
+            case "/companion/ipad/companion_worker.js":
+                asset = ("companion_worker", "js", "application/javascript; charset=utf-8")
             default:
                 asset = nil
             }
@@ -418,7 +452,8 @@ final class CompanionSchemeHandler: NSObject, WKURLSchemeHandler {
                 statusCode: 200,
                 headers: [
                     "Content-Type": target.mime,
-                    "Cache-Control": "no-store"
+                    "Cache-Control": "no-store",
+                    "Access-Control-Allow-Origin": "*"
                 ],
                 body: data
             )

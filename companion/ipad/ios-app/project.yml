@@ -30,6 +30,8 @@ targets:
         buildPhase: resources
       - path: ../companion_engine.js
         buildPhase: resources
+      - path: ../companion_worker.js
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tgjgaming.blackjacktracker

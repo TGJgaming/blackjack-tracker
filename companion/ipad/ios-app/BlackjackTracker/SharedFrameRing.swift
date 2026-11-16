@@ -11,6 +11,8 @@ enum FrameIPCConstants {
     static let msgFrame: UInt32 = 1
     static let msgBroadcastStarted: UInt32 = 2
     static let msgBroadcastFinished: UInt32 = 3
+    static let msgMeta: UInt32 = 4
+    static let metaPayloadBytes: Int = 20 // [rawW(4), rawH(4), rawOrientation(4), dstW(4), dstH(4)]
     static let tcpHeaderBytes: Int = 12 // [magic(4), msgType(4), payloadLen(4)]
 
     static func writeUInt32LE(_ value: UInt32, to base: UnsafeMutableRawPointer, offset: Int) {
@@ -40,6 +42,43 @@ enum FrameIPCConstants {
             writeUInt32LE(0, to: base, offset: 8)
         }
         return Data(bytes)
+    }
+
+    static func makeMetaRecord(
+        rawW: Int,
+        rawH: Int,
+        rawOrientation: UInt32,
+        dstW: Int,
+        dstH: Int
+    ) -> Data {
+        var bytes = [UInt8](repeating: 0, count: tcpHeaderBytes + metaPayloadBytes)
+        bytes.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            writeUInt32LE(recordMagic, to: base, offset: 0)
+            writeUInt32LE(msgMeta, to: base, offset: 4)
+            writeUInt32LE(UInt32(metaPayloadBytes), to: base, offset: 8)
+            writeUInt32LE(UInt32(max(0, rawW)), to: base, offset: 12)
+            writeUInt32LE(UInt32(max(0, rawH)), to: base, offset: 16)
+            writeUInt32LE(rawOrientation, to: base, offset: 20)
+            writeUInt32LE(UInt32(max(0, dstW)), to: base, offset: 24)
+            writeUInt32LE(UInt32(max(0, dstH)), to: base, offset: 28)
+        }
+        return Data(bytes)
+    }
+
+    static func readMetaPayload(
+        from data: Data,
+        offset: Int
+    ) -> (rawW: Int, rawH: Int, rawOrientation: UInt32, dstW: Int, dstH: Int)? {
+        guard offset >= 0, (offset + metaPayloadBytes) <= data.count else {
+            return nil
+        }
+        let rawW = Int(readUInt32LE(from: data, offset: offset))
+        let rawH = Int(readUInt32LE(from: data, offset: offset + 4))
+        let rawOri = readUInt32LE(from: data, offset: offset + 8)
+        let dstW = Int(readUInt32LE(from: data, offset: offset + 12))
+        let dstH = Int(readUInt32LE(from: data, offset: offset + 16))
+        return (rawW, rawH, rawOri, dstW, dstH)
     }
 }
 
