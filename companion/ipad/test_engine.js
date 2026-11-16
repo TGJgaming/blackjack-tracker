@@ -1504,5 +1504,38 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 24 PASSED");
 }
 
+// 25. Split Guard allows auto_watch logging at NO_MORE_BETS
+{
+  console.log("25. Testing Split Guard auto_watch logging at NO_MORE_BETS...");
+  const cfg25 = Engine.defaultConfig({
+    anchor_mode: "ipad_split_left",
+    confirm_frames: 1,
+    clear_frames: 2,
+    require_wait_banner: false,
+  });
+  const sm25 = new Engine.CompanionStateMachine(cfg25);
+  const mk = (rank, val) => ({ rank, val, conf: 0.94, suit: "S", x: 10, y: 10, w: 12, h: 16, hand_index: 0 });
+
+  sm25.step({ ts: 1, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm25.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mk("8", 8), mk("8", 8)],
+    dealer_cards: [mk("10", 0), mk("7", 7)],
+    player_hands: { 0: [mk("8", 8), mk("8", 8)] },
+    split_detected: true,
+    hud_refreshed: true,
+  });
+  // Round ends at PLACE_BETS while split_detected=true & only 1 hand committed (splitBlocksAuto=true)
+  const pbEvs = sm25.step({ ts: 3, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  assert(pbEvs.some((e) => e.type === "prompt_confirm" && e.reason === "SPLIT"), "Should still show SPLIT prompt during betting");
+  assert(sm25._pendingAutoWatch, "Must queue _pendingAutoWatch for NO_MORE_BETS");
+
+  const nmbEvs = sm25.step({ ts: 4, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  assert(nmbEvs.some((e) => e.type === "auto_watch" && e.fromWatch === true), "Must emit auto_watch at NO_MORE_BETS even after Split Guard");
+  console.log("   Test 25 PASSED");
+}
+
+
 
 

@@ -4611,7 +4611,7 @@ function handleCompanionMessage(msg){
       const prevP = draft.hands.reduce((a, h) => a + h.cards.length, 0);
       const prevTot = prevP + draft.dCards.length + draft.bCards.length;
       if(prevTot > 0){
-        if(draft.playMode === 'watch' && prevP >= 2 && draft.dCards.length >= 1 && !(draft.compPrompt && draft.compPrompt.reason === 'SPLIT')){
+        if(draft.playMode === 'watch' && prevP >= 2 && draft.dCards.length >= 1){
           recordRound('WATCH');
         } else {
           clearDraftCards();

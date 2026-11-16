@@ -3181,6 +3181,14 @@
         flags.length === 0 &&
         this._emittedD >= 1;
 
+      const splitAutoOnNoMoreBets =
+        !canAutoWatch &&
+        this.sync_play_mode === "watch" &&
+        splitBlocksAuto &&
+        flags.length === 0 &&
+        this._emittedP >= 2 &&
+        this._emittedD >= 1;
+
       if (canAutoWatch) {
         const sumP = this._emittedSplitHands >= 2 ? `${this._emittedP}P(${this._emittedSplitHands}H)` : `${this._emittedP}P`;
         this._flushPendingAutoWatch(events);
@@ -3192,6 +3200,17 @@
           fromWatch: true,
         };
       } else {
+        if (splitAutoOnNoMoreBets) {
+          const sumP = this._emittedSplitHands >= 2 ? `${this._emittedP}P(${this._emittedSplitHands}H)` : `${this._emittedP}P`;
+          this._flushPendingAutoWatch(events);
+          this._pendingAutoWatch = {
+            type: "auto_watch",
+            roundId: this.round_id,
+            handCount: this._emittedSplitHands,
+            summary: `${sumP}+${this._emittedD}D+${this._emittedB}B`,
+            fromWatch: true,
+          };
+        }
         const reason = splitBlocksAuto || (this.sync_play_mode === "bet" && (this._splitDetected || this.sync_is_split))
           ? "SPLIT"
           : this.sync_play_mode === "bet"
@@ -3214,7 +3233,7 @@
           feltSightings: [],
         });
       }
-      this.resyncRound(!canAutoWatch);
+      this.resyncRound(!(canAutoWatch || splitAutoOnNoMoreBets));
       return events;
     }
 
