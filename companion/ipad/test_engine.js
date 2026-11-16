@@ -1454,4 +1454,55 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 23 PASSED");
 }
 
+// 24. Educated guess fallback for incomplete dealer hands
+{
+  console.log("24. Testing educated guess fallback for incomplete dealer hands...");
+  assert.deepStrictEqual(Engine.guessMissingDealerCard(["7", "5"]), { rank: "10", val: 0 });
+  assert.deepStrictEqual(Engine.guessMissingDealerCard(["6"]), { rank: "A", val: 1 });
+
+  const cfg24 = Engine.defaultConfig({
+    anchor_mode: "ipad_split_left",
+    confirm_frames: 1,
+    clear_frames: 2,
+    require_wait_banner: false,
+  });
+  const sm24 = new Engine.CompanionStateMachine(cfg24);
+  const mk = (rank, val) => ({ rank, val, conf: 0.94, suit: "S", x: 10, y: 10, w: 12, h: 16, hand_index: 0 });
+
+  sm24.step({
+    ts: 1,
+    banner_state: "NO_MORE_BETS",
+    player_cards: [],
+    dealer_cards: [],
+    player_hands: {},
+    hud_refreshed: true,
+  });
+  sm24.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mk("10", 0), mk("9", 9)],
+    dealer_cards: [mk("7", 7), { rank: "BACK", val: null, conf: 0.92, suit: null, x: 30, y: 10, w: 20, h: 30, hand_index: 0 }],
+    player_hands: { 0: [mk("10", 0), mk("9", 9)] },
+    hud_refreshed: true,
+  });
+  // Wipe to PLACE_BETS before dealer's hole/final card is ever seen or badge read
+  const endEvs = sm24.step({
+    ts: 3,
+    banner_state: "PLACE_BETS",
+    player_cards: [],
+    dealer_cards: [],
+    player_hands: {},
+    hud_refreshed: true,
+  });
+  const guessEv = endEvs.find((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess");
+  assert(guessEv, "Must emit educated_guess dealer card when dealer hand is incomplete");
+  assert.strictEqual(guessEv.rankLabel, "10");
+  assert.strictEqual(guessEv.slot, 1, "Educated guess must replace BACK at slot 1");
+  const promptEv = endEvs.find((e) => e.type === "prompt_confirm" && e.reason === "DEALER_INCOMPLETE");
+  assert(promptEv, "Must emit DEALER_INCOMPLETE prompt so user can remove guessed card if desired");
+  assert.strictEqual(promptEv.educatedGuessRank, "10");
+  console.log("   Test 24 PASSED");
+}
+
+
 

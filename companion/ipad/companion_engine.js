@@ -2182,6 +2182,15 @@
     return matches.length === 1 ? matches[0] : null;
   }
 
+  function guessMissingDealerCard(dCommittedRanks) {
+    if (!Array.isArray(dCommittedRanks) || !dCommittedRanks.length) return null;
+    const [dTot, dSoft] = evalBjRanks(dCommittedRanks);
+    if (dTot === 6 && !dSoft) {
+      return { rank: "A", val: 1 };
+    }
+    return { rank: "10", val: 0 };
+  }
+
   class PlaytechDetector {
     constructor(cfg, initialPack = null) {
       this.cfg = cfg;
@@ -3124,13 +3133,37 @@
         }
       }
 
+      // Fallback E: educated guess for missing final dealer card when dealer hand is still incomplete
+      let educatedGuessRank = null;
+      if (isDealerStillIncomplete()) {
+        const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
+        const guess = guessMissingDealerCard(dCommBefore);
+        if (guess) {
+          const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
+          const slotIdx = backIdx >= 0 ? backIdx : this.dDebouncer.committedRanks.length;
+          if (backIdx >= 0) {
+            this.dDebouncer.committedRanks[backIdx] = guess.rank;
+          } else {
+            this.dDebouncer.committedRanks.push(guess.rank);
+          }
+          educatedGuessRank = guess.rank;
+          const guessDet = {
+            rank: guess.rank,
+            val: guess.val,
+            conf: 0.50,
+            suit: null,
+          };
+          this._emitDealerCards([[slotIdx, guessDet]], events, "educated_guess");
+        }
+      }
+
       const dCommitted = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
       const [dTotal] = evalBjRanks(dCommitted);
       const hasUnrevealedBack = this.dDebouncer.committedRanks.includes("BACK");
       const flags = this._uncertaintyFlags.slice();
       if (this._emittedP < 2 || this._emittedD < 1) flags.push("HUD_GLITCH");
 
-      const dealerIncomplete = isDealerStillIncomplete();
+      const dealerIncomplete = isDealerStillIncomplete() || educatedGuessRank !== null;
       if (dealerIncomplete && !flags.includes("HUD_GLITCH") && !flags.includes("DEALER_INCOMPLETE")) {
         flags.push("DEALER_INCOMPLETE");
       }
@@ -3177,6 +3210,7 @@
           uncertainSlots: flags,
           suggestedFocus,
           dealerTotal: dTotal,
+          educatedGuessRank,
           feltSightings: [],
         });
       }
@@ -5160,6 +5194,7 @@
     detectClusterCards,
     detectDealerBadgeTotal,
     deduceMissingDealerCard,
+    guessMissingDealerCard,
     computeRoiSignature,
     roiSigDiff,
     hudRoiSigChanged,
