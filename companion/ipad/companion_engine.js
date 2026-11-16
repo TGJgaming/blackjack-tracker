@@ -2365,8 +2365,9 @@
       for (let idx = 0; idx < Math.min(this.committedRanks.length, detections.length); idx++) {
         if (this.committedRanks[idx] === "BACK" && this._slotCands.has(idx)) {
           const { rank, cnt, det } = this._slotCands.get(idx);
+          const crispTail = this.fastTailConfirm && this.committedRanks.length >= 1 && (det.conf >= Math.max(0.84, this.fastTailMinConf) || (det.suit && det.conf >= 0.80));
           const fastOk = this.fastTailConfirm && (det.conf >= Math.min(0.82, this.fastTailMinConf) || (det.suit && det.conf >= 0.78));
-          const req = fastOk ? Math.min(this.confirmFrames, 2) : this.confirmFrames;
+          const req = crispTail ? 1 : (fastOk ? Math.min(this.confirmFrames, 2) : this.confirmFrames);
           if (cnt >= req) {
             this.committedRanks[idx] = rank;
             emitted.push([idx, det]);
@@ -2383,9 +2384,10 @@
         }
         if (!this._slotCands.has(idx)) break;
         const { rank, cnt, det } = this._slotCands.get(idx);
+        const crispTail = this.fastTailConfirm && idx >= 1 && this.committedRanks.length >= 1 && (det.conf >= Math.max(0.84, this.fastTailMinConf) || (det.suit && det.conf >= 0.80));
         const useFast = (this.fastTailConfirm && idx >= 1) || (this.fastInitialDeal && idx < 2);
         const fastOk = useFast && (det.conf >= (this.fastTailConfirm ? Math.min(0.82, this.fastTailMinConf) : this.fastTailMinConf) || (det.suit && det.conf >= 0.80));
-        const req = fastOk ? Math.min(this.confirmFrames, 2) : this.confirmFrames;
+        const req = crispTail ? 1 : (fastOk ? Math.min(this.confirmFrames, 2) : this.confirmFrames);
         if (cnt < req) break;
         this.committedRanks.push(rank);
         emitted.push([idx, det]);
@@ -3212,7 +3214,6 @@
       this._lastBetRoundsCount = 0;
       this._manualArmed = false;
       this._refreshCount = 0;
-      this._sawPlayerStrip = false;
     }
 
     inGrace(now = performance.now() / 1000) {
@@ -3243,7 +3244,6 @@
       this._lastTickTs = now;
       this._manualArmed = false;
       this._graceUntilTs = 0.0;
-      this._sawPlayerStrip = false;
       if (this.cfg.keepalive_enabled === false || this.cfg.keepalive_mode === "off") {
         this.state = "OFF";
       } else {
@@ -3396,17 +3396,8 @@
         });
       }
 
-      const hasObsPlayerStrip = Boolean(
-        obs && ((obs.player_cards && obs.player_cards.length > 0) || (obs.player_hands && Object.keys(obs.player_hands).length > 0))
-      );
-      if (hasObsPlayerStrip) {
-        this._sawPlayerStrip = true;
-      }
-      const playerStripDisappeared = Boolean(obs && this._sawPlayerStrip && !hasObsPlayerStrip);
-
       const isDue = this._manualArmed || (this._watchElapsedSec >= targetSec && now >= this._lastCooldownEndTs);
       if (!isDue) {
-        if (playerStripDisappeared) this._sawPlayerStrip = false;
         if (this.state !== "WARN") this.state = "WATCH_COUNTDOWN";
         return events;
       }
@@ -3415,18 +3406,20 @@
 
       const banner = obs && obs.banner_state ? obs.banner_state : "";
       const pbConf = obs && obs.place_bets_conf ? obs.place_bets_conf : 0.0;
+      const hasLiveCards = Boolean(obs && ((obs.player_cards && obs.player_cards.length) || (obs.dealer_cards && obs.dealer_cards.length)));
       const placeBetsReady = banner === "PLACE_BETS" || pbConf >= 0.66;
-      const roundOverSafe =
-        smState === "ROUND_OVER" ||
-        playerStripDisappeared ||
-        (smState === "IDLE" && this._manualArmed) ||
-        (smState === "BETTING" && banner === "PLACE_BETS");
+      const notInActivePlayOrCutoff =
+        banner !== "NO_MORE_BETS" &&
+        banner !== "LAST_BETS" &&
+        !["DEALING", "PLAYER_TURN", "DEALER_TURN"].includes(smState);
+      const stripsWiped =
+        !hasLiveCards &&
+        (smState === "ROUND_OVER" || smState === "BETTING" || (smState === "IDLE" && this._manualArmed));
       const safeWindow =
         windowFound &&
         playMode === "watch" &&
         !hasPrompt &&
-        banner !== "NO_MORE_BETS" &&
-        (placeBetsReady || roundOverSafe);
+        (placeBetsReady || (notInActivePlayOrCutoff && stripsWiped));
 
       if (!safeWindow) return events;
 
@@ -3434,7 +3427,6 @@
         if (now - this._lastAlertPlaceBetsTs >= 15.0) {
           this._lastAlertPlaceBetsTs = now;
           this._manualArmed = false;
-          this._sawPlayerStrip = false;
           events.push({
             type: "keepalive_status",
             event: "alert_place_bets",
@@ -3451,7 +3443,6 @@
         this._refreshStartedTs = now;
         this._graceUntilTs = now + (this.cfg.keepalive_reload_grace_sec || 14.0);
         this._manualArmed = false;
-        this._sawPlayerStrip = false;
         this.state = "REFRESHING";
         events.push({
           type: "keepalive_status",
@@ -3463,7 +3454,6 @@
       } else if (now - this._lastAlertPlaceBetsTs >= 15.0) {
         this._lastAlertPlaceBetsTs = now;
         this._manualArmed = false;
-        this._sawPlayerStrip = false;
         this.state = "WARN";
         events.push({
           type: "keepalive_status",
@@ -3978,7 +3968,6 @@
       if (kaEvents.some((e) => e.event === "refreshing")) {
         this.sm._flushPendingAutoWatch(events);
       }
-
       const allEvents = [...events, ...kaEvents];
       for (const ev of allEvents) {
         this.broadcast(ev);

@@ -1155,44 +1155,37 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 19 PASSED");
 }
 
-// Test 20: Keepalive reload fires immediately on PLACE_BETS OR when player strip disappears
+// Test 20: 1-frame crisp final dealer card commit & immediate keepalive reload on PLACE_BETS or wiped strips
 {
-  console.log("20. Testing keepalive reload on PLACE_BETS (even with draftCount>0) and on player strip disappearance...");
-  const kaA = new Engine.WatchKeepaliveManager(cfg);
-  let reloadsA = 0;
-  // Advance elapsed to 605s
-  kaA._watchElapsedSec = 605;
-  kaA.step({ now: 705.0, windowFound: true, obs: { banner_state: "", player_cards: [{ rank: "8" }], dealer_cards: [{ rank: "10" }] }, smState: "DEALER_TURN", playMode: "watch", draftCount: 4, hasPrompt: false });
-  // Trigger 1: PLACE_BETS detected even while draftCount=4 -> fires immediately!
-  const evPB = kaA.step({
-    now: 705.2,
-    windowFound: true,
-    obs: { banner_state: "PLACE_BETS", place_bets_conf: 0.91, player_cards: [], dealer_cards: [] },
-    smState: "BETTING",
-    playMode: "watch",
-    draftCount: 4,
-    hasPrompt: false,
-    triggerRefreshCb: () => { reloadsA++; return [true, "safari_ext"]; },
-  });
-  assert.strictEqual(reloadsA, 1, "Reload must fire immediately on PLACE_BETS even with draftCount > 0");
-  assert(evPB.some((e) => e.event === "refreshing"));
+  console.log("20. Testing 1-frame crisp final dealer card commit & immediate keepalive reload...");
+  const sm20 = new Engine.CompanionStateMachine(cfg);
+  const mkC = (rank, val, conf = 0.92, suit = "S", x = 10) => ({ rank, val, conf, suit, x, y: 10, w: 12, h: 16, hand_index: 0 });
+  const p1 = mkC("10", 0, 0.94, "S", 20);
+  const p2 = mkC("9", 9, 0.94, "H", 40);
+  const d1 = mkC("7", 7, 0.94, "C", 10);
+  const d2 = mkC("10", 0, 0.89, "D", 35);
+  const d3 = mkC("5", 5, 0.88, null, 55);
 
-  // Trigger 2: Player strip disappears (no PLACE_BETS banner yet) -> fires immediately!
-  const kaB = new Engine.WatchKeepaliveManager(cfg);
-  let reloadsB = 0;
-  kaB._watchElapsedSec = 605;
-  kaB.step({ now: 705.0, windowFound: true, obs: { banner_state: "", player_cards: [{ rank: "A" }], dealer_cards: [{ rank: "9" }] }, smState: "DEALER_TURN", playMode: "watch", draftCount: 3, hasPrompt: false });
-  const evStripGone = kaB.step({
-    now: 705.2,
-    windowFound: true,
-    obs: { banner_state: "", player_cards: [], dealer_cards: [] },
-    smState: "DEALER_TURN",
-    playMode: "watch",
-    draftCount: 3,
-    hasPrompt: false,
-    triggerRefreshCb: () => { reloadsB++; return [true, "safari_ext"]; },
-  });
-  assert.strictEqual(reloadsB, 1, "Reload must fire immediately when player strip disappears");
-  assert(evStripGone.some((e) => e.event === "refreshing"));
+  let t = 80.0;
+  sm20.step({ ts: (t += 0.1), banner_state: "NO_MORE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  for (let i = 0; i < 3; i++) {
+    sm20.step({ ts: (t += 0.1), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d1], player_hands: { 0: [p1, p2] } });
+  }
+  const evD2 = sm20.step({ ts: (t += 0.08), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d1, d2], player_hands: { 0: [p1, p2] } });
+  assert(evD2.some((e) => e.type === "card" && e.target === "D" && e.rankLabel === "10"), "2nd dealer card must record on 1st crisp frame");
+  const evD3 = sm20.step({ ts: (t += 0.08), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d1, d2, d3], player_hands: { 0: [p1, p2] } });
+  assert(evD3.some((e) => e.type === "card" && e.target === "D" && e.rankLabel === "5"), "Last dealer card must record on 1st crisp frame before wipe");
+
+  // Keepalive reload triggers immediately on PLACE_BETS even with draftCount > 0
+  const ka20a = new Engine.WatchKeepaliveManager({ ...cfg, keepalive_interval_sec: 60 });
+  ka20a._watchElapsedSec = 62;
+  const kaEvPb = ka20a.step({ now: 162, windowFound: true, obs: { banner_state: "PLACE_BETS", place_bets_conf: 0.9, player_cards: [], dealer_cards: [] }, smState: "BETTING", playMode: "watch", draftCount: 4, hasPrompt: false, betRoundsCount: 0, triggerRefreshCb: () => [true, "safari_ext"] });
+  assert(kaEvPb.some((e) => e.event === "refreshing"), "Keepalive must trigger immediately on PLACE_BETS even with draftCount > 0");
+
+  // Keepalive reload also triggers immediately when player & dealer strips are wiped in ROUND_OVER
+  const ka20b = new Engine.WatchKeepaliveManager({ ...cfg, keepalive_interval_sec: 60 });
+  ka20b._watchElapsedSec = 62;
+  const kaEvWipe = ka20b.step({ now: 262, windowFound: true, obs: { banner_state: "", place_bets_conf: 0, player_cards: [], dealer_cards: [] }, smState: "ROUND_OVER", playMode: "watch", draftCount: 4, hasPrompt: false, betRoundsCount: 0, triggerRefreshCb: () => [true, "safari_ext"] });
+  assert(kaEvWipe.some((e) => e.event === "refreshing"), "Keepalive must trigger immediately when both strips are wiped in ROUND_OVER");
   console.log("   Test 20 PASSED");
 }
