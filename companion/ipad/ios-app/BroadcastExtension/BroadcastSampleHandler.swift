@@ -3,14 +3,211 @@ import CoreImage
 import CoreVideo
 import ImageIO
 import QuartzCore
+import Network
 import os
 
+/// App-Group-free loopback frame streamer (`127.0.0.1:8766`) used automatically when
+/// Sideloadly / a free Apple ID strips `com.apple.security.application-groups`.
+/// Enforces strict 1-frame-in-flight backpressure so `BroadcastExtension` stays well under
+/// iPadOS's 50 MB Jetsam memory cap.
+private final class LoopbackFrameSender {
+    private let logger = Logger(subsystem: "com.tgjgaming.blackjacktracker.BroadcastExtension", category: "LoopbackTx")
+    private let queue = DispatchQueue(label: "com.tgjgaming.blackjacktracker.loopbackFrameTx", qos: .userInitiated)
+    private let lock = NSLock()
+
+    private var connection: NWConnection?
+    private var ready = false
+    private var sending = false
+    private var sendStartNs: UInt64 = 0
+    private var lastAttemptNs: UInt64 = 0
+    private var sentStartedControl = false
+    private var loggedConnected = false
+
+    func prepareForFrameAndCheckCanRender() -> Bool {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        let isReady = ready
+        let isSending = sending
+        let elapsedSinceSend = nowNs >= sendStartNs ? (nowNs - sendStartNs) : 0
+        let shouldConnect = (connection == nil) && (lastAttemptNs == 0 || (nowNs - lastAttemptNs) > 350_000_000)
+        if shouldConnect {
+            lastAttemptNs = nowNs
+        }
+        lock.unlock()
+
+        if shouldConnect {
+            connectIfNeeded()
+        }
+        if !isReady {
+            return false
+        }
+        if isSending {
+            if elapsedSinceSend > 2_000_000_000 {
+                logger.notice("Loopback send stalled >2s; resetting connection")
+                resetConnection()
+            }
+            return false
+        }
+        return true
+    }
+
+    func connectIfNeeded() {
+        queue.async { [weak self] in
+            self?._connectOnQueue()
+        }
+    }
+
+    private func _connectOnQueue() {
+        lock.lock()
+        let existing = connection
+        if existing != nil {
+            lock.unlock()
+            return
+        }
+        lastAttemptNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+
+        guard let port = NWEndpoint.Port(rawValue: FrameIPCConstants.loopbackPort) else { return }
+        let tcpOpts = NWProtocolTCP.Options()
+        tcpOpts.noDelay = true
+        tcpOpts.connectionTimeout = 2
+        let params = NWParameters(tls: nil, tcp: tcpOpts)
+        params.preferNoProxies = true
+
+        let endpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: port)
+        let conn = NWConnection(to: endpoint, using: params)
+
+        lock.lock()
+        connection = conn
+        ready = false
+        sending = false
+        sentStartedControl = false
+        lock.unlock()
+
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let self = self, let conn = conn else { return }
+            self.lock.lock()
+            let isCurrent = (self.connection === conn)
+            if !isCurrent {
+                self.lock.unlock()
+                return
+            }
+            switch state {
+            case .ready:
+                self.ready = true
+                let needHello = !self.sentStartedControl
+                self.sentStartedControl = true
+                let firstLog = !self.loggedConnected
+                self.loggedConnected = true
+                self.lock.unlock()
+                if firstLog {
+                    self.logger.info("Connected loopback frame sender to 127.0.0.1:\(FrameIPCConstants.loopbackPort)")
+                }
+                if needHello {
+                    let ctrl = FrameIPCConstants.makeControlRecord(msgType: FrameIPCConstants.msgBroadcastStarted)
+                    conn.send(content: ctrl, completion: .idempotent)
+                }
+            case .failed(let err):
+                self.ready = false
+                self.sending = false
+                self.connection = nil
+                self.lock.unlock()
+                self.logger.error("Loopback frame connection failed: \(String(describing: err), privacy: .public)")
+                conn.cancel()
+            case .waiting(let err):
+                self.ready = false
+                self.sending = false
+                self.connection = nil
+                self.lock.unlock()
+                self.logger.notice("Loopback frame receiver not ready yet: \(String(describing: err), privacy: .public)")
+                conn.cancel()
+            case .cancelled:
+                self.ready = false
+                self.sending = false
+                self.connection = nil
+                self.lock.unlock()
+            default:
+                self.lock.unlock()
+            }
+        }
+        conn.start(queue: queue)
+    }
+
+    func sendFrameRecord(_ wireData: Data) {
+        lock.lock()
+        guard ready, !sending, let conn = connection else {
+            lock.unlock()
+            return
+        }
+        sending = true
+        sendStartNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+
+        queue.async { [weak self, weak conn] in
+            guard let self = self, let conn = conn else { return }
+            conn.send(content: wireData, completion: .contentProcessed { [weak self, weak conn] err in
+                guard let self = self, let conn = conn else { return }
+                self.lock.lock()
+                let isCurrent = (self.connection === conn)
+                if isCurrent {
+                    self.sending = false
+                    if err != nil {
+                        self.ready = false
+                        self.connection = nil
+                    }
+                }
+                self.lock.unlock()
+                if let err = err, isCurrent {
+                    self.logger.error("Loopback send error: \(String(describing: err), privacy: .public)")
+                    conn.cancel()
+                }
+            })
+        }
+    }
+
+    func sendControlIfReady(_ msgType: UInt32, waitSeconds: TimeInterval = 0) {
+        lock.lock()
+        guard ready, let conn = connection else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        let ctrl = FrameIPCConstants.makeControlRecord(msgType: msgType)
+        let sem = waitSeconds > 0 ? DispatchSemaphore(value: 0) : nil
+        queue.async {
+            conn.send(content: ctrl, completion: .contentProcessed { _ in
+                sem?.signal()
+            })
+        }
+        if let sem = sem {
+            _ = sem.wait(timeout: .now() + waitSeconds)
+        }
+    }
+
+    func resetConnection() {
+        lock.lock()
+        let old = connection
+        connection = nil
+        ready = false
+        sending = false
+        sentStartedControl = false
+        lock.unlock()
+        if let old = old {
+            queue.async {
+                old.cancel()
+            }
+        }
+    }
+}
+
 /// Lightweight ReplayKit Broadcast Upload Extension (`RPBroadcastSampleHandler`).
-/// Strictly engineered to stay under 12 MB RAM (well below iPadOS's 50 MB extension limit):
+/// Strictly engineered to stay well below iPadOS's 50 MB extension limit:
 /// - Throttles capture to 12 FPS
 /// - Applies `RPVideoSampleOrientationKey` and normalizes extent origin before scaling
 /// - Downscales incoming `CMSampleBuffer` to <= 1280x960 using hardware CIContext
-/// - Writes RGBA bytes directly into the memory-mapped App Group `SharedFrameRing`
+/// - Writes RGBA bytes directly into `SharedFrameRing` (when App Group exists) OR
+///   streams directly over loopback TCP (`127.0.0.1:8766`) when App Group is stripped
 final class BroadcastSampleHandler: RPBroadcastSampleHandler {
     private let logger = Logger(subsystem: "com.tgjgaming.blackjacktracker.BroadcastExtension", category: "Broadcast")
     private let ciContext = CIContext(options: [
@@ -20,22 +217,27 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
     private let srgbColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     private var ring: SharedFrameRing?
+    private var attemptedRingInit = false
+    private let loopbackSender = LoopbackFrameSender()
     private var seq: UInt32 = 0
     private var frameCount: UInt64 = 0
     private var lastFrameTs: CFTimeInterval = 0
     private let minFrameInterval: CFTimeInterval = 1.0 / 12.0
     private var loggedFirstFrame = false
-    private var rgbaScratch = [UInt8](repeating: 0, count: SharedFrameRing.maxWidth * SharedFrameRing.maxHeight * 4)
+    private var frameBuffer = [UInt8](repeating: 0, count: FrameIPCConstants.tcpHeaderBytes + SharedFrameRing.capacityBytes)
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         logger.info("Broadcast started")
+        attemptedRingInit = true
         ring = SharedFrameRing(isWriter: true)
         if let ring = ring {
             logger.info("Broadcast SharedFrameRing writer ready: \(ring.storageDescription, privacy: .public)")
         } else {
-            logger.error("Failed to open SharedFrameRing writer on broadcast start")
+            logger.info("App Group unavailable; starting LoopbackFrameSender (127.0.0.1:\(FrameIPCConstants.loopbackPort))")
+            loopbackSender.connectIfNeeded()
         }
-        seq = 0
+        let seed = UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds)
+        seq = (seed == 0) ? 1 : seed
         frameCount = 0
         lastFrameTs = 0
         loggedFirstFrame = false
@@ -47,24 +249,38 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastResumed() {
         logger.info("Broadcast resumed")
+        if ring == nil {
+            loopbackSender.sendControlIfReady(FrameIPCConstants.msgBroadcastStarted)
+        }
     }
 
     override func broadcastFinished() {
         logger.info("Broadcast finished after \(self.frameCount) rendered frame(s)")
+        if ring == nil {
+            loopbackSender.sendControlIfReady(FrameIPCConstants.msgBroadcastFinished, waitSeconds: 0.15)
+            loopbackSender.resetConnection()
+        } else {
+            ring?.clear()
+        }
         ring = nil
+        attemptedRingInit = false
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
         guard sampleBufferType == .video else { return }
         let now = CACurrentMediaTime()
         if now - lastFrameTs < minFrameInterval { return }
+
+        if !attemptedRingInit {
+            attemptedRingInit = true
+            ring = SharedFrameRing(isWriter: true)
+        }
+        if ring == nil && !loopbackSender.prepareForFrameAndCheckCanRender() {
+            return
+        }
         lastFrameTs = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        if ring == nil {
-            ring = SharedFrameRing(isWriter: true)
-        }
-        guard let ring = ring else { return }
 
         autoreleasepool {
             var ciImage = CIImage(cvPixelBuffer: pixelBuffer)
@@ -114,14 +330,21 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
             }
 
             let rowBytes = dstW * 4
+            let rgbaCount = rowBytes * dstH
+            let packetBytes = SharedFrameRing.headerBytes + rgbaCount
+            let totalRecordBytes = FrameIPCConstants.tcpHeaderBytes + packetBytes
+            guard totalRecordBytes <= frameBuffer.count else { return }
             let bounds = CGRect(x: 0, y: 0, width: dstW, height: dstH)
+            let pixelOffset = FrameIPCConstants.tcpHeaderBytes + SharedFrameRing.headerBytes
 
-            rgbaScratch.withUnsafeMutableBytes { rawPtr in
+            var loopbackRecordData: Data?
+            frameBuffer.withUnsafeMutableBytes { rawPtr in
                 guard let baseAddress = rawPtr.baseAddress else { return }
+                let pixelPtr = baseAddress.advanced(by: pixelOffset)
                 // CIContext.render(_:toBitmap:rowBytes:bounds:format:colorSpace:) writes top-down row order
                 ciContext.render(
                     ciImage,
-                    toBitmap: baseAddress,
+                    toBitmap: pixelPtr,
                     rowBytes: rowBytes,
                     bounds: bounds,
                     format: .RGBA8,
@@ -129,18 +352,36 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
                 )
                 seq &+= 1
                 if seq == 0 { seq = 1 }
-                ring.writeRGBAFrame(
-                    width: dstW,
-                    height: dstH,
-                    rgbaSource: baseAddress,
-                    bytesPerRow: rowBytes,
-                    seq: seq
-                )
+
+                if let ring = ring {
+                    ring.writeRGBAFrame(
+                        width: dstW,
+                        height: dstH,
+                        rgbaSource: pixelPtr,
+                        bytesPerRow: rowBytes,
+                        seq: seq
+                    )
+                } else {
+                    FrameIPCConstants.writeUInt32LE(FrameIPCConstants.recordMagic, to: baseAddress, offset: 0)
+                    FrameIPCConstants.writeUInt32LE(FrameIPCConstants.msgFrame, to: baseAddress, offset: 4)
+                    FrameIPCConstants.writeUInt32LE(UInt32(packetBytes), to: baseAddress, offset: 8)
+                    FrameIPCConstants.writeUInt32LE(seq, to: baseAddress, offset: 12)
+                    FrameIPCConstants.writeUInt32LE(UInt32(dstW), to: baseAddress, offset: 16)
+                    FrameIPCConstants.writeUInt32LE(UInt32(dstH), to: baseAddress, offset: 20)
+                    FrameIPCConstants.writeUInt32LE(4, to: baseAddress, offset: 24)
+                    loopbackRecordData = Data(bytes: baseAddress, count: totalRecordBytes)
+                }
+
                 frameCount &+= 1
                 if !loggedFirstFrame {
                     loggedFirstFrame = true
-                    logger.info("Rendered first broadcast frame \(dstW)x\(dstH) (rawOrientation=\(orientation.rawValue))")
+                    let mode = (ring != nil) ? "appGroup" : "loopback"
+                    logger.info("Rendered first broadcast frame \(dstW)x\(dstH) via \(mode, privacy: .public) (rawOrientation=\(orientation.rawValue))")
                 }
+            }
+
+            if let recordData = loopbackRecordData {
+                loopbackSender.sendFrameRecord(recordData)
             }
         }
     }

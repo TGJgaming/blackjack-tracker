@@ -234,5 +234,137 @@ rt.handleClientMessage(
 assert(calibSnap && calibSnap.type === "calib_snapshot", "calib_grab should succeed after ingestRGBA");
 assert(calibSnap.width <= 732, `Isolated split pane width ${calibSnap.width} should stay left of divider`);
 
-console.log("   All iPad JS CV & State Machine parity checks PASSED!");
+console.log("6. Testing zero-arg IpadCompanionRuntime & corrupt localStorage guard...");
+const memStore = new Map();
+global.localStorage = {
+  getItem: (k) => (memStore.has(k) ? memStore.get(k) : null),
+  setItem: (k, v) => memStore.set(k, String(v)),
+  removeItem: (k) => memStore.delete(k),
+};
+memStore.set("bjPlaytechTracker.ipadCompanionPack.v1", JSON.stringify({ templates: {} }));
+const zeroArgRt = new Engine.IpadCompanionRuntime();
+const zeroCounts = zeroArgRt.detector.listTemplateCounts();
+const zeroTotal = Object.values(zeroCounts).reduce((a, b) => a + Object.values(b).reduce((x, y) => x + y, 0), 0);
+assert(zeroTotal >= 70, `Zero-arg runtime must reject empty saved pack and load PRELOADED_PACK (got ${zeroTotal})`);
+
+console.log("7. Testing keepalive set_config, hostInfo, extConnected & native loopback polling...");
+(async () => {
+  const readyMsgs = [];
+  global.window = {
+    location: { protocol: "bjtracker:" },
+    webkit: {
+      messageHandlers: {
+        ipadCompanion: { postMessage: (m) => readyMsgs.push(m) },
+      },
+    },
+  };
+
+  let mockPollMode = "idle";
+  let mockSeq = 42;
+  const requestedUrls = [];
+  global.XMLHttpRequest = class MockXHR {
+    open(method, url) {
+      this._url = url;
+      requestedUrls.push(url);
+      this._headers = {};
+    }
+    send() {
+      if (mockPollMode === "idle") {
+        this.status = 204;
+        this._headers = {
+          "X-BJ-Transport": "idle",
+          "X-BJ-Broadcast-Active": "0",
+          "X-BJ-AppGroup-Ok": "0",
+          "X-BJ-BroadcastExt-Present": "1",
+        };
+      } else if (mockPollMode === "waiting") {
+        this.status = 204;
+        this._headers = {
+          "X-BJ-Transport": "loopback_waiting",
+          "X-BJ-Broadcast-Active": "1",
+          "X-BJ-AppGroup-Ok": "0",
+          "X-BJ-BroadcastExt-Present": "1",
+        };
+      } else if (mockPollMode === "frame") {
+        const w = 120, h = 90;
+        const ab = new ArrayBuffer(16 + w * h * 4);
+        const hdr = new Uint32Array(ab, 0, 4);
+        hdr[0] = mockSeq;
+        hdr[1] = w;
+        hdr[2] = h;
+        hdr[3] = 4;
+        this.status = 200;
+        this.response = ab;
+        this._headers = {
+          "X-BJ-Transport": "loopback",
+          "X-BJ-Broadcast-Active": "1",
+          "X-BJ-AppGroup-Ok": "0",
+          "X-BJ-BroadcastExt-Present": "1",
+        };
+      }
+      if (this.onload) this.onload();
+    }
+    getResponseHeader(name) {
+      return this._headers[name] || null;
+    }
+  };
+
+  const pollRt = new Engine.IpadCompanionRuntime({ initialPack: pack });
+  const received = [];
+  const sock = new Engine.IpadCompanionSocket(pollRt);
+  sock.onmessage = ({ data }) => received.push(JSON.parse(data));
+  await new Promise((r) => setTimeout(r, 35));
+  assert.strictEqual(sock.readyState, 1, "IpadCompanionSocket should open automatically");
+  assert(readyMsgs.some((m) => m.action === "companionReady"), "startNativePolling must notify native companionReady");
+  assert(received.some((m) => m.type === "status" && m.ipadMode === true), "Initial status message must arrive on open");
+
+  // Update keepalive config via nested UI format ("set_config")
+  sock.send(JSON.stringify({
+    type: "keepalive_action",
+    action: "set_config",
+    keepalive: {
+      enabled: true,
+      mode: "alert_only",
+      method: "ext_reload",
+      min_watch_sec: 180,
+      max_watch_sec: 240,
+      reset_on_bet_round: false,
+    },
+  }));
+  const kaStatus = pollRt.keepalive.getStatus(10.0);
+  assert.strictEqual(kaStatus.mode, "alert_only");
+  assert.strictEqual(kaStatus.targetSec, 240);
+  assert.strictEqual(kaStatus.resetOnBetRound, false);
+
+  // Trigger host info + extension hooks
+  globalThis.__ipadCompanionSetHostInfo({ appGroupAvailable: false, broadcastExtPresent: true, loopbackPort: 8766 });
+  globalThis.__ipadCompanionSetExtConnected(true);
+  assert.strictEqual(pollRt.extConnected, true);
+  assert.strictEqual(pollRt.hostInfo.loopbackPort, 8766);
+
+  // Test loopback_waiting -> frame (200) -> ?since=42 -> idle reset
+  mockPollMode = "waiting";
+  await new Promise((r) => setTimeout(r, 140));
+  assert.strictEqual(pollRt.broadcastActive, true, "loopback_waiting should keep broadcastActive true");
+  assert.strictEqual(pollRt.frameTransport, "loopback_waiting");
+
+  mockPollMode = "frame";
+  await new Promise((r) => setTimeout(r, 140));
+  assert(pollRt.latestRawFrame && pollRt.latestRawFrame.w === 120, "Native poll should ingest 200 RGBA frame");
+  assert.strictEqual(pollRt._lastFrameSeq, 42);
+  await new Promise((r) => setTimeout(r, 140));
+  assert(requestedUrls.some((u) => u.endsWith("?since=42")), "Subsequent polls must pass ?since=42 to skip duplicate buffers");
+
+  mockPollMode = "idle";
+  await new Promise((r) => setTimeout(r, 140));
+  assert.strictEqual(pollRt.broadcastActive, false, "Returning to idle must clear broadcastActive");
+  assert.strictEqual(pollRt._lastFrameSeq, 0, "Returning to idle must reset _lastFrameSeq");
+
+  sock.close();
+  console.log("   All iPad JS CV, Socket, Loopback Polling & State Machine checks PASSED!");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
 

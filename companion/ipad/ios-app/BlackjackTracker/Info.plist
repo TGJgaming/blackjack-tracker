@@ -23,7 +23,7 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Runs a loopback WebSocket relay on 127.0.0.1 so the optional Safari Keep-Alive extension can refresh Playtech tabs during breaks.</string>
+	<string>Uses loopback 127.0.0.1 to stream live ReplayKit screen frames from the Broadcast extension and relay optional Safari Keep-Alive reloads.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

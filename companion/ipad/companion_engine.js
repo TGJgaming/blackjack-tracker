@@ -1937,7 +1937,7 @@
 
     getStatus(now = performance.now() / 1000) {
       const enabled = this.cfg.keepalive_enabled !== false && this.cfg.keepalive_mode !== "off";
-      const target = Math.max(60, Number(this.cfg.keepalive_interval_sec) || 600);
+      const target = Math.max(30, Number(this.cfg.keepalive_interval_sec) || 600);
       const elapsed = Math.round(this._watchElapsedSec * 10) / 10;
       const rem = Math.max(0, Math.round(target - this._watchElapsedSec));
       return {
@@ -1983,16 +1983,40 @@
       };
     }
 
-    updateConfig(patch, now = performance.now() / 1000) {
+    updateConfig(rawPatch, now = performance.now() / 1000) {
+      const patch = rawPatch && rawPatch.keepalive && typeof rawPatch.keepalive === "object"
+        ? rawPatch.keepalive
+        : (rawPatch || {});
       if (patch.enabled !== undefined) this.cfg.keepalive_enabled = !!patch.enabled;
       if (patch.mode && ["auto", "alert_only", "off"].includes(patch.mode)) {
         this.cfg.keepalive_mode = patch.mode;
       }
-      if (patch.intervalSec !== undefined) {
-        this.cfg.keepalive_interval_sec = Math.max(120, Math.min(840, Number(patch.intervalSec) || 600));
+      if (patch.method && typeof patch.method === "string") {
+        this.cfg.keepalive_method = patch.method;
+      }
+      const nextInterval =
+        patch.intervalSec !== undefined
+          ? Number(patch.intervalSec)
+          : patch.max_watch_sec !== undefined
+          ? Number(patch.max_watch_sec)
+          : patch.min_watch_sec !== undefined
+          ? Number(patch.min_watch_sec)
+          : undefined;
+      if (nextInterval !== undefined && Number.isFinite(nextInterval)) {
+        this.cfg.keepalive_interval_sec = Math.max(30, Math.min(888, nextInterval));
+      }
+      if (this.cfg.keepalive && typeof this.cfg.keepalive === "object") {
+        if (patch.min_watch_sec !== undefined && Number.isFinite(Number(patch.min_watch_sec))) {
+          this.cfg.keepalive.min_watch_sec = Math.max(30, Math.min(888, Number(patch.min_watch_sec)));
+        }
+        if (patch.max_watch_sec !== undefined && Number.isFinite(Number(patch.max_watch_sec))) {
+          this.cfg.keepalive.max_watch_sec = Math.max(30, Math.min(888, Number(patch.max_watch_sec)));
+        }
       }
       if (patch.resetOnBetRound !== undefined) {
         this.cfg.keepalive_reset_on_bet_round = !!patch.resetOnBetRound;
+      } else if (patch.reset_on_bet_round !== undefined) {
+        this.cfg.keepalive_reset_on_bet_round = !!patch.reset_on_bet_round;
       }
       if (this.cfg.keepalive_enabled === false || this.cfg.keepalive_mode === "off") {
         this.state = "OFF";
@@ -2240,6 +2264,7 @@
       const initialPack =
         options.initialPack ||
         this._loadSavedPack() ||
+        PRELOADED_PACK ||
         (typeof globalThis.DEFAULT_COMPANION_PACK === "object" ? globalThis.DEFAULT_COMPANION_PACK : null);
 
       this.cfg = defaultConfig(initialPack && initialPack.config ? initialPack.config : {});
@@ -2256,6 +2281,10 @@
       this.latestFrameTs = 0;
       this._lastFrameSeq = 0;
       this.broadcastActive = false;
+      this.frameTransport = "idle";
+      this.hostInfo = null;
+      this._sawNativeBroadcast = false;
+      this._didNotifyNativeReady = false;
       this.extConnected = false;
       this._loopTimer = null;
       this._busy = false;
@@ -2267,6 +2296,12 @@
         globalThis.__ipadCompanionSetExtConnected = (connected) => {
           this.extConnected = !!connected;
           this.broadcast(this.buildStatusPayload());
+        };
+        globalThis.__ipadCompanionSetHostInfo = (info) => {
+          if (info && typeof info === "object") {
+            this.hostInfo = Object.assign({}, this.hostInfo || {}, info);
+            this.broadcast(this.buildStatusPayload());
+          }
         };
       }
     }
@@ -2280,7 +2315,14 @@
         window.webkit.messageHandlers.ipadCompanion;
       if (!isNativeHost) return;
 
-      const frameUrl =
+      if (!this._didNotifyNativeReady) {
+        this._didNotifyNativeReady = true;
+        try {
+          window.webkit.messageHandlers.ipadCompanion.postMessage({ action: "companionReady" });
+        } catch (_) {}
+      }
+
+      const frameUrlBase =
         typeof window !== "undefined" &&
         window.location &&
         window.location.protocol === "bjtracker:"
@@ -2292,7 +2334,8 @@
         if (this._busy || this.clients.size === 0) return;
         this._busy = true;
         const xhr = new XMLHttpRequest();
-        xhr.open("GET", frameUrl, true);
+        const pollUrl = this._lastFrameSeq ? `${frameUrlBase}?since=${this._lastFrameSeq}` : frameUrlBase;
+        xhr.open("GET", pollUrl, true);
         xhr.responseType = "arraybuffer";
         xhr.timeout = 1000;
         const done = () => {
@@ -2300,6 +2343,31 @@
         };
         xhr.onload = () => {
           try {
+            const now = performance.now() / 1000;
+            const hdrTransport = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-Transport")) || "";
+            const hdrActive = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-Broadcast-Active")) || "";
+            const hdrAppGroupOk = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-AppGroup-Ok")) || "";
+            const hdrExtPresent = (xhr.getResponseHeader && xhr.getResponseHeader("X-BJ-BroadcastExt-Present")) || "";
+
+            let statusDirty = false;
+            if (hdrAppGroupOk || hdrExtPresent) {
+              const prevInfo = this.hostInfo || {};
+              const nextAppGroup = hdrAppGroupOk ? hdrAppGroupOk === "1" : !!prevInfo.appGroupAvailable;
+              const nextExtPres = hdrExtPresent ? hdrExtPresent === "1" : !!prevInfo.broadcastExtPresent;
+              if (prevInfo.appGroupAvailable !== nextAppGroup || prevInfo.broadcastExtPresent !== nextExtPres) {
+                this.hostInfo = Object.assign({}, prevInfo, {
+                  appGroupAvailable: nextAppGroup,
+                  broadcastExtPresent: nextExtPres,
+                });
+                statusDirty = true;
+              }
+            }
+            if (hdrTransport && hdrTransport !== this.frameTransport) {
+              this.frameTransport = hdrTransport;
+              statusDirty = true;
+            }
+
+            let decodedNewFrame = false;
             if (xhr.status === 200 && xhr.response instanceof ArrayBuffer) {
               const buf = xhr.response;
               if (buf.byteLength > 16) {
@@ -2312,14 +2380,45 @@
                   const neededBytes = w * h * channels;
                   if (buf.byteLength >= 16 + neededBytes) {
                     this._lastFrameSeq = seq;
+                    this._sawNativeBroadcast = true;
+                    decodedNewFrame = true;
                     const pixels = new Uint8Array(buf, 16, neededBytes);
                     if (channels === 4) {
-                      this.ingestRGBA(pixels, w, h);
+                      this.ingestRGBA(pixels, w, h, now);
                     } else if (channels === 3) {
-                      this.ingestFrameBgr({ w, h, c: 3, data: pixels });
+                      this.ingestFrameBgr({ w, h, c: 3, data: pixels }, now);
                     }
                   }
                 }
+              }
+            }
+
+            if (!decodedNewFrame) {
+              const frameFresh = this.latestRawFrame !== null && (now - this.latestFrameTs) < 4.5;
+              if (hdrTransport === "loopback_waiting" || (hdrTransport === "loopback" && hdrActive === "1")) {
+                this._sawNativeBroadcast = true;
+                if (!this.broadcastActive) {
+                  this.broadcastActive = true;
+                  statusDirty = true;
+                }
+              } else if (hdrActive === "0" && hdrTransport === "idle") {
+                if (this._sawNativeBroadcast) {
+                  this._sawNativeBroadcast = false;
+                  this._lastFrameSeq = 0;
+                  this.latestFrameTs = 0;
+                  statusDirty = true;
+                }
+                if (this.broadcastActive) {
+                  this.broadcastActive = false;
+                  statusDirty = true;
+                }
+              } else if (this.broadcastActive && !frameFresh && hdrTransport === "appgroup") {
+                this.broadcastActive = false;
+                statusDirty = true;
+              }
+
+              if (statusDirty) {
+                this.broadcast(this.buildStatusPayload(now));
               }
             }
           } catch (_) {
@@ -2350,7 +2449,12 @@
       try {
         if (typeof localStorage === "undefined") return null;
         const raw = localStorage.getItem(STORAGE_PACK_KEY);
-        return raw ? JSON.parse(raw) : null;
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || !parsed.templates || typeof parsed.templates !== "object" || Object.keys(parsed.templates).length === 0) {
+          return null;
+        }
+        return parsed;
       } catch (e) {
         return null;
       }
@@ -2386,6 +2490,8 @@
         extConnected: this.extConnected,
         ipadMode: true,
         broadcastActive: this.broadcastActive,
+        transport: this.frameTransport,
+        hostInfo: this.hostInfo,
         keepalive: this.keepalive.getStatus(now),
       };
     }
@@ -2489,7 +2595,7 @@
         let kaEvt = null;
         if (kaAction === "reset") kaEvt = this.keepalive.resetTimer(performance.now() / 1000, "ui_button");
         else if (kaAction === "refresh_now" || kaAction === "arm") kaEvt = this.keepalive.armNow();
-        else if (kaAction === "configure") kaEvt = this.keepalive.updateConfig(msg);
+        else if (kaAction === "configure" || kaAction === "set_config") kaEvt = this.keepalive.updateConfig(msg);
         if (kaEvt) this.broadcast(kaEvt);
         this.broadcast(this.buildStatusPayload());
         return;

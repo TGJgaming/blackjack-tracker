@@ -12,9 +12,9 @@
     --radius:14px;
   }
   *{box-sizing:border-box}
-  html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-text-size-adjust:100%;text-size-adjust:100%;overflow-x:clip}
   header{position:sticky;top:0;z-index:10;background:rgba(15,17,21,.95);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
-  .wrap{max-width:1240px;margin:0 auto;padding:12px}
+  .wrap{max-width:1240px;margin:0 auto;padding:12px max(12px,env(safe-area-inset-right,12px)) 12px max(12px,env(safe-area-inset-left,12px))}
 
   /* Universal 2-column split layout with sticky right dock */
   .split-layout{display:flex;flex-direction:column;gap:12px}
@@ -27,18 +27,27 @@
   @media(min-width:860px){
     .split-layout{display:grid;grid-template-columns:minmax(0,1.20fr) minmax(380px,1.0fr);gap:16px;align-items:start}
     .split-layout.no-dock,.split-layout.all-dock{grid-template-columns:minmax(0,900px);justify-content:center}
-    .dock-col{position:sticky;top:66px;z-index:4;max-height:calc(100vh - 80px);overflow-y:auto;padding-right:4px}
+    .dock-col{position:sticky;top:calc(var(--hdr-h, 110px) + 8px);z-index:4;max-height:calc(100dvh - var(--hdr-h, 110px) - 20px);overflow-y:auto;padding-right:4px}
     .split-layout.all-dock .dock-col{position:static;max-height:none;overflow:visible;padding-right:0}
-    .dock-col .grid.g4{grid-template-columns:repeat(2,1fr)}
+    .dock-col .grid.g4,.dock-col .grid.g3{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .dock-col .grid.g5{grid-template-columns:repeat(auto-fit,minmax(74px,1fr))}
+    .dock-col .tray3{grid-template-columns:1fr}
+    .dock-col .sidebet-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .dock-col table th,.dock-col table td{padding:5px 4px;font-size:12px}
     .dock-col::-webkit-scrollbar{width:5px}
     .dock-col::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
   }
 
+  @media(min-width:860px) and (max-width:1100px){
+    .main-col .grid.g4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  }
+
   @media(max-width:859px){
-    .dock-col{order:-1;position:sticky;top:58px;z-index:6;max-height:48vh;overflow-y:auto;background:rgba(15,17,21,.96);padding:8px;border-radius:14px;border:1px solid #33415c;box-shadow:0 10px 28px rgba(0,0,0,.68)}
+    .dock-col{order:-1;position:sticky;top:calc(var(--hdr-h, 140px) + 6px);z-index:6;max-height:min(44dvh,calc(100dvh - var(--hdr-h, 140px) - 16px));overflow-y:auto;background:rgba(15,17,21,.96);padding:8px;border-radius:14px;border:1px solid #33415c;box-shadow:0 10px 28px rgba(0,0,0,.68)}
     .dock-col.mob-min{max-height:none;overflow:visible;padding:6px 10px}
     .dock-col.mob-min .mod-card{display:none}
     .dock-mob-bar{display:flex;align-items:center;gap:8px;font-size:12px;color:#93c5fd;font-weight:600}
+    .dock-col .grid.g5{grid-template-columns:repeat(auto-fit,minmax(74px,1fr))}
   }
 
   h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.2px}
@@ -56,7 +65,7 @@
   @media(max-width:680px){.g2{grid-template-columns:1fr}}
   @media(max-width:560px){.g4,.g3,.g5{grid-template-columns:repeat(2,minmax(0,1fr))}}
   .stat{background:var(--panel2);border-radius:12px;padding:10px;min-width:0}
-  .stat .k{font-size:12px;color:var(--muted)} .stat .v{font-size:20px;font-weight:700}
+  .stat .k{font-size:12px;color:var(--muted)} .stat .v{font-size:clamp(16px,2.2vw,20px);font-weight:700;overflow-wrap:anywhere}
   .big{font-size:30px!important}
   .pos{color:var(--green)} .neg{color:var(--red)} .warn{color:var(--amber)} .mut{color:var(--muted)} .purp{color:#c084fc} .cyan{color:#22d3ee}
   button,.btn{font:inherit}
@@ -83,7 +92,7 @@
   /* Numpad */
   .numpad{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;margin-top:8px}
   .numpad button{min-width:0;padding:11px 3px;border-radius:11px;border:1px solid var(--line);background:var(--panel);color:var(--text);font-weight:700;font-size:15px;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.15;transition:transform .06s,background .08s,border-color .08s}
-  .numpad button .sub{font-size:10px;color:var(--muted);font-weight:600;margin-top:2px;white-space:normal;overflow-wrap:anywhere;line-height:1.1}
+  .numpad button .sub{font-size:10px;color:var(--muted);font-weight:600;margin-top:2px;white-space:normal;overflow-wrap:anywhere;text-align:center;max-width:100%;line-height:1.1}
   .numpad button:active,.numpad button.kflash{background:#2d3a54;border-color:var(--blue);transform:scale(.96)}
   .numpad button:disabled{opacity:.35;cursor:not-allowed;transform:none}
   .numpad button.low{border-color:#14532d;background:#0d2318;color:#bbf7d0}
@@ -94,8 +103,8 @@
 
   /* Card Trays */
   .tray3{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,0.85fr) minmax(0,1.2fr);gap:8px;margin-top:8px}
-  @media(max-width:640px){.tray3{grid-template-columns:1fr}}
-  .handbox{background:var(--panel);border:2px solid var(--line);border-radius:11px;padding:8px 10px;min-height:68px;cursor:pointer;transition:border-color .12s,box-shadow .12s}
+  @media(max-width:960px){.tray3{grid-template-columns:1fr}}
+  .handbox{background:var(--panel);border:2px solid var(--line);border-radius:11px;padding:8px 10px;min-height:68px;min-width:0;cursor:pointer;transition:border-color .12s,box-shadow .12s}
   .handbox.activeP{border-color:var(--blue);box-shadow:0 0 0 2px rgba(59,130,246,.3)}
   .handbox.activeD{border-color:var(--amber);box-shadow:0 0 0 2px rgba(245,158,11,.3)}
   .handbox.activeB{border-color:var(--purple);box-shadow:0 0 0 2px rgba(168,85,247,.3)}
@@ -149,7 +158,7 @@
   .field span{font-size:12px;color:var(--muted)}
   .tbl-wrap{width:100%;overflow-x:auto}
   .strat-grid{display:grid;gap:12px;grid-template-columns:repeat(3,minmax(0,1fr))}
-  @media(max-width:1000px){.strat-grid{grid-template-columns:1fr}}
+  @media(max-width:1120px){.strat-grid{grid-template-columns:1fr}}
 
   .bar{position:relative;height:14px;border-radius:9px;background:linear-gradient(90deg,#3a1515 0%,#2a2f3a 42%,#0f3822 72%,#16a34a 100%);overflow:visible;margin:8px 0 18px}
   .bar .mk{position:absolute;top:-4px;width:4px;height:22px;border-radius:2px;background:#fff;transform:translateX(-2px)}
@@ -159,14 +168,15 @@
   .meter{height:10px;border-radius:6px;background:#12151c;border:1px solid var(--line);overflow:hidden;position:relative}
   .meter > i{display:block;height:100%;border-radius:5px;transition:width .2s}
   .meter .cutmk{position:absolute;top:0;bottom:0;width:2px;background:#f59e0b}
-  .alert-toast{position:fixed;bottom:18px;right:18px;z-index:9999;min-width:260px;max-width:390px;padding:11px 14px;border-radius:12px;background:#0f172a;border:1px solid #334155;box-shadow:0 16px 40px rgba(0,0,0,.78);color:#f8fafc;display:none;animation:bjSlideIn .18s ease-out}
+  .alert-toast{position:fixed;bottom:calc(18px + env(safe-area-inset-bottom,0px));right:max(18px,env(safe-area-inset-right,18px));z-index:9999;min-width:240px;max-width:min(390px,calc(100vw - 24px));padding:11px 14px;border-radius:12px;background:#0f172a;border:1px solid #334155;box-shadow:0 16px 40px rgba(0,0,0,.78);color:#f8fafc;display:none;animation:bjSlideIn .18s ease-out}
+  @media(max-width:440px){.alert-toast{left:max(12px,env(safe-area-inset-left,12px));right:max(12px,env(safe-area-inset-right,12px));min-width:0;max-width:none}}
   .alert-toast.show{display:block}
   .alert-toast.tier-high{border-color:#22c55e;background:#062312}
   .alert-toast.tier-med{border-color:#f59e0b;background:#261a05}
   .alert-toast.tier-crit{border-color:#ef4444;background:#2e0c0f}
   .sidebet-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-top:6px}
   @media(max-width:600px){.sidebet-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-  .sb-chip{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:5px 8px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);font-size:11px;cursor:pointer}
+  .sb-chip{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:5px 8px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);font-size:11px;cursor:pointer;min-width:0}
   .sb-chip.on{border-color:var(--green);background:#0f281a;color:#bbf7d0}
   .sb-chip.hit{border-color:var(--amber);background:#2d200a;color:#fde68a}
   .csuit{font-size:12px;margin-left:1px}
@@ -197,7 +207,7 @@
   th,td{padding:7px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
   th{color:var(--muted);font-weight:600}
   td.r,th.r{text-align:right}
-  .pill{display:inline-block;font-size:11px;padding:2px 7px;border-radius:999px;background:#2a2f3a;color:var(--muted);margin:1px}
+  .pill{display:inline-block;font-size:11px;padding:2px 7px;border-radius:999px;background:#2a2f3a;color:var(--muted);margin:1px;max-width:100%;overflow-wrap:anywhere}
   .pill.red{background:#3a1a1a;color:#fca5a5} .pill.green{background:#14301f;color:#86efac}
   .pill.amber{background:#3a2c10;color:#fcd34d} .pill.blue{background:#172b4d;color:#93c5fd} .pill.purple{background:#2e144f;color:#d8b4fe}
   .alert{border-radius:12px;padding:10px 12px;margin:8px 0;border:1px solid}
@@ -209,17 +219,17 @@
   .sp{flex:1}
   .small{font-size:12px}
   .hide{display:none!important}
-  footer{color:var(--muted);font-size:12px;text-align:center;padding:24px 12px 40px}
+  footer{color:var(--muted);font-size:12px;text-align:center;padding:24px 12px calc(40px + env(safe-area-inset-bottom,0px))}
 
   /* Built-in Fit-to-Screen Companion Calibrator Modal */
-  .calib-backdrop{position:fixed;inset:0;background:rgba(6,8,13,.88);z-index:999;display:flex;align-items:center;justify-content:center;padding:12px}
+  .calib-backdrop{position:fixed;inset:0;background:rgba(6,8,13,.88);z-index:999;display:flex;align-items:center;justify-content:center;padding:12px max(12px,env(safe-area-inset-right,12px)) calc(12px + env(safe-area-inset-bottom,0px)) max(12px,env(safe-area-inset-left,12px))}
   .calib-modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;width:100%;max-width:960px;max-height:94vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.6)}
   .calib-canvas-wrap{position:relative;width:100%;background:#05070b;border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-top:8px}
   .calib-canvas-wrap canvas{width:100%;height:auto;display:block;cursor:crosshair;touch-action:none}
   .calib-side{display:grid;grid-template-columns:minmax(0,1fr) 230px;gap:12px;align-items:start}
-  @media(max-width:740px){.calib-side{grid-template-columns:1fr}}
+  @media(max-width:740px){.calib-side{grid-template-columns:minmax(0,1fr)}}
   .calib-ranks{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-top:8px}
-  .calib-ranks button{padding:6px 4px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:12px;font-weight:700;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+  .calib-ranks button{min-width:0;padding:6px 4px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:11px;font-weight:700;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:2px;flex-wrap:wrap}
   .calib-ranks button.has{border-color:#22c55e;background:#0e2819;color:#bbf7d0}
   .calib-ranks button .cnt{font-size:10px;opacity:.8}
   .calib-loupe{border:1px solid var(--line);border-radius:8px;background:#090b10;image-rendering:pixelated;width:140px;height:140px;display:block}
@@ -227,12 +237,16 @@
   .card,.mod-card,.row,.grid>*,.split-layout>*{min-width:0}
   .btn,button{white-space:normal;overflow-wrap:anywhere;max-width:100%}
   .card *,.mod-card *{overflow-wrap:anywhere}
+  code{overflow-wrap:anywhere}
+  .ctrl-sel-grid select{width:100%;min-width:0}
   .row{flex-wrap:wrap}
   .tbl-wrap,table{max-width:100%}
-  .tbl-wrap{overflow-x:auto}
+  .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .tbl-wrap table *,.tbl-wrap th,.tbl-wrap td{overflow-wrap:normal;word-break:normal}
+  .tbl-wrap .pill{white-space:nowrap}
   .modal,.modal *{max-width:100%}
-  @media (max-width:900px){ .dock-col .grid.g5{grid-template-columns:repeat(3,minmax(0,1fr))} }
-  @media (max-width:700px){ nav{flex-wrap:wrap} nav button{font-size:12px;padding:6px 6px} .grid.g4,.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))} h1{font-size:18px} }
+  @media (max-width:700px){ nav{flex-wrap:wrap} nav button{font-size:12px;padding:6px 8px} .grid.g4,.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))} h1{font-size:16px} }
+  @media (max-width:440px){ .numpad{gap:4px} .numpad button{padding:9px 2px;font-size:14px} .numpad button .sub{font-size:9px;letter-spacing:-0.2px} .calib-modal{padding:10px} }
   @media (max-width:420px){ .grid.g3{grid-template-columns:repeat(2,minmax(0,1fr))} }
 </style>
 </head>
@@ -553,6 +567,9 @@ const _comp = {
   enabled: true,
   ipadMode: _isIpadUa && typeof IpadCompanionEngine !== 'undefined',
   broadcastActive: false,
+  transport: 'idle',
+  hostInfo: null,
+  announcedFirstBroadcast: false,
   connected: false,
   windowFound: false,
   paused: false,
@@ -2523,19 +2540,35 @@ function renderPlay(){
     </div>`;
   })() : '';
 
+  const compTransport = _comp.transport || 'idle';
+  const hostInfo = _comp.hostInfo || null;
+  const broadcastExtMissing = !!(_comp.ipadMode && hostInfo && hostInfo.broadcastExtPresent === false);
+  const compTransportHint = !_comp.ipadMode
+    ? 'Toggle local desktop or standalone iPad companion auto-tracking'
+    : (broadcastExtMissing
+        ? 'BroadcastExtension.appex is missing from this build (uncheck Sideloadly Remove extensions and reinstall)'
+        : compTransport === 'appgroup'
+          ? 'Live broadcast streaming via App Group shared memory'
+          : (compTransport === 'loopback' || compTransport === 'loopback_waiting')
+            ? 'Live broadcast streaming via loopback TCP (127.0.0.1:8766)'
+            : (hostInfo && hostInfo.appGroupAvailable === false)
+              ? 'Ready for live broadcast via loopback TCP (127.0.0.1:8766 — App Group not required)'
+              : 'Toggle standalone iPad companion auto-tracking');
+
   const modSession = {
     id: 'bj-session',
     title: `Shoe #${meta.shoeNum || 1} · Playtech Live Control Bar`,
     hdrExtra: `
       ${draft.phaseBanner ? `<span class="pill ${['WAIT','DEALING'].includes(draft.phaseBanner)?'green':['PLACE_BETS','LAST_BETS','NO_MORE_BETS'].includes(draft.phaseBanner)?'amber':'blue'}" title="Detected Playtech Table Banner Phase">${draft.phaseBanner==='WAIT'?'WAIT · RECORDING':draft.phaseBanner==='DEALING'?'DEALING · RECORDING':draft.phaseBanner.replace(/_/g,' ')}</span>` : ''}
-      <button class="btn xs ${compPillCls}" id="compToggleBtn" title="Toggle local desktop or standalone iPad companion auto-tracking">${compPillText}</button>
+      <button class="btn xs ${compPillCls}" id="compToggleBtn" title="${compTransportHint}">${compPillText}</button>
       ${typeof IpadCompanionEngine !== 'undefined' ? `<button class="btn xs ${_comp.ipadMode?'pinbtn on':''}" id="compIpadModeBtn" title="Switch between Standalone iPad Split-View Engine and Desktop WebSocket (ws://127.0.0.1:8765)">📱 iPad Mode</button>` : ''}
-      ${_comp.ipadMode ? `<button class="btn xs ${_comp.windowFound?'good':'primary'}" id="compBroadcastBtn" title="Start iPadOS ReplayKit Screen Broadcast (or load test frame)">📺 ${_comp.windowFound?'Broadcasting':'Broadcast Screen'}</button>` : ''}
+      ${_comp.ipadMode ? `<button class="btn xs ${_comp.windowFound?'good':'primary'}" id="compBroadcastBtn" title="${broadcastExtMissing ? 'Broadcast Extension missing — uncheck Remove extensions in Sideloadly and reinstall' : `Start iPadOS ReplayKit Screen Broadcast (or load test frame) · IPC: ${hostInfo && hostInfo.appGroupAvailable ? 'App Group' : 'Loopback 127.0.0.1:8766'}`}">📺 ${_comp.windowFound?'Broadcasting':'Broadcast Screen'}</button>` : ''}
       ${_comp.connected ? `<button class="btn xs ${getKeepaliveBadgeState().cls}" id="compKeepaliveBtn" title="${getKeepaliveBadgeState().title}">${getKeepaliveBadgeState().text}</button>${(_comp.keepalive && _comp.keepalive.enabled !== false && _comp.keepalive.mode !== 'off') ? `<button class="btn xs" id="compKeepaliveResetBtn" title="Reset Watch-mode inactivity timer">↺</button>` : ''}<button class="btn xs" id="compCalibBtn" title="Open fit-to-screen ROI & template calibrator">🎯 Calibrate</button><button class="btn xs" id="compPauseBtn" title="Pause/Resume companion">${_comp.paused?'▶ Resume':'⏸ Pause'}</button><button class="btn xs" id="compResyncBtn" title="Reset companion round sync">↻ Resync</button>` : ''}
       <button class="btn xs ${cfg().soundAlert?'pinbtn on':''}" id="toggleSoundBtn" title="Sound alerts (Wong, Deviations, Insurance, +EV Side Bets, Splits, Banner Phase)">${cfg().soundAlert?'🔔 Sound On':'🔕 Sound Off'}</button>
       <button class="btn xs" id="newShoeBtn" title="Archive current shoe and reset 416 cards">🔄 New Shoe</button>
     `,
     body: `
+      ${broadcastExtMissing ? '<div class="alert red small" style="margin:0 0 10px">⚠️ <strong>BroadcastExtension.appex missing:</strong> Your sideloading tool stripped the ReplayKit broadcast extension. Reinstall the IPA with Sideloadly <strong>Remove extensions</strong> unchecked to receive live frames.</div>' : ''}
       ${compPromptHtml}
       ${draft.confirmEndOpen ? `
         <div class="alert amber" style="margin:0 0 10px">
@@ -2602,9 +2635,9 @@ function renderPlay(){
         <div class="fl" style="left:${zeroBarPct}%" title="0.00% Break-Even"></div>
         <div class="fl" style="left:${wongBarPct}%;background:#22c55e" title="+0.25% Wong Entry"></div>
         <div class="mk" style="left:${edgePctBar}%"></div>
-        <div class="lbl" style="left:8%">-1.2%</div>
+        <div class="lbl" style="left:0;transform:none">-1.2%</div>
         <div class="lbl" style="left:${zeroBarPct}%">0.0% Break-Even</div>
-        <div class="lbl" style="left:88%">+1.5% (TC+4)</div>
+        <div class="lbl" style="right:0;left:auto;transform:none">+1.5% (TC+4)</div>
       </div>
 
       <!-- 2. LIVE HAND DECISION ADVISOR -->
@@ -2941,55 +2974,57 @@ function renderPlay(){
 
       <!-- Live Insurance & Playtech All Bets Side-Bet Sniper -->
       <h3 style="font-size:12px;text-transform:uppercase;color:var(--muted);margin:12px 0 6px;letter-spacing:.5px">🎯 Playtech Side-Bet &amp; Insurance Sniper</h3>
-      <table>
-        <thead>
-          <tr><th>Bet (All Bets BJ)</th><th class="r">Key Metric</th><th class="r">Live EV</th><th class="r">Call</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><strong>Insurance (2:1)</strong></td>
-            <td class="r">10s: ${pct(shoeLive.tenProb,1)} <span class="mut">/ 33.3%</span></td>
-            <td class="r ${shoeLive.insEv>0?'pos':'neg'}">${pctSign(shoeLive.insEv,2)}</td>
-            <td class="r"><span class="edge ${shoeLive.insEv>0?'plus':'bad'}">${shoeLive.insEv>0?'⚡ +EV INSURE':'SKIP'}</span></td>
-          </tr>
-          <tr>
-            <td><strong>Buster Blackjack</strong></td>
-            <td class="r">P(Bust): ${pct((shoeLive.rem[2]+shoeLive.rem[3]+shoeLive.rem[4]+shoeLive.rem[5]+shoeLive.rem[6])/Math.max(1,shoeLive.totalRem),1)}</td>
-            <td class="r ${shoeLive.busterEv>0?'pos':'neg'}">${pctSign(shoeLive.busterEv,2)}</td>
-            <td class="r"><span class="edge ${shoeLive.busterEv>0?'plus':shoeLive.busterEv>-0.02?'mid':'bad'}">${shoeLive.busterEv>0?'⚡ +EV BUSTER':'SKIP'}</span></td>
-          </tr>
-          <tr>
-            <td><strong>Lucky Lucky</strong></td>
-            <td class="r">7s: ${shoeLive.rem[7]}/${shoeLive.init[7]}</td>
-            <td class="r ${shoeLive.luckyEv>0?'pos':'neg'}">${pctSign(shoeLive.luckyEv,2)}</td>
-            <td class="r"><span class="edge ${shoeLive.luckyEv>0?'plus':'bad'}">${shoeLive.luckyEv>0?'⚡ +EV LUCKY':'SKIP'}</span></td>
-          </tr>
-          <tr>
-            <td><strong>21+3</strong></td>
-            <td class="r">Str/Trips DP</td>
-            <td class="r ${shoeLive.plus3Ev>0?'pos':'neg'}">${pctSign(shoeLive.plus3Ev,2)}</td>
-            <td class="r"><span class="edge ${shoeLive.plus3Ev>0?'plus':'bad'}">${shoeLive.plus3Ev>0?'⚡ +EV 21+3':'SKIP'}</span></td>
-          </tr>
-          <tr>
-            <td><strong>Top 3</strong></td>
-            <td class="r">90/180/270</td>
-            <td class="r ${shoeLive.top3Ev>0?'pos':'neg'}">${pctSign(shoeLive.top3Ev,2)}</td>
-            <td class="r"><span class="edge ${shoeLive.top3Ev>0?'plus':'bad'}">${shoeLive.top3Ev>0?'⚡ +EV TOP3':'SKIP'}</span></td>
-          </tr>
-          <tr>
-            <td><strong>Perfect Player Pairs</strong></td>
-            <td class="r">P(Pair): ${pct(shoeLive.pairProb, 2)}</td>
-            <td class="r ${shoeLive.pairsEv>0?'pos':'neg'}">${pctSign(shoeLive.pairsEv,2)}</td>
-            <td class="r"><span class="edge ${shoeLive.pairsEv>0?'plus':'bad'}">${shoeLive.pairsEv>0?'⚡ +EV PP':'SKIP'}</span></td>
-          </tr>
-          <tr>
-            <td><strong>Perfect Dealer Pairs</strong></td>
-            <td class="r">P(Pair): ${pct(shoeLive.pairProb, 2)}</td>
-            <td class="r ${shoeLive.dpEv>0?'pos':'neg'}">${pctSign(shoeLive.dpEv,2)}</td>
-            <td class="r"><span class="edge ${shoeLive.dpEv>0?'plus':'bad'}">${shoeLive.dpEv>0?'⚡ +EV DP':'SKIP'}</span></td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr><th>Bet (All Bets BJ)</th><th class="r">Key Metric</th><th class="r">Live EV</th><th class="r">Call</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Insurance (2:1)</strong></td>
+              <td class="r">10s: ${pct(shoeLive.tenProb,1)} <span class="mut">/ 33.3%</span></td>
+              <td class="r ${shoeLive.insEv>0?'pos':'neg'}">${pctSign(shoeLive.insEv,2)}</td>
+              <td class="r"><span class="edge ${shoeLive.insEv>0?'plus':'bad'}">${shoeLive.insEv>0?'⚡ +EV INSURE':'SKIP'}</span></td>
+            </tr>
+            <tr>
+              <td><strong>Buster Blackjack</strong></td>
+              <td class="r">P(Bust): ${pct((shoeLive.rem[2]+shoeLive.rem[3]+shoeLive.rem[4]+shoeLive.rem[5]+shoeLive.rem[6])/Math.max(1,shoeLive.totalRem),1)}</td>
+              <td class="r ${shoeLive.busterEv>0?'pos':'neg'}">${pctSign(shoeLive.busterEv,2)}</td>
+              <td class="r"><span class="edge ${shoeLive.busterEv>0?'plus':shoeLive.busterEv>-0.02?'mid':'bad'}">${shoeLive.busterEv>0?'⚡ +EV BUSTER':'SKIP'}</span></td>
+            </tr>
+            <tr>
+              <td><strong>Lucky Lucky</strong></td>
+              <td class="r">7s: ${shoeLive.rem[7]}/${shoeLive.init[7]}</td>
+              <td class="r ${shoeLive.luckyEv>0?'pos':'neg'}">${pctSign(shoeLive.luckyEv,2)}</td>
+              <td class="r"><span class="edge ${shoeLive.luckyEv>0?'plus':'bad'}">${shoeLive.luckyEv>0?'⚡ +EV LUCKY':'SKIP'}</span></td>
+            </tr>
+            <tr>
+              <td><strong>21+3</strong></td>
+              <td class="r">Str/Trips DP</td>
+              <td class="r ${shoeLive.plus3Ev>0?'pos':'neg'}">${pctSign(shoeLive.plus3Ev,2)}</td>
+              <td class="r"><span class="edge ${shoeLive.plus3Ev>0?'plus':'bad'}">${shoeLive.plus3Ev>0?'⚡ +EV 21+3':'SKIP'}</span></td>
+            </tr>
+            <tr>
+              <td><strong>Top 3</strong></td>
+              <td class="r">90/180/270</td>
+              <td class="r ${shoeLive.top3Ev>0?'pos':'neg'}">${pctSign(shoeLive.top3Ev,2)}</td>
+              <td class="r"><span class="edge ${shoeLive.top3Ev>0?'plus':'bad'}">${shoeLive.top3Ev>0?'⚡ +EV TOP3':'SKIP'}</span></td>
+            </tr>
+            <tr>
+              <td><strong>Perfect Player Pairs</strong></td>
+              <td class="r">P(Pair): ${pct(shoeLive.pairProb, 2)}</td>
+              <td class="r ${shoeLive.pairsEv>0?'pos':'neg'}">${pctSign(shoeLive.pairsEv,2)}</td>
+              <td class="r"><span class="edge ${shoeLive.pairsEv>0?'plus':'bad'}">${shoeLive.pairsEv>0?'⚡ +EV PP':'SKIP'}</span></td>
+            </tr>
+            <tr>
+              <td><strong>Perfect Dealer Pairs</strong></td>
+              <td class="r">P(Pair): ${pct(shoeLive.pairProb, 2)}</td>
+              <td class="r ${shoeLive.dpEv>0?'pos':'neg'}">${pctSign(shoeLive.dpEv,2)}</td>
+              <td class="r"><span class="edge ${shoeLive.dpEv>0?'plus':'bad'}">${shoeLive.dpEv>0?'⚡ +EV DP':'SKIP'}</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     `
   };
 
@@ -3622,7 +3657,7 @@ function renderHistory(){
         <h2 style="margin:0">📜 Shoe Round Log (${rounds.length} Rounds)</h2>
         <span class="sp"></span>
         ${S.sessions.length > 1 ? `
-          <select id="histShoeSel" style="width:auto;max-width:260px;padding:4px 8px;font-size:12px">
+          <select id="histShoeSel" style="width:auto;max-width:min(260px,100%);padding:4px 8px;font-size:12px">
             ${S.sessions.slice().reverse().map(sh => {
               const m = sh.shoeMeta || {shoeNum:1};
               const isAct = sCur && sh.id === sCur.id;
@@ -3778,36 +3813,41 @@ function renderSettings(){
           <span class="sp"></span>
           <span class="mut">Active ONLY in Watch mode · Left window</span>
         </div>
-        <div class="g4">
-          <div>
-            <label>Mode</label>
+        <div class="grid g4">
+          <label class="field">
+            <span>Mode</span>
             <select id="setKaMode">
               <option value="auto" ${(c.keepalive?.mode || _comp.keepalive?.mode || 'auto')==='auto'?'selected':''}>Auto Reload (Stealth Round-Over / Place Bets)</option>
               <option value="alert_only" ${(c.keepalive?.mode || _comp.keepalive?.mode)==='alert_only'?'selected':''}>Alert Only (No Auto-Refresh)</option>
               <option value="off" ${(c.keepalive?.mode || _comp.keepalive?.mode)==='off'?'selected':''}>Off</option>
             </select>
-          </div>
-          <div>
-            <label>Watch Window Min (min)</label>
+          </label>
+          <label class="field">
+            <span>Watch Window Min (min)</span>
             <input type="number" id="setKaMin" value="${c.keepalive?.minWatchMin ?? (Math.round((((_comp.keepalive?.minWatchSec ?? _comp.keepalive?.targetSec ?? 570)) / 60) * 10) / 10)}" min="0.5" max="14.5" step="0.5">
-          </div>
-          <div>
-            <label>Watch Window Max (min)</label>
+          </label>
+          <label class="field">
+            <span>Watch Window Max (min)</span>
             <input type="number" id="setKaMax" value="${c.keepalive?.maxWatchMin ?? (Math.round((((_comp.keepalive?.maxWatchSec ?? _comp.keepalive?.targetSec ?? 630)) / 60) * 10) / 10)}" min="0.5" max="14.8" step="0.1">
-          </div>
-          <div>
-            <label>Refresh Method</label>
+          </label>
+          <label class="field">
+            <span>Refresh Method</span>
             <select id="setKaMethod">
-              <option value="ext_then_os" ${(c.keepalive?.method || _comp.keepalive?.method || 'ext_then_os')==='ext_then_os'?'selected':''}>Brave Extension (Background Tab Reload) → OS Fallback (Recommended)</option>
-              <option value="ext_reload" ${(c.keepalive?.method || _comp.keepalive?.method)==='ext_reload'?'selected':''}>Brave Extension Only (chrome.tabs.reload)</option>
-              <option value="click_reload_then_f5" ${(c.keepalive?.method || _comp.keepalive?.method)==='click_reload_then_f5'?'selected':''}>Click Brave Reload (⟳) → F5 → Ctrl+R</option>
-              <option value="click_reload" ${(c.keepalive?.method || _comp.keepalive?.method)==='click_reload'?'selected':''}>Click Brave Reload (⟳) Only</option>
-              <option value="sendinput_f5" ${(c.keepalive?.method || _comp.keepalive?.method)==='sendinput_f5'?'selected':''}>Direct F5 → Ctrl+R Fallback</option>
-              <option value="sendinput_ctrl_r" ${(c.keepalive?.method || _comp.keepalive?.method)==='sendinput_ctrl_r'?'selected':''}>Direct Ctrl+R Only</option>
-              <option value="appcommand_then_f5" ${(c.keepalive?.method || _comp.keepalive?.method)==='appcommand_then_f5'?'selected':''}>AppCommand → F5 → Ctrl+R</option>
-              <option value="appcommand" ${(c.keepalive?.method || _comp.keepalive?.method)==='appcommand'?'selected':''}>Background WM_APPCOMMAND Only</option>
+              ${_comp.ipadMode ? `
+                <option value="ext_then_os" ${(c.keepalive?.method || _comp.keepalive?.method || 'ext_then_os')==='ext_then_os'?'selected':''}>Safari Extension (tabs.reload) → Alert Fallback (Recommended)</option>
+                <option value="ext_reload" ${(c.keepalive?.method || _comp.keepalive?.method)==='ext_reload'?'selected':''}>Safari Extension Only (tabs.reload)</option>
+              ` : `
+                <option value="ext_then_os" ${(c.keepalive?.method || _comp.keepalive?.method || 'ext_then_os')==='ext_then_os'?'selected':''}>Brave Extension (Background Tab Reload) → OS Fallback (Recommended)</option>
+                <option value="ext_reload" ${(c.keepalive?.method || _comp.keepalive?.method)==='ext_reload'?'selected':''}>Brave Extension Only (chrome.tabs.reload)</option>
+                <option value="click_reload_then_f5" ${(c.keepalive?.method || _comp.keepalive?.method)==='click_reload_then_f5'?'selected':''}>Click Brave Reload (⟳) → F5 → Ctrl+R</option>
+                <option value="click_reload" ${(c.keepalive?.method || _comp.keepalive?.method)==='click_reload'?'selected':''}>Click Brave Reload (⟳) Only</option>
+                <option value="sendinput_f5" ${(c.keepalive?.method || _comp.keepalive?.method)==='sendinput_f5'?'selected':''}>Direct F5 → Ctrl+R Fallback</option>
+                <option value="sendinput_ctrl_r" ${(c.keepalive?.method || _comp.keepalive?.method)==='sendinput_ctrl_r'?'selected':''}>Direct Ctrl+R Only</option>
+                <option value="appcommand_then_f5" ${(c.keepalive?.method || _comp.keepalive?.method)==='appcommand_then_f5'?'selected':''}>AppCommand → F5 → Ctrl+R</option>
+                <option value="appcommand" ${(c.keepalive?.method || _comp.keepalive?.method)==='appcommand'?'selected':''}>Background WM_APPCOMMAND Only</option>
+              `}
             </select>
-          </div>
+          </label>
         </div>
         <div class="row small" style="margin-top:8px;gap:14px;flex-wrap:wrap">
           <label class="row" style="cursor:pointer;gap:6px">
@@ -3816,8 +3856,28 @@ function renderSettings(){
           </label>
         </div>
         <div class="row small" style="margin-top:6px;gap:10px;flex-wrap:wrap;align-items:center">
-          <span style="padding:2px 8px;border-radius:999px;font-weight:600;border:1px solid ${_comp.extConnected ? 'rgba(52,211,153,.45)' : 'rgba(251,191,36,.45)'};color:${_comp.extConnected ? '#6ee7b7' : '#fcd34d'};background:${_comp.extConnected ? 'rgba(16,185,129,.12)' : 'rgba(245,158,11,.10)'}">${_comp.extConnected ? '🧩 Brave Extension: Connected (Background Tab Reload)' : '🧩 Brave Extension: Not Connected — OS Fallback Active'}</span>
-          <span style="opacity:.78">In <code>brave://extensions</code> (Developer mode) → Load unpacked: <code>companion\brave_keepalive_ext</code></span>
+          ${_comp.ipadMode ? (() => {
+            const hi = _comp.hostInfo || {};
+            const tr = _comp.transport || 'idle';
+            const ipcCls = hi.broadcastExtPresent === false
+              ? 'red'
+              : (tr === 'appgroup' || tr === 'loopback' || tr === 'loopback_waiting' || hi.appGroupAvailable) ? 'green' : 'blue';
+            const ipcText = hi.broadcastExtPresent === false
+              ? '⚠️ BroadcastExtension Missing (Uncheck Sideloadly Remove extensions)'
+              : (tr === 'appgroup' || hi.appGroupAvailable)
+                ? '📡 Frame IPC: App Group Shared Memory'
+                : (tr === 'loopback' || tr === 'loopback_waiting')
+                  ? '📡 Frame IPC: Loopback TCP (127.0.0.1:8766) Active'
+                  : '📡 Frame IPC: Loopback TCP (127.0.0.1:8766) Ready';
+            return `
+              <span class="pill ${_comp.extConnected ? 'green' : 'amber'}" style="font-weight:600">${_comp.extConnected ? '🧩 Safari Keep-Alive Ext: Connected (tabs.reload)' : '🧩 Safari Keep-Alive Ext: Not Connected — Alert Fallback'}</span>
+              <span class="pill ${ipcCls}" style="font-weight:600">${ipcText}</span>
+              <span style="opacity:.78;min-width:0">Enable Safari extension in <code>Settings → Apps → Safari → Extensions → BJ Tracker</code> (allow on your Playtech site)</span>
+            `;
+          })() : `
+            <span class="pill ${_comp.extConnected ? 'green' : 'amber'}" style="font-weight:600">${_comp.extConnected ? '🧩 Brave Extension: Connected (Background Tab Reload)' : '🧩 Brave Extension: Not Connected — OS Fallback Active'}</span>
+            <span style="opacity:.78;min-width:0">In <code>brave://extensions</code> (Developer mode) → Load unpacked: <code>companion\\brave_keepalive_ext</code></span>
+          `}
         </div>
       </div>
       <div class="row" style="margin-top:14px">
@@ -3899,6 +3959,13 @@ function renderSettings(){
   };
 }
 
+function syncStickyHeaderHeight(){
+  const hdr = document.querySelector('header');
+  if(!hdr) return;
+  const h = Math.ceil(hdr.getBoundingClientRect().height);
+  if(h > 0) document.documentElement.style.setProperty('--hdr-h', h + 'px');
+}
+
 function render(){
   if(tab === 'play') renderPlay();
   else if(tab === 'strategy') renderStrategy();
@@ -3906,6 +3973,7 @@ function render(){
   else if(tab === 'settings') renderSettings();
   persistDraft();
   syncCompanionState();
+  syncStickyHeaderHeight();
 }
 
 /* ============================================================================
@@ -4110,7 +4178,9 @@ function getKeepaliveBadgeState(){
   }
   const rem = Math.max(0, Math.round(ka.remainingSec ?? Math.max(0, (ka.targetSec || 600) - (ka.elapsedSec || 0))));
   const refreshCount = ka.refreshCount || 0;
-  const extLbl = _comp.extConnected ? 'Brave Ext: Connected (background tab reload)' : 'Brave Ext: Not connected (OS fallback)';
+  const extLbl = _comp.ipadMode
+    ? (_comp.extConnected ? 'Safari Ext: Connected (tabs.reload)' : 'Safari Ext: Not connected (alert fallback)')
+    : (_comp.extConnected ? 'Brave Ext: Connected (background tab reload)' : 'Brave Ext: Not connected (OS fallback)');
   if(ka.state === 'REFRESHING' || ka.state === 'RECOVERING' || ka.inGrace){
     return {
       text: '🔄 Reloading...',
@@ -4122,7 +4192,7 @@ function getKeepaliveBadgeState(){
     return {
       text: '⚠️ KA Check',
       cls: 'warn',
-      title: `Newport session keep-alive warning — check the left game window or press F5 during Place Bets • ${extLbl}`
+      title: `Newport session keep-alive warning — check the left game window or ${_comp.ipadMode ? 'reload in Safari' : 'press F5'} during Place Bets • ${extLbl}`
     };
   }
   if(ka.state === 'PAUSED_BET' || (draft && draft.playMode !== 'watch')){
@@ -4174,11 +4244,11 @@ function handleCompanionMessage(msg){
       _comp.keepaliveGraceUntil = 0;
       if(draft) draft.lastMsg = msg.message || `✅ Newport session kept alive (${msg.reloadSec ?? '?'}s reload) — back at live table.`;
     } else if(ev === 'alert_place_bets'){
-      triggerAlert('window', '🔄 Refresh Newport Now (Watch)', msg.message || `Place Bets window (${Math.round(msg.elapsedSec || 0)}s watch) — press F5 in the Newport window to avoid 15-min kick.`, {
+      triggerAlert('window', '🔄 Refresh Newport Now (Watch)', msg.message || `Place Bets window (${Math.round(msg.elapsedSec || 0)}s watch) — ${_comp.ipadMode ? 'tap Reload (⟳) in Safari' : 'press F5 in the Newport window'} to avoid 15-min kick.`, {
         key: `ka_pb_${Math.floor(Date.now() / 15000)}`, cooldownMs: 12000, speak: 'Refresh Newport now'
       });
     } else if(ev === 'hard_warn'){
-      triggerAlert('disconnect', '⚠️ 15-Min Idle Disconnect Imminent', msg.message || `${Math.round(msg.elapsedSec || 0)}s watched without a refresh — press F5 in Newport at the next break!`, {
+      triggerAlert('disconnect', '⚠️ 15-Min Idle Disconnect Imminent', msg.message || `${Math.round(msg.elapsedSec || 0)}s watched without a refresh — ${_comp.ipadMode ? 'reload Safari' : 'press F5 in Newport'} at the next break!`, {
         key: 'ka_hard_warn', cooldownMs: 25000, speak: 'Warning. Refresh Newport soon'
       });
     } else if(ev === 'timeout_warn'){
@@ -4186,12 +4256,16 @@ function handleCompanionMessage(msg){
         key: 'ka_timeout_warn', cooldownMs: 20000, speak: 'Check Newport window'
       });
     } else if(ev === 'refresh_failed'){
-      triggerAlert('disconnect', '⚠️ Auto-Refresh Could Not Target Newport', msg.message || `Could not refresh left Newport window (${msg.reason || 'target_lost'}) — press F5 manually.`, {
+      triggerAlert('disconnect', '⚠️ Auto-Refresh Could Not Target Newport', msg.message || `Could not refresh left Newport window (${msg.reason || 'target_lost'}) — ${_comp.ipadMode ? 'reload manually in Safari' : 'press F5 manually'}.`, {
         key: 'ka_ref_fail', cooldownMs: 15000, speak: 'Refresh Newport manually'
       });
     } else if((ev === 'reset' || ev === 'armed' || ev === 'config_saved') && draft){
-      const evLabel = ev === 'reset' ? '↺ Keep-alive Watch timer reset.' : ev === 'armed' ? '⏱ Keep-alive armed for next Round-Over / Place Bets.' : '💾 Keep-alive settings synced to companion.';
-      draft.lastMsg = msg.message || evLabel;
+      if(ev === 'config_saved' && _comp.suppressNextKaConfigToast){
+        _comp.suppressNextKaConfigToast = false;
+      } else {
+        const evLabel = ev === 'reset' ? '↺ Keep-alive Watch timer reset.' : ev === 'armed' ? '⏱ Keep-alive armed for next Round-Over / Place Bets.' : '💾 Keep-alive settings synced to companion.';
+        draft.lastMsg = msg.message || evLabel;
+      }
     }
     const nextMode = (_comp.keepalive || {}).mode;
     const nextEnabled = (_comp.keepalive || {}).enabled;
@@ -4205,11 +4279,31 @@ function handleCompanionMessage(msg){
     const prevKaMode = (_comp.keepalive || {}).mode;
     const prevKaEnabled = (_comp.keepalive || {}).enabled;
     const prevExt = !!_comp.extConnected;
-    const prevKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${prevKaMode}|${prevKaEnabled}|${prevExt}`;
+    const prevTransport = _comp.transport || 'idle';
+    const prevAppGrp = !!(_comp.hostInfo && _comp.hostInfo.appGroupAvailable);
+    const prevExtPres = _comp.hostInfo ? _comp.hostInfo.broadcastExtPresent : null;
+    const prevKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${prevKaMode}|${prevKaEnabled}|${prevExt}|${prevTransport}|${prevAppGrp}|${prevExtPres}`;
     _comp.windowFound = !!msg.windowFound;
     _comp.paused = !!msg.paused;
     _comp.state = msg.state || 'IDLE';
     _comp.extConnected = !!msg.extConnected;
+    if(typeof msg.transport === 'string') _comp.transport = msg.transport;
+    if(msg.hostInfo && typeof msg.hostInfo === 'object'){
+      _comp.hostInfo = { ...(_comp.hostInfo || {}), ...msg.hostInfo };
+    }
+    if(_comp.ipadMode){
+      if(_comp.windowFound && !_comp.announcedFirstBroadcast){
+        _comp.announcedFirstBroadcast = true;
+        if(draft){
+          const trLabel = _comp.transport === 'appgroup'
+            ? 'App Group Shared Memory'
+            : 'Loopback TCP (127.0.0.1:8766)';
+          draft.lastMsg = `📺 Live broadcast active — streaming via ${trLabel}.`;
+        }
+      } else if(!_comp.windowFound && _comp.transport === 'idle'){
+        _comp.announcedFirstBroadcast = false;
+      }
+    }
     if(msg.keepalive){
       _comp.keepalive = { ..._comp.keepalive, ...msg.keepalive };
       if(_comp.keepalive.inGrace) _comp.keepaliveGraceUntil = Math.max(_comp.keepaliveGraceUntil, Date.now() + 5000);
@@ -4220,7 +4314,9 @@ function handleCompanionMessage(msg){
         key: 'win_lost', cooldownMs: 10000, speak: 'Game window lost'
       });
     }
-    const nextKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${(_comp.keepalive || {}).mode}|${(_comp.keepalive || {}).enabled}|${!!_comp.extConnected}`;
+    const curAppGrp = !!(_comp.hostInfo && _comp.hostInfo.appGroupAvailable);
+    const curExtPres = _comp.hostInfo ? _comp.hostInfo.broadcastExtPresent : null;
+    const nextKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${(_comp.keepalive || {}).mode}|${(_comp.keepalive || {}).enabled}|${!!_comp.extConnected}|${_comp.transport || 'idle'}|${curAppGrp}|${curExtPres}`;
     if(prevKey !== nextKey) render();
     else updateKeepaliveBadge();
     return;
@@ -4760,15 +4856,15 @@ function renderCalibModal(){
               : '<div class="small mut" style="padding:48px;text-align:center">Waiting for snapshot from Newport/Playtech window (or tap 🖼 Load Screenshot / 📺 Broadcast Screen on iPad)…</div>'}
           </div>
           <div class="row" style="margin-top:8px">
-            <label class="small mut">Anchor Frame:
-              <select id="calibAnchorSel" style="width:auto;max-width:100%;padding:3px 7px;margin-left:4px">
+            <label class="field small" style="flex:1 1 200px;min-width:0;max-width:100%">
+              <span>Anchor Frame</span>
+              <select id="calibAnchorSel">
                 <option value="ipad_split_left" ${_calib.anchorMode==='ipad_split_left'?'selected':''}>iPad Split-View Left Safari 16:9 (Recommended on iPad)</option>
                 <option value="game_viewport" ${_calib.anchorMode==='game_viewport'?'selected':''}>Auto Playtech 16:9 Frame (Desktop Recommended)</option>
                 <option value="window" ${_calib.anchorMode==='window'?'selected':''}>Full Browser Window</option>
                 <option value="toolbar" ${_calib.anchorMode==='toolbar'?'selected':''}>Brave Toolbar Only (Reload ⟳)</option>
               </select>
             </label>
-            <span class="sp"></span>
             <button class="btn xs" id="calibTestBtn">🧪 Test Match on Snapshot</button>
             <button class="btn xs primary" id="calibSaveRoisBtn" ${_calib.anchorMode==='toolbar'?'disabled title="Switch Anchor Frame back to Playtech Frame to save game ROIs"':''}>💾 Save ROIs</button>
           </div>
@@ -5006,7 +5102,28 @@ function connectCompanion(immediate = false){
       _comp.connected = true;
       _comp.backoffMs = 2000;
       _comp.lastSyncKey = '';
+      if(_isNativeIpadHost){
+        try{ window.webkit.messageHandlers.ipadCompanion.postMessage({ action: 'companionReady' }); }catch(_){}
+      }
       syncCompanionState(true);
+      const savedKa = cfg().keepalive;
+      if(useIpadSocket && savedKa && typeof savedKa === 'object'){
+        const kaMode = savedKa.mode || 'auto';
+        const kaMinM = Math.max(0.5, Math.min(14.5, +savedKa.minWatchMin || 9.5));
+        const kaMaxM = Math.max(kaMinM, Math.min(14.8, +savedKa.maxWatchMin || kaMinM));
+        _comp.suppressNextKaConfigToast = true;
+        sendKeepaliveAction('set_config', {
+          keepalive: {
+            enabled: kaMode !== 'off',
+            mode: kaMode,
+            method: savedKa.method || 'ext_then_os',
+            min_watch_sec: Math.round(kaMinM * 60),
+            max_watch_sec: Math.round(kaMaxM * 60),
+            reset_on_bet_round: savedKa.resetOnBetRound !== false
+          }
+        });
+        _comp.suppressNextKaConfigToast = false;
+      }
       render();
     };
     ws.onmessage = (ev) => {
@@ -5040,6 +5157,12 @@ function connectCompanion(immediate = false){
 
 if(!active()) startNewSession();
 else { restoreDraft(); render(); }
+syncStickyHeaderHeight();
+window.addEventListener('resize', syncStickyHeaderHeight, { passive: true });
+if(typeof ResizeObserver !== 'undefined'){
+  const _hdrEl = document.querySelector('header');
+  if(_hdrEl) new ResizeObserver(syncStickyHeaderHeight).observe(_hdrEl);
+}
 connectCompanion(true);
 </script>
 </body>

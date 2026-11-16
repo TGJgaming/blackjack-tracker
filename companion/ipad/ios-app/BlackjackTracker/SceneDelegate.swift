@@ -23,8 +23,13 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         UIApplication.shared.isIdleTimerDisabled = true
     }
 
+    func sceneWillEnterForeground(_ scene: UIScene) {
+        (window?.rootViewController as? TrackerViewController)?.ensureServicesRunning()
+    }
+
     func sceneDidBecomeActive(_ scene: UIScene) {
         UIApplication.shared.isIdleTimerDisabled = true
+        (window?.rootViewController as? TrackerViewController)?.ensureServicesRunning()
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {
