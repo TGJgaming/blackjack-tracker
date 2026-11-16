@@ -22,6 +22,11 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Uses loopback 127.0.0.1 to stream live ReplayKit screen frames from the Broadcast extension and relay optional Safari Keep-Alive reloads.</string>
 	<key>UIApplicationSceneManifest</key>

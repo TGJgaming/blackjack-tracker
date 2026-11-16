@@ -10,11 +10,14 @@
     --bg:#0f1115; --panel:#181b22; --panel2:#20242d; --line:#2c313c; --text:#e8eaf0; --muted:#8b93a7;
     --green:#22c55e; --red:#ef4444; --amber:#f59e0b; --blue:#3b82f6; --purple:#a855f7; --cyan:#06b6d4; --slate:#64748b;
     --radius:14px;
+    --ui-zoom:1;
   }
   *{box-sizing:border-box}
   html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-text-size-adjust:100%;text-size-adjust:100%;overflow-x:clip}
   header{position:sticky;top:0;z-index:10;background:rgba(15,17,21,.95);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+  body.ui-zoomed header,body.ui-zoomed main,body.ui-zoomed footer{zoom:var(--ui-zoom,1)}
   .wrap{max-width:1240px;margin:0 auto;padding:12px max(12px,env(safe-area-inset-right,12px)) 12px max(12px,env(safe-area-inset-left,12px))}
+  body.ui-zoomed .wrap{max-width:calc(1240px / var(--ui-zoom, 1));padding:10px max(10px,env(safe-area-inset-right,10px)) 10px max(10px,env(safe-area-inset-left,10px))}
 
   /* Universal 2-column split layout with sticky right dock */
   .split-layout{display:flex;flex-direction:column;gap:12px}
@@ -248,15 +251,46 @@
   @media (max-width:700px){ nav{flex-wrap:wrap} nav button{font-size:12px;padding:6px 8px} .grid.g4,.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))} h1{font-size:16px} }
   @media (max-width:440px){ .numpad{gap:4px} .numpad button{padding:9px 2px;font-size:14px} .numpad button .sub{font-size:9px;letter-spacing:-0.2px} .calib-modal{padding:10px} }
   @media (max-width:420px){ .grid.g3{grid-template-columns:repeat(2,minmax(0,1fr))} }
+
+  /* Effective-width overrides when zoomed out in iPad Split View */
+  body.eff-wide .split-layout{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(240px,0.92fr);gap:10px;align-items:start}
+  body.eff-wide .split-layout.no-dock,body.eff-wide .split-layout.all-dock{grid-template-columns:minmax(0,900px);justify-content:center}
+  body.eff-wide .dock-col{order:0;position:sticky;top:calc(var(--hdr-h, 90px) + 6px);z-index:4;max-height:calc((100dvh / var(--ui-zoom, 1)) - var(--hdr-h, 90px) - 18px);overflow-y:auto;background:transparent;border:none;box-shadow:none;padding:0 4px 0 0;border-radius:0}
+  body.eff-wide .split-layout.all-dock .dock-col{position:static;max-height:none;overflow:visible;padding-right:0}
+  body.eff-wide .dock-col.mob-min{max-height:calc((100dvh / var(--ui-zoom, 1)) - var(--hdr-h, 90px) - 18px);overflow-y:auto;padding:0 4px 0 0}
+  body.eff-wide .dock-col.mob-min .mod-card{display:block}
+  body.eff-wide .dock-mob-bar{display:none}
+  body.eff-wide .dock-col .grid.g4,body.eff-wide .dock-col .grid.g3{grid-template-columns:repeat(2,minmax(0,1fr))}
+  body.eff-wide .dock-col .grid.g5{grid-template-columns:repeat(auto-fit,minmax(68px,1fr))}
+  body.eff-wide .dock-col .tray3{grid-template-columns:1fr}
+  body.eff-wide .dock-col .sidebet-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  body.eff-wide .dock-col table th,body.eff-wide .dock-col table td{padding:5px 4px;font-size:12px}
+  body.eff-wide .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  body.eff-wide .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  body.eff-wide .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+  body.eff-wide .g5{grid-template-columns:repeat(5,minmax(0,1fr))}
+  body.eff-wide.eff-compact .main-col .grid.g4,body.eff-wide.eff-compact .card > .grid.g4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  body.eff-wide .sidebet-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  body.eff-tray3 .main-col .tray3{grid-template-columns:minmax(0,1.1fr) minmax(0,0.9fr) minmax(0,1.1fr)}
+  body.eff-wide nav{flex-wrap:wrap}
+  body.eff-wide nav button{font-size:13px;padding:7px 9px}
+  body.ui-zoomed header h1{font-size:15px}
+  body.ui-zoomed nav button{padding:6px 8px;font-size:12.5px}
+  body.ui-zoomed .card{padding:11px}
 </style>
 </head>
 <body>
 <header>
   <div class="wrap">
-    <div class="row" style="margin-bottom:8px">
+    <div class="row" style="margin-bottom:8px;gap:6px">
       <h1>🃏 Playtech Live Blackjack · Advantage &amp; Wonging Tracker</h1>
       <span class="sp"></span>
-      <a href="../baccarat-tracker/index.html" class="btn xs" style="text-decoration:none;background:linear-gradient(135deg,#1d2a44,#3a1515);border-color:#60a5fa;color:#dbeafe;font-weight:700">🎴 Switch to Baccarat Tracker →</a>
+      <span class="row zoom-ctl" style="gap:3px;flex-wrap:nowrap" title="Adjust UI Zoom for iPad Split Screen (tap middle badge to reset to Auto)">
+        <button type="button" class="btn xs icon" id="hdrZoomOutBtn" aria-label="Zoom Out">−</button>
+        <button type="button" class="btn xs" id="hdrZoomLbl" style="min-width:60px;text-align:center">🔍 Auto</button>
+        <button type="button" class="btn xs icon" id="hdrZoomInBtn" aria-label="Zoom In">+</button>
+      </span>
+      <a href="../baccarat-tracker/index.html" class="btn xs hdr-bacc-btn" style="text-decoration:none;background:linear-gradient(135deg,#1d2a44,#3a1515);border-color:#60a5fa;color:#dbeafe;font-weight:700">🎴 Switch to Baccarat Tracker →</a>
     </div>
     <nav>
       <button data-tab="play" class="on">⚡ Live Tracker (All Bets / Wong)</button>
@@ -417,7 +451,8 @@ const DEFAULTS = {
     split: true,
     disconnect: true
   },
-  defaultSideStakes: { pp: 0, dp: 0, plus3: 0, top3: 0, lucky: 0, buster: 0 }
+  defaultSideStakes: { pp: 0, dp: 0, plus3: 0, top3: 0, lucky: 0, buster: 0 },
+  uiZoom: null
 };
 
 const KEY = 'bjPlaytechTracker.v1';
@@ -581,6 +616,7 @@ const _comp = {
   backoffMs: 2000,
   lastSyncKey: '',
   extConnected: false,
+  extDiag: null,
   keepalive: {
     enabled: true,
     mode: 'auto',
@@ -595,6 +631,81 @@ const _comp = {
   },
   keepaliveGraceUntil: 0
 };
+
+const UI_ZOOM_PRESETS = [55, 65, 75, 85, 100];
+function resolveUiZoom(){
+  const vw = Math.max(240, window.innerWidth || document.documentElement.clientWidth || 1024);
+  const raw = (typeof cfg === 'function' && cfg()) ? cfg().uiZoom : null;
+  const manualPct = (raw === null || raw === undefined || raw === 'auto' || raw === '')
+    ? null
+    : Math.max(50, Math.min(110, Math.round(Number(raw) || 100)));
+  const pct = manualPct !== null ? manualPct : (vw <= 859 ? 75 : 100);
+  const scale = pct / 100;
+  const effW = vw / scale;
+  return {
+    vw,
+    pct,
+    scale,
+    effW,
+    isAuto: manualPct === null,
+    isZoomed: scale < 0.999
+  };
+}
+function applyUiZoom(){
+  const z = resolveUiZoom();
+  const root = document.documentElement;
+  const body = document.body;
+  if(root){
+    root.style.setProperty('--ui-zoom', z.isZoomed ? String(z.scale) : '1');
+  }
+  if(body){
+    body.classList.toggle('ui-zoomed', z.isZoomed);
+    const effWide = z.isZoomed && z.effW >= 660;
+    const effCompact = effWide && z.effW < 1060;
+    const effTray3 = z.isZoomed && z.effW >= 650;
+    body.classList.toggle('eff-wide', effWide);
+    body.classList.toggle('eff-compact', effCompact);
+    body.classList.toggle('eff-tray3', effTray3);
+  }
+  const lbl = document.getElementById('hdrZoomLbl');
+  if(lbl){
+    lbl.textContent = z.isAuto ? `🔍 Auto ${z.pct}%` : `🔍 ${z.pct}%`;
+    lbl.title = z.isAuto
+      ? `Auto UI Zoom (${z.pct}% for ${z.vw}px width; eff ${Math.round(z.effW)}px) — tap to reset to Auto`
+      : `Manual UI Zoom (${z.pct}%; eff ${Math.round(z.effW)}px) — tap to reset to Auto`;
+  }
+  const outBtn = document.getElementById('hdrZoomOutBtn');
+  if(outBtn) outBtn.disabled = z.pct <= UI_ZOOM_PRESETS[0];
+  const inBtn = document.getElementById('hdrZoomInBtn');
+  if(inBtn) inBtn.disabled = z.pct >= UI_ZOOM_PRESETS[UI_ZOOM_PRESETS.length - 1];
+  if(typeof syncStickyHeaderHeight === 'function') syncStickyHeaderHeight();
+  return z;
+}
+function setUiZoom(val){
+  const c = cfg();
+  if(val === null || val === undefined || val === 'auto' || val === ''){
+    c.uiZoom = null;
+  } else {
+    c.uiZoom = Math.max(50, Math.min(110, Math.round(Number(val) || 100)));
+  }
+  save();
+  applyUiZoom();
+  const sel = document.getElementById('setUiZoom');
+  if(sel) sel.value = (c.uiZoom === null || c.uiZoom === undefined) ? 'auto' : String(c.uiZoom);
+}
+function cycleUiZoom(dir){
+  const z = resolveUiZoom();
+  const cur = z.pct;
+  let next = cur;
+  if(dir < 0){
+    const lower = UI_ZOOM_PRESETS.filter(p => p < cur);
+    next = lower.length ? lower[lower.length - 1] : UI_ZOOM_PRESETS[0];
+  } else if(dir > 0){
+    const higher = UI_ZOOM_PRESETS.filter(p => p > cur);
+    next = higher.length ? higher[0] : UI_ZOOM_PRESETS[UI_ZOOM_PRESETS.length - 1];
+  }
+  setUiZoom(next);
+}
 draft = freshDraft();
 function freshDraft(){
   _lastCleared = null;
@@ -3750,6 +3861,90 @@ function renderHistory(){
 /* ============================================================================
    Tab 4: ⚙️ Settings
    ============================================================================ */
+function renderSettingsExtDiagHtml(){
+  if(!_comp.ipadMode){
+    return `
+      <span class="pill ${_comp.extConnected ? 'green' : 'amber'}" style="font-weight:600">${_comp.extConnected ? '🧩 Brave Extension: Connected (Background Tab Reload)' : '🧩 Brave Extension: Not Connected — OS Fallback Active'}</span>
+      <span style="opacity:.78;min-width:0">In <code>brave://extensions</code> (Developer mode) → Load unpacked: <code>companion\\brave_keepalive_ext</code></span>
+    `;
+  }
+  const hi = _comp.hostInfo || {};
+  const ed = _comp.extDiag || {};
+  const tr = _comp.transport || 'idle';
+  const ipcCls = hi.broadcastExtPresent === false
+    ? 'red'
+    : (tr === 'appgroup' || tr === 'loopback' || tr === 'loopback_waiting' || hi.appGroupAvailable) ? 'green' : 'blue';
+  const ipcText = hi.broadcastExtPresent === false
+    ? '⚠️ BroadcastExtension Missing (Uncheck Sideloadly Remove extensions)'
+    : (tr === 'appgroup' || hi.appGroupAvailable)
+      ? '📡 Frame IPC: App Group Shared Memory'
+      : (tr === 'loopback' || tr === 'loopback_waiting')
+        ? '📡 Frame IPC: Loopback TCP (127.0.0.1:8766) Active'
+        : '📡 Frame IPC: Loopback TCP (127.0.0.1:8766) Ready';
+
+  let extPillCls = 'amber';
+  let extPillTxt = ed.pendingQueued
+    ? '🧩 Safari Ext: Queued (Waiting Extension Wakeup)'
+    : '🧩 Safari Keep-Alive Ext: Standby / Sleeping — Alert Fallback Ready';
+  if(hi.safariExtPresent === false){
+    extPillCls = 'red';
+    extPillTxt = '🧩 Safari Keep-Alive Ext: Missing (Uncheck Sideloadly Remove extensions or use SideStore)';
+  } else if(_comp.extConnected && ed.permissionOk === false){
+    extPillCls = 'amber';
+    extPillTxt = `🧩 Safari Ext: Connected — Website Permission Needed (${ed.tabCount || 0} tabs hidden)`;
+  } else if(_comp.extConnected){
+    extPillCls = 'green';
+    extPillTxt = `🧩 Safari Keep-Alive Ext: Connected (${ed.matchedCount || 0} Playtech / ${ed.tabCount || 0} tabs)`;
+  }
+
+  let ackHtml = '';
+  if(ed.lastAck && typeof ed.lastAck === 'object'){
+    const ack = ed.lastAck;
+    if(ack.ok){
+      const titleTag = ack.title ? ` · ${String(ack.title).slice(0, 32)}` : '';
+      ackHtml = `<span class="pill green">✅ Last Reload (${ack.matchedBy || 'ok'}${titleTag})</span>`;
+    } else {
+      ackHtml = `<span class="pill red">⚠️ Last Reload Failed: ${ack.reason || 'unknown'}</span>`;
+    }
+  }
+
+  return `
+    <span class="pill ${extPillCls}" style="font-weight:600">${extPillTxt}</span>
+    <span class="pill ${ipcCls}" style="font-weight:600">${ipcText}</span>
+    ${ackHtml}
+    <button type="button" class="btn xs primary" id="testSafariReloadBtn">🧪 Test Safari Reload</button>
+    <button type="button" class="btn xs" id="reqExtStatusBtn">🔄 Check Ext</button>
+    <span style="opacity:.78;min-width:0;flex-basis:100%">In iPad <code>Settings → Apps → Safari → Extensions → Newport Keep-Alive (Safari)</code> enable extension &amp; set Website Access to <strong>Allow</strong> on your Playtech/Newport site.</span>
+  `;
+}
+
+function wireSettingsExtDiagBtns(){
+  const testSafBtn = document.getElementById('testSafariReloadBtn');
+  if(testSafBtn){
+    testSafBtn.onclick = () => {
+      if(!_comp.ws || _comp.ws.readyState !== 1){
+        triggerAlert('disconnect', '⚠️ Companion Offline', 'Connect companion or toggle iPad Mode first.', { key: 'ext_test_off', cooldownMs: 4000 });
+        return;
+      }
+      sendKeepaliveAction('test_reload');
+    };
+  }
+  const reqExtBtn = document.getElementById('reqExtStatusBtn');
+  if(reqExtBtn){
+    reqExtBtn.onclick = () => {
+      if(_comp.ws && _comp.ws.readyState === 1) sendKeepaliveAction('request_ext_status');
+    };
+  }
+}
+
+function updateSettingsExtDiag(){
+  const row = document.getElementById('kaExtDiagRow');
+  if(!row) return false;
+  row.innerHTML = renderSettingsExtDiagHtml();
+  wireSettingsExtDiagBtns();
+  return true;
+}
+
 function renderSettings(){
   const el = document.getElementById('tab-settings');
   const c = cfg();
@@ -3774,6 +3969,13 @@ function renderSettings(){
         </label>
         <label class="field"><span>Daily Stop-Loss (${c.currency}, 0 = off)</span><input type="number" id="setSL" value="${c.stopLoss}" min="0"></label>
         <label class="field"><span>Daily Take-Profit (${c.currency}, 0 = off)</span><input type="number" id="setTP" value="${c.takeProfit}" min="0"></label>
+        <label class="field">
+          <span>Split-Screen UI Zoom</span>
+          <select id="setUiZoom">
+            <option value="auto" ${(c.uiZoom===null||c.uiZoom===undefined||c.uiZoom==='auto')?'selected':''}>Auto (75% Split Screen)</option>
+            ${UI_ZOOM_PRESETS.map(p => `<option value="${p}" ${Number(c.uiZoom)===p?'selected':''}>${p}%${p===75?' (Split Default)':p===100?' (Full Size)':''}</option>`).join('')}
+          </select>
+        </label>
       </div>
       <div class="row small" style="margin-top:12px;gap:16px">
         <label class="row" style="cursor:pointer;gap:6px">
@@ -3860,29 +4062,8 @@ function renderSettings(){
             <span>Reset keep-alive countdown to 0:00 whenever a real bet settles</span>
           </label>
         </div>
-        <div class="row small" style="margin-top:6px;gap:10px;flex-wrap:wrap;align-items:center">
-          ${_comp.ipadMode ? (() => {
-            const hi = _comp.hostInfo || {};
-            const tr = _comp.transport || 'idle';
-            const ipcCls = hi.broadcastExtPresent === false
-              ? 'red'
-              : (tr === 'appgroup' || tr === 'loopback' || tr === 'loopback_waiting' || hi.appGroupAvailable) ? 'green' : 'blue';
-            const ipcText = hi.broadcastExtPresent === false
-              ? '⚠️ BroadcastExtension Missing (Uncheck Sideloadly Remove extensions)'
-              : (tr === 'appgroup' || hi.appGroupAvailable)
-                ? '📡 Frame IPC: App Group Shared Memory'
-                : (tr === 'loopback' || tr === 'loopback_waiting')
-                  ? '📡 Frame IPC: Loopback TCP (127.0.0.1:8766) Active'
-                  : '📡 Frame IPC: Loopback TCP (127.0.0.1:8766) Ready';
-            return `
-              <span class="pill ${_comp.extConnected ? 'green' : 'amber'}" style="font-weight:600">${_comp.extConnected ? '🧩 Safari Keep-Alive Ext: Connected (tabs.reload)' : '🧩 Safari Keep-Alive Ext: Not Connected — Alert Fallback'}</span>
-              <span class="pill ${ipcCls}" style="font-weight:600">${ipcText}</span>
-              <span style="opacity:.78;min-width:0">Enable Safari extension in <code>Settings → Apps → Safari → Extensions → BJ Tracker</code> (allow on your Playtech site)</span>
-            `;
-          })() : `
-            <span class="pill ${_comp.extConnected ? 'green' : 'amber'}" style="font-weight:600">${_comp.extConnected ? '🧩 Brave Extension: Connected (Background Tab Reload)' : '🧩 Brave Extension: Not Connected — OS Fallback Active'}</span>
-            <span style="opacity:.78;min-width:0">In <code>brave://extensions</code> (Developer mode) → Load unpacked: <code>companion\\brave_keepalive_ext</code></span>
-          `}
+        <div class="row small" id="kaExtDiagRow" style="margin-top:6px;gap:8px;flex-wrap:wrap;align-items:center">
+          ${renderSettingsExtDiagHtml()}
         </div>
       </div>
       <div class="row" style="margin-top:14px">
@@ -3896,6 +4077,7 @@ function renderSettings(){
     </div>
   `;
 
+  wireSettingsExtDiagBtns();
   document.getElementById('testAlertBtn').onclick = () => {
     triggerAlert('wong', '🔔 Test Alert Active', 'Chimes, toast banner & voice check OK.', {
       force: true, speak: 'Alerts ready. Positive shoe'
@@ -3913,6 +4095,10 @@ function renderSettings(){
     c.stopLoss = Math.max(0, +document.getElementById('setSL').value || 0);
     c.takeProfit = Math.max(0, +document.getElementById('setTP').value || 0);
     c.tenLoseAll = document.getElementById('setTenRule').value === 'loseall';
+    const zoomSel = document.getElementById('setUiZoom');
+    if(zoomSel){
+      c.uiZoom = zoomSel.value === 'auto' ? null : Math.max(50, Math.min(110, Math.round(+zoomSel.value || 100)));
+    }
     c.useLearnedCut = document.getElementById('setLearnChk').checked;
     c.soundAlert = document.getElementById('setSoundChk').checked;
     c.alertVoice = document.getElementById('setVoiceChk').checked;
@@ -3938,7 +4124,7 @@ function renderSettings(){
     });
     draft.stake = c.unit;
     draft.manualBetOverride = false;
-    save(); render();
+    save(); applyUiZoom(); render();
   };
   document.getElementById('resetAllBtn').onclick = () => {
     if(!confirm('Delete ALL shoes, rounds and settings? Export a backup first if unsure. This cannot be undone.')) return;
@@ -3959,7 +4145,7 @@ function renderSettings(){
       if(!confirm(`Replace current data with this backup (${d.sessions.length} shoes)?`)) return;
       localStorage.setItem(KEY, JSON.stringify(d));
       S = load(); draft = freshDraft();
-      if(!active()) startNewSession(); else render();
+      if(!active()) startNewSession(); else { applyUiZoom(); render(); }
     }catch(err){ alert('That file is not a valid tracker backup.'); }
   };
 }
@@ -3967,7 +4153,8 @@ function renderSettings(){
 function syncStickyHeaderHeight(){
   const hdr = document.querySelector('header');
   if(!hdr) return;
-  const h = Math.ceil(hdr.getBoundingClientRect().height);
+  const z = (typeof resolveUiZoom === 'function') ? Math.max(0.4, resolveUiZoom().scale) : 1;
+  const h = Math.ceil(hdr.getBoundingClientRect().height / z);
   if(h > 0) document.documentElement.style.setProperty('--hdr-h', h + 'px');
 }
 
@@ -4240,11 +4427,18 @@ function handleCompanionMessage(msg){
     const prevMode = (_comp.keepalive || {}).mode;
     const prevEnabled = (_comp.keepalive || {}).enabled;
     if(msg.keepalive) _comp.keepalive = { ..._comp.keepalive, ...msg.keepalive };
+    if(msg.extStatus && typeof msg.extStatus === 'object') _comp.extDiag = { ...(_comp.extDiag || {}), ...msg.extStatus };
     const ev = msg.event || '';
     if(ev === 'refreshing'){
       const graceMs = Math.round(((msg.graceSec || 12) + 2) * 1000);
       _comp.keepaliveGraceUntil = Date.now() + graceMs;
       if(draft) draft.lastMsg = msg.message || `🔄 Keep-alive refreshing Newport left window (${msg.method || 'ext_reload'}) during break...`;
+    } else if(ev === 'test_reload_sent'){
+      if(draft){
+        draft.lastMsg = msg.method === 'safari_ext_queued'
+          ? '⏳ Test Safari reload queued (waiting up to 25s for Newport Keep-Alive extension wakeup)...'
+          : '🧪 Test Safari reload command sent to Newport Keep-Alive extension.';
+      }
     } else if(ev === 'recovered'){
       _comp.keepaliveGraceUntil = 0;
       if(draft) draft.lastMsg = msg.message || `✅ Newport session kept alive (${msg.reloadSec ?? '?'}s reload) — back at live table.`;
@@ -4274,8 +4468,9 @@ function handleCompanionMessage(msg){
     }
     const nextMode = (_comp.keepalive || {}).mode;
     const nextEnabled = (_comp.keepalive || {}).enabled;
+    if(tab === 'settings' && typeof updateSettingsExtDiag === 'function') updateSettingsExtDiag();
     if(prevMode !== nextMode || prevEnabled !== nextEnabled || !updateKeepaliveBadge()){
-      render();
+      if(tab !== 'settings') render();
     }
     return;
   }
@@ -4287,13 +4482,19 @@ function handleCompanionMessage(msg){
     const prevTransport = _comp.transport || 'idle';
     const prevAppGrp = !!(_comp.hostInfo && _comp.hostInfo.appGroupAvailable);
     const prevExtPres = _comp.hostInfo ? _comp.hostInfo.broadcastExtPresent : null;
+    const prevSafPres = _comp.hostInfo ? _comp.hostInfo.safariExtPresent : null;
     const prevRot = Number(_comp.frameRotation || 0);
     const prevFrameInfo = _comp.frameInfo || '';
-    const prevKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${prevKaMode}|${prevKaEnabled}|${prevExt}|${prevTransport}|${prevAppGrp}|${prevExtPres}|${prevRot}|${prevFrameInfo}`;
+    const edKeyStr = ed => ed ? `${ed.verifiedCount||0}:${ed.permissionOk??''}:${ed.tabCount||0}:${ed.matchedCount||0}:${ed.pendingQueued?1:0}:${((ed.lastAck||{}).ts)||0}` : '';
+    const prevEdKey = edKeyStr(_comp.extDiag);
+    const prevKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${prevKaMode}|${prevKaEnabled}|${prevExt}|${prevTransport}|${prevAppGrp}|${prevExtPres}|${prevSafPres}|${prevRot}|${prevFrameInfo}|${prevEdKey}`;
     _comp.windowFound = !!msg.windowFound;
     _comp.paused = !!msg.paused;
     _comp.state = msg.state || 'IDLE';
     _comp.extConnected = !!msg.extConnected;
+    if(msg.extStatus && typeof msg.extStatus === 'object'){
+      _comp.extDiag = { ...(_comp.extDiag || {}), ...msg.extStatus };
+    }
     if(typeof msg.transport === 'string') _comp.transport = msg.transport;
     if(typeof msg.frameRotation === 'number'){
       _comp.frameRotation = msg.frameRotation;
@@ -4331,9 +4532,17 @@ function handleCompanionMessage(msg){
     }
     const curAppGrp = !!(_comp.hostInfo && _comp.hostInfo.appGroupAvailable);
     const curExtPres = _comp.hostInfo ? _comp.hostInfo.broadcastExtPresent : null;
-    const nextKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${(_comp.keepalive || {}).mode}|${(_comp.keepalive || {}).enabled}|${!!_comp.extConnected}|${_comp.transport || 'idle'}|${curAppGrp}|${curExtPres}|${Number(_comp.frameRotation || 0)}|${_comp.frameInfo || ''}`;
-    if(prevKey !== nextKey) render();
-    else updateKeepaliveBadge();
+    const curSafPres = _comp.hostInfo ? _comp.hostInfo.safariExtPresent : null;
+    const curEdKey = edKeyStr(_comp.extDiag);
+    const nextKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${(_comp.keepalive || {}).mode}|${(_comp.keepalive || {}).enabled}|${!!_comp.extConnected}|${_comp.transport || 'idle'}|${curAppGrp}|${curExtPres}|${curSafPres}|${Number(_comp.frameRotation || 0)}|${_comp.frameInfo || ''}|${curEdKey}`;
+    if(prevKey !== nextKey){
+      if(tab === 'settings'){
+        if(typeof updateSettingsExtDiag === 'function') updateSettingsExtDiag();
+        updateKeepaliveBadge();
+      } else {
+        render();
+      }
+    } else updateKeepaliveBadge();
     return;
   }
   if(msg.type === 'phase'){
@@ -5228,8 +5437,14 @@ function connectCompanion(immediate = false){
 
 if(!active()) startNewSession();
 else { restoreDraft(); render(); }
-syncStickyHeaderHeight();
-window.addEventListener('resize', syncStickyHeaderHeight, { passive: true });
+applyUiZoom();
+const _zoomOutEl = document.getElementById('hdrZoomOutBtn');
+if(_zoomOutEl) _zoomOutEl.onclick = () => cycleUiZoom(-1);
+const _zoomLblEl = document.getElementById('hdrZoomLbl');
+if(_zoomLblEl) _zoomLblEl.onclick = () => setUiZoom(null);
+const _zoomInEl = document.getElementById('hdrZoomInBtn');
+if(_zoomInEl) _zoomInEl.onclick = () => cycleUiZoom(1);
+window.addEventListener('resize', applyUiZoom, { passive: true });
 if(typeof ResizeObserver !== 'undefined'){
   const _hdrEl = document.querySelector('header');
   if(_hdrEl) new ResizeObserver(syncStickyHeaderHeight).observe(_hdrEl);

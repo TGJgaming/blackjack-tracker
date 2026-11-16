@@ -233,7 +233,7 @@ private final class LoopbackFrameSender {
 
 /// Lightweight ReplayKit Broadcast Upload Extension (`RPBroadcastSampleHandler`).
 /// Strictly engineered to stay well below iPadOS's 50 MB extension limit:
-/// - Throttles capture to 6 FPS and skips duplicate static frames between 1.2s heartbeats
+/// - Throttles capture to 12 FPS and skips duplicate static frames between 0.45s heartbeats
 /// - Remaps `RPVideoSampleOrientationKey` to EXIF `CIImage.oriented(_:)` (swapping `.left` <-> `.right`) and normalizes extent origin
 /// - Downscales incoming `CMSampleBuffer` to <= 1280x960 using hardware CIContext
 /// - Writes RGBA bytes directly into `SharedFrameRing` (when App Group exists) OR
@@ -252,8 +252,8 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
     private var seq: UInt32 = 0
     private var frameCount: UInt64 = 0
     private var lastFrameTs: CFTimeInterval = 0
-    private let minFrameInterval: CFTimeInterval = 1.0 / 6.0
-    private let duplicateHeartbeatInterval: CFTimeInterval = 1.2
+    private let minFrameInterval: CFTimeInterval = 1.0 / 12.0
+    private let duplicateHeartbeatInterval: CFTimeInterval = 0.45
     private var hasSentFrame = false
     private var lastSentFrameHash: UInt64 = 0
     private var lastSentDims: (Int, Int) = (0, 0)
@@ -283,7 +283,7 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
     private static func computeStridedPixelHash(_ raw: UnsafeRawPointer, byteCount: Int) -> UInt64 {
         let pixelCount = byteCount / 4
         guard pixelCount > 0 else { return 0 }
-        let stride = max(1, pixelCount / 1024)
+        let stride = max(1, pixelCount / 8192)
         var h: UInt64 = 14695981039346656037
         var i = 0
         while i < pixelCount {

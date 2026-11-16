@@ -741,9 +741,84 @@
     return { w: rw, h: rh, data: out, maxVal, maxX, maxY };
   }
 
+  const _tplFftCache = new WeakMap();
+  const _tplFftLRU = [];
+  let _tplFftBytes = 0;
+  const _TPL_FFT_MAX_BYTES = 16 * 1024 * 1024;
+
+  function _evictTplFftIfNeeded(neededBytes) {
+    while (_tplFftLRU.length > 0 && _tplFftBytes + neededBytes > _TPL_FFT_MAX_BYTES) {
+      const oldest = _tplFftLRU.shift();
+      if (!oldest) break;
+      if (oldest.map.delete(oldest.key)) {
+        _tplFftBytes = Math.max(0, _tplFftBytes - oldest.bytes);
+      }
+    }
+  }
+
+  function _computeTplFftSpec(tZero, tw, th, prep, outRe, outIm) {
+    const { Fx, Fy, halfX, specStride, planX, planY, rowRe, rowIm, colRe, colIm } = prep;
+    outRe.fill(0);
+    outIm.fill(0);
+    for (let ty = 0; ty < th; ty += 2) {
+      rowRe.fill(0);
+      rowIm.fill(0);
+      const tOff0 = ty * tw;
+      for (let tx = 0; tx < tw; tx++) rowRe[tx] = tZero[tOff0 + tx];
+      if (ty + 1 < th) {
+        const tOff1 = (ty + 1) * tw;
+        for (let tx = 0; tx < tw; tx++) rowIm[tx] = tZero[tOff1 + tx];
+        rfft2RowsForward(rowRe, rowIm, planX, outRe, outIm, ty * specStride, (ty + 1) * specStride, halfX);
+      } else {
+        fft1d(rowRe, rowIm, planX, false);
+        outRe.set(rowRe.subarray(0, halfX), ty * specStride);
+        outIm.set(rowIm.subarray(0, halfX), ty * specStride);
+      }
+    }
+    for (let x = 0; x < halfX; x++) {
+      for (let y = 0; y < Fy; y++) {
+        colRe[y] = outRe[y * specStride + x];
+        colIm[y] = outIm[y * specStride + x];
+      }
+      fft1d(colRe, colIm, planY, false);
+      for (let y = 0; y < Fy; y++) {
+        outRe[y * specStride + x] = colRe[y];
+        outIm[y * specStride + x] = colIm[y];
+      }
+    }
+  }
+
+  function getOrBuildTplFftSpec(tZero, tw, th, prep) {
+    const { Fx, Fy, halfX, specStride } = prep;
+    const specSize = specStride * Fy;
+    const specBytes = specSize * 16;
+    if (!tZero || typeof tZero !== "object" || specBytes > (_TPL_FFT_MAX_BYTES >> 1)) {
+      _computeTplFftSpec(tZero, tw, th, prep, prep.tplRe, prep.tplIm);
+      return { re: prep.tplRe, im: prep.tplIm };
+    }
+    const key = `${Fx}x${Fy}|${tw}x${th}`;
+    let map = _tplFftCache.get(tZero);
+    if (map) {
+      const hit = map.get(key);
+      if (hit) return hit;
+    } else {
+      map = new Map();
+      _tplFftCache.set(tZero, map);
+    }
+    _evictTplFftIfNeeded(specBytes);
+    const re = new Float64Array(specSize);
+    const im = new Float64Array(specSize);
+    _computeTplFftSpec(tZero, tw, th, prep, re, im);
+    const entry = { re, im };
+    map.set(key, entry);
+    _tplFftLRU.push({ map, key, bytes: specBytes });
+    _tplFftBytes += specBytes;
+    return entry;
+  }
+
   function matchFFTPacked(prep, tplGray, tZero, tNorm) {
     ensureSourceFft(prep);
-    const { sw, sh, iw, sumS, sumSqS, Fx, Fy, halfX, specStride, planX, planY, srcRe, srcIm, tplRe, tplIm, rowRe, rowIm, colRe, colIm } = prep;
+    const { sw, sh, iw, sumS, sumSqS, Fx, Fy, halfX, specStride, planX, planY, srcRe, srcIm, tplRe, tplIm, rowRe, rowIm, colRe } = prep;
     const tw = tplGray.w, th = tplGray.h;
     const rw = sw - tw + 1;
     const rh = sh - th + 1;
@@ -756,32 +831,13 @@
       return { w: rw, h: rh, data: out, maxVal: 0, maxX: 0, maxY: 0 };
     }
 
-    tplRe.fill(0);
-    tplIm.fill(0);
-    for (let ty = 0; ty < th; ty += 2) {
-      rowRe.fill(0);
-      rowIm.fill(0);
-      const tOff0 = ty * tw;
-      for (let tx = 0; tx < tw; tx++) rowRe[tx] = tZero[tOff0 + tx];
-      if (ty + 1 < th) {
-        const tOff1 = (ty + 1) * tw;
-        for (let tx = 0; tx < tw; tx++) rowIm[tx] = tZero[tOff1 + tx];
-        rfft2RowsForward(rowRe, rowIm, planX, tplRe, tplIm, ty * specStride, (ty + 1) * specStride, halfX);
-      } else {
-        fft1d(rowRe, rowIm, planX, false);
-        tplRe.set(rowRe.subarray(0, halfX), ty * specStride);
-        tplIm.set(rowIm.subarray(0, halfX), ty * specStride);
-      }
-    }
+    const spec = getOrBuildTplFftSpec(tZero, tw, th, prep);
+    const specRe = spec.re, specIm = spec.im;
+    const colIm = prep.colIm;
     for (let x = 0; x < halfX; x++) {
       for (let y = 0; y < Fy; y++) {
-        colRe[y] = tplRe[y * specStride + x];
-        colIm[y] = tplIm[y * specStride + x];
-      }
-      fft1d(colRe, colIm, planY, false);
-      for (let y = 0; y < Fy; y++) {
         const idx = y * specStride + x;
-        const sr = srcRe[idx], si = srcIm[idx], tr = colRe[y], ti = colIm[y];
+        const sr = srcRe[idx], si = srcIm[idx], tr = specRe[idx], ti = specIm[idx];
         colRe[y] = sr * tr + si * ti;
         colIm[y] = si * tr - sr * ti;
       }
@@ -1636,7 +1692,7 @@
 
   function computeRoiSignature(img, gridW, gridH, useMinGray = false) {
     if (!img || img.w === 0 || img.h === 0) {
-      return { w: 0, h: 0, gw: 0, gh: 0, bins: new Uint8Array(0) };
+      return { w: 0, h: 0, gw: 0, gh: 0, bins: new Uint8Array(0), brightCnt: 0, darkCnt: 0, pxCnt: 0 };
     }
     const w = img.w, h = img.h, c = img.c, src = img.data;
     const gw = Math.max(1, Math.min(gridW, w));
@@ -1644,6 +1700,9 @@
     const nBins = gw * gh;
     const sums = new Int32Array(nBins);
     const cnts = new Int32Array(nBins);
+    let brightCnt = 0;
+    let darkCnt = 0;
+    let pxCnt = 0;
     const step = (w * h > 65000) ? 2 : 1;
     for (let y = 0; y < h; y += step) {
       const gy = Math.min(gh - 1, ((y * gh) / h) | 0);
@@ -1651,9 +1710,13 @@
       const pxRow = y * w;
       if (c === 1) {
         for (let x = 0; x < w; x += step) {
+          const v = src[pxRow + x];
+          if (v > 155) brightCnt++;
+          else if (v < 90) darkCnt++;
+          pxCnt++;
           const gx = Math.min(gw - 1, ((x * gw) / w) | 0);
           const bIdx = binRow + gx;
-          sums[bIdx] += src[pxRow + x];
+          sums[bIdx] += v;
           cnts[bIdx]++;
         }
       } else if (useMinGray) {
@@ -1661,6 +1724,9 @@
           const p = (pxRow + x) * 3;
           const b = src[p], g = src[p + 1], r = src[p + 2];
           const v = b < g ? (b < r ? b : r) : (g < r ? g : r);
+          if (v > 155) brightCnt++;
+          else if (v < 90) darkCnt++;
+          pxCnt++;
           const gx = Math.min(gw - 1, ((x * gw) / w) | 0);
           const bIdx = binRow + gx;
           sums[bIdx] += v;
@@ -1670,6 +1736,9 @@
         for (let x = 0; x < w; x += step) {
           const p = (pxRow + x) * 3;
           const v = (29 * src[p] + 150 * src[p + 1] + 77 * src[p + 2] + 128) >> 8;
+          if (v > 155) brightCnt++;
+          else if (v < 90) darkCnt++;
+          pxCnt++;
           const gx = Math.min(gw - 1, ((x * gw) / w) | 0);
           const bIdx = binRow + gx;
           sums[bIdx] += v;
@@ -1681,7 +1750,7 @@
     for (let i = 0; i < nBins; i++) {
       bins[i] = cnts[i] > 0 ? Math.round(sums[i] / cnts[i]) : 0;
     }
-    return { w, h, gw, gh, bins };
+    return { w, h, gw, gh, bins, brightCnt, darkCnt, pxCnt };
   }
 
   function roiSigDiff(sigA, sigB) {
@@ -1697,6 +1766,23 @@
       if (ad > maxD) maxD = ad;
     }
     return maxD;
+  }
+
+  function hudRoiSigChanged(sigA, sigB, tol = 2) {
+    if (!sigA || !sigB) return true;
+    if (sigA.w !== sigB.w || sigA.h !== sigB.h || sigA.gw !== sigB.gw || sigA.gh !== sigB.gh) {
+      return true;
+    }
+    if (sigA.pxCnt !== sigB.pxCnt) return true;
+    const minPixShift = Math.max(2, Math.round((sigA.pxCnt || 0) * 0.0008));
+    if (Math.abs((sigA.brightCnt || 0) - (sigB.brightCnt || 0)) >= minPixShift) return true;
+    if (Math.abs((sigA.darkCnt || 0) - (sigB.darkCnt || 0)) >= minPixShift) return true;
+    const a = sigA.bins, b = sigB.bins, n = a.length;
+    for (let i = 0; i < n; i++) {
+      const d = a[i] - b[i];
+      if ((d < 0 ? -d : d) > tol) return true;
+    }
+    return false;
   }
 
   class PlaytechDetector {
@@ -1724,6 +1810,7 @@
       this._cachedShuf = ["", 0.0];
       this._shufSigAge = 0;
       this._lastShuffleScanTs = null;
+      this._lastShuffleFullScanTs = null;
       this._lastPbSig = null;
       this._cachedPb = 0.0;
       this._pbSigAge = 0;
@@ -1933,12 +2020,14 @@
     processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, ts = null }) {
       const now = ts !== null ? ts : performance.now() / 1000;
       const REFRESH_PERIOD = 8;
+      const HUD_REFRESH_PERIOD = 4;
       const SIG_TOL = 4;
 
-      const pSig = computeRoiSignature(playerImg, 48, 24, true);
+      const pSig = computeRoiSignature(playerImg, 96, 32, true);
+      const pChanged = hudRoiSigChanged(pSig, this._lastPSig, 2);
       const pDiff = roiSigDiff(pSig, this._lastPSig);
       let pCards, pHands, splitDetected;
-      if (this._lastPSig && (pDiff === 0 || (pDiff <= SIG_TOL && this._pSigAge < REFRESH_PERIOD))) {
+      if (this._lastPSig && !pChanged && (pDiff === 0 || this._pSigAge < HUD_REFRESH_PERIOD)) {
         [pCards, pHands, splitDetected] = this._cachedP;
         if (pDiff > 0) this._pSigAge++;
       } else {
@@ -1948,10 +2037,11 @@
         this._cachedP = [pCards, pHands, splitDetected];
       }
 
-      const dSig = computeRoiSignature(dealerImg, 40, 24, true);
+      const dSig = computeRoiSignature(dealerImg, 80, 36, true);
+      const dChanged = hudRoiSigChanged(dSig, this._lastDSig, 1);
       const dDiff = roiSigDiff(dSig, this._lastDSig);
       let dCards;
-      if (this._lastDSig && (dDiff === 0 || (dDiff <= SIG_TOL && this._dSigAge < REFRESH_PERIOD))) {
+      if (this._lastDSig && !dChanged && (dDiff === 0 || this._dSigAge < HUD_REFRESH_PERIOD)) {
         dCards = this._cachedD;
         if (dDiff > 0) this._dSigAge++;
       } else {
@@ -2002,13 +2092,23 @@
           const shufDiff = roiSigDiff(shufSig, this._lastShuffleSig);
           const modeSame = this._lastShufMode === shufMode;
           this._lastShuffleScanTs = now;
-          if (this._lastShuffleSig && modeSame && (shufDiff === 0 || (shufDiff <= SIG_TOL && this._shufSigAge < REFRESH_PERIOD))) {
+          const needFullFallback = !cardsPresent && (this._lastShuffleFullScanTs === null || (now - this._lastShuffleFullScanTs) >= 0.85);
+          if (this._lastShuffleSig && modeSame && !needFullFallback && (shufDiff === 0 || (shufDiff <= SIG_TOL && this._shufSigAge < REFRESH_PERIOD))) {
             if (shufDiff > 0) this._shufSigAge++;
           } else {
             this._lastShuffleSig = shufSig;
             this._lastShufMode = shufMode;
             this._shufSigAge = 0;
-            const shufTpls = cardsPresent ? bannerTpls.filter((t) => t.rank === "SHUFFLE" || t.rank === "WAIT") : bannerTpls;
+            const shufPriorityTpls = bannerTpls.filter((t) => t.rank === "SHUFFLE" || t.rank === "WAIT");
+            let shufTpls;
+            if (cardsPresent) {
+              shufTpls = shufPriorityTpls;
+            } else if (needFullFallback || !shufPriorityTpls.length) {
+              shufTpls = bannerTpls;
+              this._lastShuffleFullScanTs = now;
+            } else {
+              shufTpls = shufPriorityTpls;
+            }
             const [btpl, bconf] = shufTpls.length
               ? this._detectBannerWithHint(shuffleImg, shufTpls, this.cfg.min_banner_confidence, TOP_BANNER_SCALES, "shuffle")
               : [null, 0.0];
@@ -2121,21 +2221,28 @@
       this._candDets = [];
       this._candCount = 0;
       this._emptyCount = 0;
+      this._wipeDets = [];
       this._slotCands = new Map();
+      this._pendingTail = new Map();
       this.committedRanks = [];
     }
 
-    reanchor(ranks) {
+    reanchor(ranks, candRanks = null, candCount = null) {
       this.committedRanks = ranks.slice();
-      this._candRanks = ranks.join(",");
+      this._candRanks = candRanks ? (Array.isArray(candRanks) ? candRanks.join(",") : String(candRanks)) : ranks.join(",");
       this._candDets = [];
-      this._candCount = this.confirmFrames;
+      this._candCount = candCount === null || candCount === undefined ? this.confirmFrames : Math.max(0, Number(candCount) || 0);
       this._emptyCount = 0;
+      this._wipeDets = [];
       this._slotCands.clear();
+      this._pendingTail.clear();
     }
 
     update(detections) {
       if (!detections || !detections.length) {
+        if (this._emptyCount === 0 && this._candDets.length && this.committedRanks.length && this._candDets.length >= this.committedRanks.length) {
+          this._wipeDets = this._candDets.slice();
+        }
         this._emptyCount++;
         this._candRanks = "";
         this._candDets = [];
@@ -2153,7 +2260,25 @@
         this._candDets = detections.slice();
         this._candCount = 1;
       }
+      if (this.fastTailConfirm && this.committedRanks.length && detections.length >= this.committedRanks.length) {
+        let prefixOkWipe = true;
+        for (let k = 0; k < this.committedRanks.length; k++) {
+          if (this.committedRanks[k] !== "BACK" && detections[k].rank !== this.committedRanks[k]) {
+            prefixOkWipe = false;
+            break;
+          }
+        }
+        if (prefixOkWipe) {
+          this._wipeDets = detections.slice();
+        }
+      }
 
+      let maxPendingSlot = -1;
+      for (const k of this._pendingTail.keys()) {
+        if (k > maxPendingSlot) maxPendingSlot = k;
+      }
+      const maxTracked = Math.max(this.committedRanks.length, maxPendingSlot + 1);
+      const partialWipe = !!(this.fastTailConfirm && this.committedRanks.length && detections.length < maxTracked);
       const committedWipe = detections.length < this.committedRanks.length;
       let prefixOk = !committedWipe;
       for (let k = 0; k < this.committedRanks.length && prefixOk; k++) {
@@ -2186,9 +2311,31 @@
         }
         if (rKey === this._candRanks && this._candCount > cnt) cnt = this._candCount;
         this._slotCands.set(idx, { rank: det.rank, cnt, det });
+        if (this.fastTailConfirm && this.committedRanks.length) {
+          this._pendingTail.set(idx, { det, missed: 0 });
+        }
       }
-      for (const idx of Array.from(this._slotCands.keys())) {
-        if (!seenSlots.has(idx)) this._slotCands.delete(idx);
+
+      if (!partialWipe) {
+        for (const idx of Array.from(this._slotCands.keys())) {
+          if (!seenSlots.has(idx)) this._slotCands.delete(idx);
+        }
+        if (this.fastTailConfirm && this.committedRanks.length) {
+          for (const [idx, entry] of Array.from(this._pendingTail.entries())) {
+            if (!seenSlots.has(idx)) {
+              if (entry.missed + 1 >= 4) this._pendingTail.delete(idx);
+              else this._pendingTail.set(idx, { det: entry.det, missed: entry.missed + 1 });
+            }
+          }
+        }
+      } else if (!committedWipe) {
+        // Trailing uncommitted card faded early before committed prefix: keep in _pendingTail for wipe rescue
+        for (const [idx, entry] of Array.from(this._pendingTail.entries())) {
+          if (!seenSlots.has(idx)) {
+            if (entry.missed + 1 >= 5) this._pendingTail.delete(idx);
+            else this._pendingTail.set(idx, { det: entry.det, missed: entry.missed + 1 });
+          }
+        }
       }
       if (committedWipe) return [[], false];
 
@@ -2202,6 +2349,7 @@
             this.committedRanks[idx] = rank;
             emitted.push([idx, det]);
             this._slotCands.delete(idx);
+            this._pendingTail.delete(idx);
           }
         }
       }
@@ -2220,8 +2368,54 @@
         this.committedRanks.push(rank);
         emitted.push([idx, det]);
         this._slotCands.delete(idx);
+        this._pendingTail.delete(idx);
       }
+      if (emitted.length) this._wipeDets = [];
       return [emitted, false];
+    }
+
+    flushPendingOnWipe(minConf = 0.80) {
+      if (!this.committedRanks.length) return [];
+      const merged = new Map();
+      for (const [idx, entry] of this._pendingTail.entries()) {
+        if (entry.missed <= 4) merged.set(idx, entry.det);
+      }
+      const fallbackSeq = this._candDets.length >= this.committedRanks.length ? this._candDets : this._wipeDets;
+      for (let idx = 0; idx < fallbackSeq.length; idx++) {
+        if (!merged.has(idx)) merged.set(idx, fallbackSeq[idx]);
+      }
+
+      const canRescue = (idx, det) => {
+        if (!det || det.rank === "BACK") return false;
+        if (det.conf >= minConf) return true;
+        const cand = this._slotCands.get(idx);
+        return !!(cand && cand.rank === det.rank && cand.cnt >= 2 && det.conf >= 0.78);
+      };
+
+      const emitted = [];
+      for (let idx = 0; idx < this.committedRanks.length; idx++) {
+        if (this.committedRanks[idx] === "BACK" && merged.has(idx)) {
+          const det = merged.get(idx);
+          if (canRescue(idx, det)) {
+            this.committedRanks[idx] = det.rank;
+            emitted.push([idx, det]);
+          }
+        }
+      }
+      if (!this.committedRanks.includes("BACK")) {
+        while (true) {
+          const idx = this.committedRanks.length;
+          const det = merged.get(idx);
+          if (!det || !canRescue(idx, det)) break;
+          this.committedRanks.push(det.rank);
+          emitted.push([idx, det]);
+        }
+      }
+
+      this._wipeDets = [];
+      this._pendingTail.clear();
+      this._slotCands.clear();
+      return emitted;
     }
   }
 
@@ -2242,6 +2436,8 @@
       this._pendingAutoWatch = null;
       this._lastBannerEmitted = "";
       this._sawClearSinceRoundOver = true;
+      this._shuffleSince = null;
+      this._shuffleEmitted = false;
       this._resetRoundAccumulators();
     }
 
@@ -2259,8 +2455,10 @@
       this._lastBetBanner = "";
       this._seenWaitInRound = false;
       this._waitAbsentFrames = 0;
+      this._waitMissingWithCardsSince = null;
       this._blankCardFrames = 0;
       this._sawEmptyHudInBetting = false;
+      this._predealObs = null;
     }
 
     resyncRound(clearPending = true) {
@@ -2269,6 +2467,20 @@
       this._lastBannerEmitted = "";
       this._sawClearSinceRoundOver = true;
       this.state = "IDLE";
+    }
+
+    _seedPredealObs(predeal) {
+      if (this.cfg.confirm_frames < 2 || !predeal) return;
+      const pHands = (predeal.player_hands && Object.keys(predeal.player_hands).length)
+        ? predeal.player_hands
+        : (predeal.player_cards && predeal.player_cards.length ? { 0: predeal.player_cards } : {});
+      const pKeys = Object.keys(pHands);
+      if (pKeys.length === 1 && pHands[0] && pHands[0].length && this.pDebouncers[0]) {
+        this.pDebouncers[0].update(pHands[0]);
+      }
+      if (predeal.dealer_cards && predeal.dealer_cards.length) {
+        this.dDebouncer.update(predeal.dealer_cards);
+      }
     }
 
     setSyncState(msg) {
@@ -2322,17 +2534,72 @@
       }
     }
 
-    _finalizeClearedRound() {
+    _emitDealerCards(pairs, events) {
+      let dealerFlippedOrDrew = false;
+      for (const [slotIdx, det] of pairs) {
+        if (det.val === null || det.val === undefined) continue;
+        this._beginRoundIfIdle(events);
+        this._emittedD++;
+        if (slotIdx >= 1) {
+          dealerFlippedOrDrew = true;
+          this.state = "DEALER_TURN";
+        }
+        if (det.conf < this.cfg.min_auto_confidence) {
+          this._uncertaintyFlags.push(`D${slotIdx + 1}:${det.rank}@${det.conf.toFixed(2)}`);
+        }
+        const evtD = {
+          type: "card",
+          target: "D",
+          val: det.val,
+          slot: slotIdx,
+          rankLabel: det.rank,
+          conf: Number(det.conf.toFixed(3)),
+          source: "hud",
+          roundId: this.round_id,
+        };
+        if (det.suit) evtD.suit = det.suit;
+        events.push(evtD);
+      }
+      return dealerFlippedOrDrew;
+    }
+
+    _finalizeClearedRound(now = Date.now() / 1000) {
       const events = [];
+      const rescuedD = this.dDebouncer.flushPendingOnWipe(Math.max(0.78, this.cfg.min_hud_confidence - 0.06));
+      if (rescuedD.length) {
+        this._emitDealerCards(rescuedD, events);
+      }
       const totalEmitted = this._emittedP + this._emittedD + this._emittedB;
       if (totalEmitted === 0) {
         this.resyncRound(false);
         return events;
       }
+
+      const pHandsRanks = Object.values(this.pDebouncers)
+        .map((db) => db.committedRanks.filter((r) => r !== "BACK"))
+        .filter((hr) => hr.length > 0);
+      const anyPlayerAlive = pHandsRanks.length ? pHandsRanks.some((hr) => !evalBjRanks(hr)[2]) : true;
+      const allPlayersNaturalBJ =
+        pHandsRanks.length > 0 &&
+        pHandsRanks.every((hr) => hr.length === 2 && evalBjRanks(hr)[0] === 21);
+
       const dCommitted = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
       const [dTotal] = evalBjRanks(dCommitted);
+      const hasUnrevealedBack = this.dDebouncer.committedRanks.includes("BACK");
       const flags = this._uncertaintyFlags.slice();
       if (this._emittedP < 2 || this._emittedD < 1) flags.push("HUD_GLITCH");
+
+      const dealerIncomplete =
+        this._emittedP >= 2 &&
+        anyPlayerAlive &&
+        (
+          (dCommitted.length >= 2 && dTotal < 17) ||
+          (hasUnrevealedBack && dCommitted.length >= 1) ||
+          (dCommitted.length === 1 && !allPlayersNaturalBJ)
+        );
+      if (dealerIncomplete && !flags.includes("HUD_GLITCH") && !flags.includes("DEALER_INCOMPLETE")) {
+        flags.push("DEALER_INCOMPLETE");
+      }
 
       const canAutoWatch =
         this.sync_play_mode === "watch" &&
@@ -2357,14 +2624,17 @@
           ? "BET_MODE"
           : flags.includes("HUD_GLITCH")
           ? "HUD_GLITCH"
+          : flags.includes("DEALER_INCOMPLETE")
+          ? "DEALER_INCOMPLETE"
           : "UNCERTAIN_READ";
+        const suggestedFocus = flags.includes("DEALER_INCOMPLETE") ? "D" : "P";
         events.push({
           type: "prompt_confirm",
           roundId: this.round_id,
           reason,
           unreadCommunity: 0,
           uncertainSlots: flags,
-          suggestedFocus: "P",
+          suggestedFocus,
           dealerTotal: dTotal,
           feltSightings: [],
         });
@@ -2376,33 +2646,62 @@
     step(obs) {
       if (this.paused) return [];
       const events = [];
+      const now = typeof obs.ts === "number" && Number.isFinite(obs.ts) ? obs.ts : Date.now() / 1000;
+      const hudRefreshed = obs.hud_refreshed !== false;
+
+      if (obs.shuffle_active) {
+        if (this._shuffleSince === null) {
+          this._shuffleSince = now;
+        } else if ((now - this._shuffleSince) >= this.cfg.shuffle_hold_sec && !this._shuffleEmitted) {
+          this._flushPendingAutoWatch(events);
+          const hasPendingBet = !["IDLE", "BETTING"].includes(this.state) && (this.sync_play_mode === "bet" || this._splitDetected);
+          this.sync_track_felt = false;
+          this.resyncRound();
+          this.state = "SHUFFLING";
+          this._shuffleEmitted = true;
+          events.push({ type: "new_shoe", reason: "cut", hasPendingBet });
+        }
+        return events;
+      }
+      this._shuffleSince = null;
+      if (this.state === "SHUFFLING") this.state = "IDLE";
+      this._shuffleEmitted = false;
+
       const banner = obs.banner_state || "";
       const hasCards = this._emittedP > 0 || this._emittedD > 0;
-      const hasObsCards = (obs.player_cards && obs.player_cards.length > 0) || (obs.dealer_cards && obs.dealer_cards.length > 0);
+      const hasObsCards = (obs.player_cards && obs.player_cards.length > 0) || (obs.dealer_cards && obs.dealer_cards.length > 0) || (obs.player_hands && Object.keys(obs.player_hands).length > 0);
       const activeRound = ["DEALING", "PLAYER_TURN", "DEALER_TURN"].includes(this.state);
 
       if (["PLACE_BETS", "LAST_BETS", "NO_MORE_BETS"].includes(banner)) {
         if (activeRound && hasCards) {
-          events.push(...this._finalizeClearedRound());
+          events.push(...this._finalizeClearedRound(now));
         }
         if (banner === "NO_MORE_BETS") {
           this._flushPendingAutoWatch(events);
         }
+        const wasEmptyInBetting = this._sawEmptyHudInBetting || !hasObsCards;
         this.state = "BETTING";
         this._sawClearSinceRoundOver = true;
         this._emitBannerPhaseIfChanged(banner, obs.banner_conf || 0.9, events);
         this._resetRoundAccumulators();
         this._lastBetBanner = banner;
+        this._sawEmptyHudInBetting = wasEmptyInBetting;
+        if (banner === "NO_MORE_BETS" && wasEmptyInBetting && hasObsCards) {
+          this._predealObs = obs;
+        }
         return events;
       }
 
       if (banner === "WAIT") {
         this._waitAbsentFrames = 0;
+        this._waitMissingWithCardsSince = null;
         this._blankCardFrames = 0;
         this._sawClearSinceRoundOver = true;
         if (["IDLE", "BETTING", "ROUND_OVER"].includes(this.state)) {
+          const predeal = this._sawEmptyHudInBetting ? this._predealObs : null;
           this._flushPendingAutoWatch(events);
           this._startNewRound();
+          if (predeal) this._seedPredealObs(predeal);
         }
         this._seenWaitInRound = true;
         this._emitBannerPhaseIfChanged("WAIT", obs.banner_conf || 0.9, events);
@@ -2410,40 +2709,86 @@
         if (!hasObsCards) {
           this._sawClearSinceRoundOver = true;
           this._blankCardFrames = 0;
-        }
-        if (activeRound && this._seenWaitInRound && !hasObsCards) {
-          this._waitAbsentFrames++;
-          if (hasCards && this._waitAbsentFrames >= Math.max(2, this.cfg.clear_frames)) {
-            events.push(...this._finalizeClearedRound());
-            this.state = "ROUND_OVER";
-            this._sawClearSinceRoundOver = false;
-            return events;
+          if (this.state === "BETTING") {
+            this._sawEmptyHudInBetting = true;
+            this._predealObs = null;
           }
         }
-        const waitRequired = this.cfg.require_wait_banner && this.sync_play_mode === "watch";
-        if (waitRequired && !activeRound) {
-          if (hasObsCards && this._sawClearSinceRoundOver) {
-            this._blankCardFrames++;
-            if (this._blankCardFrames >= 2) {
-              this._flushPendingAutoWatch(events);
-              this._startNewRound();
-              this._emitBannerPhaseIfChanged("DEALING", 1.0, events);
-            } else {
+        if (!banner && activeRound) {
+          this._lastBannerEmitted = "";
+        }
+        if (activeRound && this._seenWaitInRound) {
+          if (hasObsCards) {
+            // Cards still visible on HUD (WAIT faded early before final dealer cards): keep debouncers active!
+            this._waitAbsentFrames = 0;
+            if (this._waitMissingWithCardsSince === null) {
+              this._waitMissingWithCardsSince = now;
+            } else if (hasCards && (now - this._waitMissingWithCardsSince) >= 3.0) {
+              events.push(...this._finalizeClearedRound(now));
+              this.state = "ROUND_OVER";
+              this._sawClearSinceRoundOver = false;
               return events;
             }
           } else {
-            return events;
+            this._waitMissingWithCardsSince = null;
+            if (hudRefreshed) this._waitAbsentFrames++;
+            if (hasCards && this._waitAbsentFrames >= Math.max(2, this.cfg.clear_frames)) {
+              events.push(...this._finalizeClearedRound(now));
+              this.state = "ROUND_OVER";
+              this._sawClearSinceRoundOver = false;
+              return events;
+            }
           }
-        } else if (!waitRequired && this.state === "BETTING") {
+        }
+        const waitRequired = this.cfg.require_wait_banner && this.sync_play_mode === "watch";
+        if (waitRequired) {
+          if (activeRound) {
+            if (this._seenWaitInRound && !hasObsCards) {
+              if (hasCards) {
+                // Speed up end-of-round auto-log if both WAIT banner and cards are gone
+                this._waitAbsentFrames = Math.max(this._waitAbsentFrames, this.cfg.clear_frames - 1);
+              }
+              return events;
+            }
+          } else {
+            if (hasObsCards && this._sawClearSinceRoundOver) {
+              if (hudRefreshed) {
+                this._blankCardFrames++;
+                if (this._blankCardFrames === 1) this._predealObs = obs;
+              }
+              if (this._blankCardFrames >= 2) {
+                const predeal = this._predealObs;
+                this._flushPendingAutoWatch(events);
+                this._startNewRound();
+                this._emitBannerPhaseIfChanged("DEALING", 1.0, events);
+                if (predeal) this._seedPredealObs(predeal);
+              } else {
+                return events;
+              }
+            } else {
+              if (this.state === "BETTING") {
+                const lastBet = this._lastBetBanner;
+                this._resetRoundAccumulators();
+                this._lastBetBanner = lastBet;
+                this._sawEmptyHudInBetting = true;
+              }
+              return events;
+            }
+          }
+        } else if (this.state === "BETTING") {
           if ((!banner && this._lastBetBanner === "NO_MORE_BETS") || hasObsCards) {
+            const predeal = this._sawEmptyHudInBetting ? this._predealObs : null;
             this._flushPendingAutoWatch(events);
             this._startNewRound();
             this._emitBannerPhaseIfChanged("DEALING", 1.0, events);
+            if (predeal) this._seedPredealObs(predeal);
           } else {
             return events;
           }
         }
       }
+
+      if (!hudRefreshed) return events;
 
       if (obs.split_detected && !this._splitDetected) {
         this._splitDetected = true;
@@ -2473,7 +2818,7 @@
       const handIndices = Array.from(new Set([...Object.keys(this.pDebouncers), ...Object.keys(handsInput)])).map(Number).sort((a, b) => a - b);
       for (const hIdx of handIndices) {
         if (!this.pDebouncers[hIdx]) {
-          this.pDebouncers[hIdx] = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames);
+          this.pDebouncers[hIdx] = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
         }
         const [newCards, hCleared] = this.pDebouncers[hIdx].update(handsInput[hIdx] || []);
         if (!hCleared) pCleared = false;
@@ -2481,6 +2826,9 @@
           if (det.val === null || det.val === undefined) continue;
           this._beginRoundIfIdle(events);
           this._emittedP++;
+          if (det.conf < this.cfg.min_auto_confidence) {
+            this._uncertaintyFlags.push(`P${hIdx}:${slotIdx + 1}:${det.rank}@${det.conf.toFixed(2)}`);
+          }
           const evt = {
             type: "card",
             target: "P",
@@ -2498,30 +2846,13 @@
       }
 
       const [newD, dCleared] = this.dDebouncer.update(obs.dealer_cards || []);
-      for (const [slotIdx, det] of newD) {
-        if (det.val === null || det.val === undefined) continue;
-        this._beginRoundIfIdle(events);
-        this._emittedD++;
-        if (slotIdx >= 1) this.state = "DEALER_TURN";
-        const evtD = {
-          type: "card",
-          target: "D",
-          val: det.val,
-          slot: slotIdx,
-          rankLabel: det.rank,
-          conf: Number(det.conf.toFixed(3)),
-          source: "hud",
-          roundId: this.round_id,
-        };
-        if (det.suit) evtD.suit = det.suit;
-        events.push(evtD);
-      }
+      this._emitDealerCards(newD, events);
 
       if (this.state === "DEALING" && this.dDebouncer.committedRanks.length >= 1 && this._emittedP >= 1) {
         this.state = "PLAYER_TURN";
       }
       if (!["IDLE", "BETTING", "ROUND_OVER"].includes(this.state) && pCleared && dCleared) {
-        events.push(...this._finalizeClearedRound());
+        events.push(...this._finalizeClearedRound(now));
       }
       return events;
     }
@@ -2939,6 +3270,7 @@
       this._didNotifyNativeReady = false;
       this._consecutiveXhrErrors = 0;
       this.extConnected = false;
+      this.extDiag = null;
       this._loopTimer = null;
       this._busy = false;
 
@@ -2949,6 +3281,15 @@
         globalThis.__ipadCompanionSetExtConnected = (connected) => {
           this.extConnected = !!connected;
           this.broadcast(this.buildStatusPayload());
+        };
+        globalThis.__ipadCompanionSetExtStatus = (st) => {
+          if (st && typeof st === "object") {
+            this.extDiag = Object.assign({}, this.extDiag || {}, st);
+            if (typeof st.connected === "boolean") {
+              this.extConnected = st.connected;
+            }
+            this.broadcast(this.buildStatusPayload());
+          }
         };
         globalThis.__ipadCompanionSetHostInfo = (info) => {
           if (info && typeof info === "object") {
@@ -3026,7 +3367,8 @@
         }
       };
 
-      const intervalMs = Math.max(50, Math.round(1000 / (this.cfg.fps || 10)));
+      const effFps = Math.max(15, Number(this.cfg.fps) || 15);
+      const intervalMs = Math.max(33, Math.round(1000 / effFps));
       this._loopTimer = setInterval(() => {
         if (this._busy || this.clients.size === 0) return;
         this._busy = true;
@@ -3206,6 +3548,7 @@
         paused: this.sm.paused,
         state: this.sm.state,
         extConnected: this.extConnected,
+        extStatus: this.extDiag,
         ipadMode: true,
         broadcastActive: this.broadcastActive,
         transport: this.frameTransport,
@@ -3216,9 +3559,24 @@
       };
     }
 
-    triggerSafariReload() {
-      if (this._postNativeAction({ action: "reloadLeftSafari" }) && this.extConnected) {
-        return [true, "safari_ext_reload"];
+    triggerSafariReload(opts = {}) {
+      if (this.hostInfo && this.hostInfo.safariExtPresent === false) {
+        return [false, "safari_ext_missing"];
+      }
+      if (this.extDiag && this.extDiag.permissionOk === false) {
+        return [false, "missing_tab_permissions"];
+      }
+      const payload = {
+        action: "reloadLeftSafari",
+        allowActiveFallback: opts.allowActiveFallback !== false,
+        testImmediate: !!opts.testImmediate,
+      };
+      if (Array.isArray(opts.keywords) && opts.keywords.length) {
+        payload.keywords = opts.keywords;
+      }
+      const posted = this._postNativeAction(payload);
+      if (posted && (this.extConnected || (this.hostInfo && this.hostInfo.nativeRelayAvailable))) {
+        return [true, this.extConnected ? "safari_ext_reload" : "safari_ext_queued"];
       }
       return [false, "alert_fallback"];
     }
@@ -3356,6 +3714,27 @@
         if (kaAction === "reset") kaEvt = this.keepalive.resetTimer(performance.now() / 1000, "ui_button");
         else if (kaAction === "refresh_now" || kaAction === "arm") kaEvt = this.keepalive.armNow();
         else if (kaAction === "configure" || kaAction === "set_config") kaEvt = this.keepalive.updateConfig(msg);
+        else if (kaAction === "test_reload") {
+          const [ok, method] = this.triggerSafariReload({
+            testImmediate: true,
+            allowActiveFallback: msg.allowActiveFallback !== false,
+            keywords: msg.keywords,
+          });
+          kaEvt = {
+            type: "keepalive_status",
+            event: ok ? "test_reload_sent" : "refresh_failed",
+            method,
+            reason: ok ? "" : method,
+            extStatus: this.extDiag,
+            keepalive: this.keepalive.getStatus(performance.now() / 1000),
+          };
+        } else if (kaAction === "request_ext_status") {
+          const reqPayload = { action: "requestExtStatus" };
+          if (Array.isArray(msg.keywords) && msg.keywords.length) {
+            reqPayload.keywords = msg.keywords;
+          }
+          this._postNativeAction(reqPayload);
+        }
         if (kaEvt) this.broadcast(kaEvt);
         this.broadcast(this.buildStatusPayload());
         return;
@@ -3659,6 +4038,7 @@
 
       this._lastHostInfo = null;
       this._lastExtConnected = null;
+      this._lastExtStatus = null;
       this._lastSyncMsg = null;
       this._lastKaConfigMsg = null;
 
@@ -3697,6 +4077,26 @@
         } else if (this._workerReady && this._worker) {
           try {
             this._worker.postMessage({ type: "set_ext_connected", connected: !!connected });
+          } catch (_) {}
+        }
+      };
+      globalThis.__ipadCompanionSetExtStatus = (st) => {
+        if (st && typeof st === "object") {
+          this._lastExtStatus = Object.assign({}, this._lastExtStatus || {}, st);
+          if (typeof st.connected === "boolean") {
+            this._lastExtConnected = st.connected;
+          }
+        }
+        if (this._closed || !this._lastExtStatus) return;
+        if (this._fallbackPromoted && this._fallback) {
+          this._fallback.runtime.extDiag = Object.assign({}, this._fallback.runtime.extDiag || {}, this._lastExtStatus);
+          if (typeof this._lastExtStatus.connected === "boolean") {
+            this._fallback.runtime.extConnected = this._lastExtStatus.connected;
+          }
+          this._fallback.runtime.broadcast(this._fallback.runtime.buildStatusPayload());
+        } else if (this._workerReady && this._worker) {
+          try {
+            this._worker.postMessage({ type: "set_ext_status", status: this._lastExtStatus });
           } catch (_) {}
         }
       };
@@ -3777,6 +4177,9 @@
           }
           if (this._lastExtConnected !== null) {
             try { worker.postMessage({ type: "set_ext_connected", connected: this._lastExtConnected }); } catch (_) {}
+          }
+          if (this._lastExtStatus !== null) {
+            try { worker.postMessage({ type: "set_ext_status", status: this._lastExtStatus }); } catch (_) {}
           }
           if (this.readyState === 0) {
             this.readyState = 1;
@@ -3875,6 +4278,12 @@
       if (!fb || !fb.runtime) return;
       if (this._lastExtConnected !== null) {
         fb.runtime.extConnected = !!this._lastExtConnected;
+      }
+      if (this._lastExtStatus !== null) {
+        fb.runtime.extDiag = Object.assign({}, fb.runtime.extDiag || {}, this._lastExtStatus);
+        if (typeof this._lastExtStatus.connected === "boolean") {
+          fb.runtime.extConnected = this._lastExtStatus.connected;
+        }
       }
       if (this._lastHostInfo) {
         fb.runtime.hostInfo = Object.assign({}, fb.runtime.hostInfo || {}, this._lastHostInfo);
@@ -4011,6 +4420,9 @@
     trimCardGlyph,
     findWhiteCardClusters,
     detectClusterCards,
+    computeRoiSignature,
+    roiSigDiff,
+    hudRoiSigChanged,
     PlaytechDetector,
     SequenceDebouncer,
     CompanionStateMachine,

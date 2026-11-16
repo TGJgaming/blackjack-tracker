@@ -476,17 +476,69 @@ final class CompanionSchemeHandler: NSObject, WKURLSchemeHandler {
 /// Web Extension (`safari-web-extension://...`) can receive `{ "type": "ext_reload" }` commands
 /// during Watch-mode Place Bets windows without any DOM/content-script injection on Playtech.
 final class KeepaliveExtensionRelay {
+    private struct PendingReload {
+        let keywords: [String]?
+        let allowActiveFallback: Bool
+        let testImmediate: Bool
+        let expiresAt: Date
+    }
+
     private let logger = Logger(subsystem: "com.tgjgaming.blackjacktracker", category: "KeepaliveRelay")
     private var listener: NWListener?
     private var extConnections: [NWConnection] = []
     private var verifiedIds = Set<ObjectIdentifier>()
+    private var isStopped = false
+    private var port: UInt16 = 8765
+
+    private var pendingReload: PendingReload?
+    private var permissionOk: Bool?
+    private var tabCount: Int = 0
+    private var matchedCount: Int = 0
+    private var lastHelloTs: Double = 0
+    private var lastAck: [String: Any]?
+
     var onConnectionCountChanged: ((Int) -> Void)?
+    var onStatusChanged: (([String: Any]) -> Void)?
 
     var verifiedConnectionCount: Int {
         verifiedIds.count
     }
 
+    private func hasActivePendingReload() -> Bool {
+        guard let pending = pendingReload else { return false }
+        if pending.expiresAt <= Date() {
+            pendingReload = nil
+            return false
+        }
+        return true
+    }
+
+    func statusDictionary() -> [String: Any] {
+        var dict: [String: Any] = [
+            "connected": !verifiedIds.isEmpty,
+            "verifiedCount": verifiedIds.count,
+            "tabCount": tabCount,
+            "matchedCount": matchedCount,
+            "pendingQueued": hasActivePendingReload(),
+            "lastHelloTs": lastHelloTs
+        ]
+        if let permissionOk = permissionOk {
+            dict["permissionOk"] = permissionOk
+        }
+        if let lastAck = lastAck {
+            dict["lastAck"] = lastAck
+        }
+        return dict
+    }
+
+    private func emitStatus() {
+        onConnectionCountChanged?(verifiedIds.count)
+        onStatusChanged?(statusDictionary())
+    }
+
     func startIfNeeded(port: UInt16 = 8765) {
+        self.port = port
+        self.isStopped = false
         guard listener == nil, let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
@@ -509,6 +561,12 @@ final class KeepaliveExtensionRelay {
                     newListener.cancel()
                     if self.listener === newListener {
                         self.listener = nil
+                        if !self.isStopped {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                                guard let self = self, !self.isStopped else { return }
+                                self.startIfNeeded(port: self.port)
+                            }
+                        }
                     }
                 case .cancelled:
                     self.logger.info("KeepaliveRelay cancelled")
@@ -530,6 +588,7 @@ final class KeepaliveExtensionRelay {
     }
 
     func stop() {
+        isStopped = true
         listener?.cancel()
         listener = nil
         for conn in extConnections {
@@ -537,6 +596,7 @@ final class KeepaliveExtensionRelay {
         }
         extConnections.removeAll()
         verifiedIds.removeAll()
+        pendingReload = nil
     }
 
     private func accept(_ conn: NWConnection) {
@@ -549,7 +609,7 @@ final class KeepaliveExtensionRelay {
                 let wasVerified = self.verifiedIds.remove(oid) != nil
                 self.extConnections.removeAll { $0 === conn }
                 if wasVerified {
-                    self.onConnectionCountChanged?(self.verifiedIds.count)
+                    self.emitStatus()
                 }
                 self.logger.info("Safari Keep-Alive extension disconnected (verified=\(self.verifiedIds.count))")
             default:
@@ -562,37 +622,113 @@ final class KeepaliveExtensionRelay {
 
     private func receiveNext(on conn: NWConnection) {
         conn.receiveMessage { [weak self, weak conn] data, _, _, error in
-            guard let self = self, let conn = conn, error == nil else { return }
+            guard let self = self, let conn = conn else { return }
+            if error != nil {
+                conn.cancel()
+                return
+            }
             if let data = data,
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let msgType = obj["type"] as? String {
                 if msgType == "ext_hello" || msgType == "ext_ping" {
                     let oid = ObjectIdentifier(conn)
-                    if self.verifiedIds.insert(oid).inserted {
-                        self.logger.info("Verified Safari Keep-Alive extension handshake (verified=\(self.verifiedIds.count))")
-                        self.onConnectionCountChanged?(self.verifiedIds.count)
+                    let newlyVerified = self.verifiedIds.insert(oid).inserted
+                    if let perm = obj["permissionOk"] as? Bool {
+                        self.permissionOk = perm
                     }
+                    if let tc = obj["tabCount"] as? Int {
+                        self.tabCount = tc
+                    }
+                    if let mc = obj["matchedCount"] as? Int {
+                        self.matchedCount = mc
+                    }
+                    self.lastHelloTs = Date().timeIntervalSince1970
+                    if newlyVerified {
+                        self.logger.info("Verified Safari Keep-Alive extension handshake (verified=\(self.verifiedIds.count), perm=\(String(describing: self.permissionOk)), tabs=\(self.tabCount))")
+                    }
+                    if self.hasActivePendingReload(), let queued = self.pendingReload {
+                        self.pendingReload = nil
+                        self.sendReload(queued, to: [conn])
+                        self.logger.info("Flushed queued Safari keep-alive reload upon extension wakeup")
+                    }
+                    self.emitStatus()
                 } else if msgType == "ext_reload_ack" {
+                    var ack = obj
+                    ack["ts"] = Date().timeIntervalSince1970
+                    self.lastAck = ack
+                    if let perm = obj["permissionOk"] as? Bool {
+                        self.permissionOk = perm
+                    }
+                    if let tc = obj["tabCount"] as? Int {
+                        self.tabCount = tc
+                    }
+                    if let mc = obj["matchedCount"] as? Int {
+                        self.matchedCount = mc
+                    }
                     let ok = (obj["ok"] as? Bool) ?? false
-                    let reason = (obj["reason"] as? String) ?? ""
-                    self.logger.info("Safari Keep-Alive reload ack ok=\(ok) reason=\(reason, privacy: .public)")
+                    let reason = (obj["reason"] as? String) ?? (obj["matchedBy"] as? String) ?? ""
+                    self.logger.info("Safari Keep-Alive reload ack ok=\(ok) detail=\(reason, privacy: .public)")
+                    self.emitStatus()
                 }
             }
             self.receiveNext(on: conn)
         }
     }
 
-    @discardableResult
-    func broadcastReload() -> Bool {
-        let targets = extConnections.filter { verifiedIds.contains(ObjectIdentifier($0)) }
-        guard !targets.isEmpty else { return false }
-        let payload = #"{"type":"ext_reload"}"#.data(using: .utf8)!
+    private func sendReload(_ cmd: PendingReload, to targets: [NWConnection]) {
+        var payloadObj: [String: Any] = [
+            "type": "ext_reload",
+            "allowActiveFallback": cmd.allowActiveFallback,
+            "testImmediate": cmd.testImmediate
+        ]
+        if let kws = cmd.keywords, !kws.isEmpty {
+            payloadObj["keywords"] = kws
+        }
+        guard let payload = try? JSONSerialization.data(withJSONObject: payloadObj) else { return }
         let meta = NWProtocolWebSocket.Metadata(opcode: .text)
         let ctx = NWConnection.ContentContext(identifier: "wsText", metadata: [meta])
         for conn in targets {
             conn.send(content: payload, contentContext: ctx, isComplete: true, completion: .idempotent)
         }
-        return true
+    }
+
+    func requestReload(keywords: [String]? = nil, allowActiveFallback: Bool = true, testImmediate: Bool = false) -> String {
+        let targets = extConnections.filter { verifiedIds.contains(ObjectIdentifier($0)) }
+        let cmd = PendingReload(
+            keywords: keywords,
+            allowActiveFallback: allowActiveFallback,
+            testImmediate: testImmediate,
+            expiresAt: Date().addingTimeInterval(25.0)
+        )
+        if !targets.isEmpty {
+            pendingReload = nil
+            sendReload(cmd, to: targets)
+            emitStatus()
+            return "delivered"
+        }
+        pendingReload = cmd
+        emitStatus()
+        return "queued"
+    }
+
+    func requestTabDiag(keywords: [String]? = nil) {
+        let targets = extConnections.filter { verifiedIds.contains(ObjectIdentifier($0)) }
+        guard !targets.isEmpty else { return }
+        var obj: [String: Any] = ["type": "ext_status_req"]
+        if let kws = keywords, !kws.isEmpty {
+            obj["keywords"] = kws
+        }
+        guard let payload = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        let meta = NWProtocolWebSocket.Metadata(opcode: .text)
+        let ctx = NWConnection.ContentContext(identifier: "wsText", metadata: [meta])
+        for conn in targets {
+            conn.send(content: payload, contentContext: ctx, isComplete: true, completion: .idempotent)
+        }
+    }
+
+    @discardableResult
+    func broadcastReload() -> Bool {
+        return requestReload(keywords: nil, allowActiveFallback: true, testImmediate: false) == "delivered"
     }
 }
 
@@ -604,6 +740,7 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
     private lazy var schemeHandler = CompanionSchemeHandler(loopbackReceiver: loopbackReceiver)
     private let extRelay = KeepaliveExtensionRelay()
     private var discoveredBroadcastExtId: String?
+    private var discoveredSafariExtId: String?
 
     override var preferredStatusBarStyle: UIStatusBarStyle {
         .lightContent
@@ -619,9 +756,10 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
         super.viewDidLoad()
         view.backgroundColor = UIColor(red: 15.0 / 255.0, green: 17.0 / 255.0, blue: 21.0 / 255.0, alpha: 1.0)
 
-        discoveredBroadcastExtId = Self.discoverBroadcastExtensionBundleId()
+        discoveredBroadcastExtId = Self.discoverExtensionBundleId(pointIdentifier: "com.apple.broadcast-services-upload")
+        discoveredSafariExtId = Self.discoverExtensionBundleId(pointIdentifier: "com.apple.Safari.web-extension")
         schemeHandler.broadcastExtensionPresent = (discoveredBroadcastExtId != nil)
-        logger.info("BroadcastExtension discovery: \(self.discoveredBroadcastExtId ?? "MISSING (stripped)", privacy: .public)")
+        logger.info("Extension discovery: broadcast=\(self.discoveredBroadcastExtId ?? "MISSING", privacy: .public), safariKeepalive=\(self.discoveredSafariExtId ?? "MISSING", privacy: .public)")
 
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
@@ -659,7 +797,7 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
         extRelay.startIfNeeded(port: 8765)
     }
 
-    private static func discoverBroadcastExtensionBundleId() -> String? {
+    private static func discoverExtensionBundleId(pointIdentifier: String) -> String? {
         guard let pluginsURL = Bundle.main.builtInPlugInsURL,
               let entries = try? FileManager.default.contentsOfDirectory(
                   at: pluginsURL,
@@ -671,7 +809,7 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
         for url in entries where url.pathExtension == "appex" {
             if let extBundle = Bundle(url: url),
                let nsExt = extBundle.infoDictionary?["NSExtension"] as? [String: Any],
-               (nsExt["NSExtensionPointIdentifier"] as? String) == "com.apple.broadcast-services-upload",
+               (nsExt["NSExtensionPointIdentifier"] as? String) == pointIdentifier,
                let bid = extBundle.bundleIdentifier, !bid.isEmpty {
                 return bid
             }
@@ -698,38 +836,53 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
 
     private func setupServices() {
         loopbackReceiver.startIfNeeded(port: FrameIPCConstants.loopbackPort)
-        extRelay.onConnectionCountChanged = { [weak self] count in
+        extRelay.onStatusChanged = { [weak self] st in
             DispatchQueue.main.async {
-                let connected = count > 0 ? "true" : "false"
-                self?.webView?.evaluateJavaScript(
-                    "window.__ipadCompanionSetExtConnected && window.__ipadCompanionSetExtConnected(\(connected));",
-                    completionHandler: nil
-                )
+                self?.pushExtStatusToWebView(st)
             }
         }
         extRelay.startIfNeeded(port: 8765)
     }
 
+    private func pushExtStatusToWebView(_ status: [String: Any]? = nil) {
+        let payload = status ?? extRelay.statusDictionary()
+        let extConn = ((payload["connected"] as? Bool) ?? (extRelay.verifiedConnectionCount > 0)) ? "true" : "false"
+        var statusJson = "{}"
+        if JSONSerialization.isValidJSONObject(payload),
+           let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+           let s = String(data: jsonData, encoding: .utf8) {
+            statusJson = s
+        }
+        let js = """
+        if (window.__ipadCompanionSetExtStatus) {
+          window.__ipadCompanionSetExtStatus(\(statusJson));
+        } else if (window.__ipadCompanionSetExtConnected) {
+          window.__ipadCompanionSetExtConnected(\(extConn));
+        }
+        """
+        webView?.evaluateJavaScript(js, completionHandler: nil)
+    }
+
     private func pushHostDiagnosticsToWebView() {
-        let extConn = extRelay.verifiedConnectionCount > 0 ? "true" : "false"
         let appGroupOk = SharedFrameRing.availableAppGroupId != nil
         let infoPayload: [String: Any] = [
             "appGroupAvailable": appGroupOk,
             "appGroupId": SharedFrameRing.availableAppGroupId ?? "",
             "broadcastExtPresent": discoveredBroadcastExtId != nil,
             "broadcastExtId": discoveredBroadcastExtId ?? "",
-            "loopbackPort": Int(FrameIPCConstants.loopbackPort)
+            "safariExtPresent": discoveredSafariExtId != nil,
+            "safariExtId": discoveredSafariExtId ?? "",
+            "loopbackPort": Int(FrameIPCConstants.loopbackPort),
+            "nativeRelayAvailable": true
         ]
         var hostJson = "{}"
         if let jsonData = try? JSONSerialization.data(withJSONObject: infoPayload),
            let s = String(data: jsonData, encoding: .utf8) {
             hostJson = s
         }
-        let js = """
-        window.__ipadCompanionSetExtConnected && window.__ipadCompanionSetExtConnected(\(extConn));
-        window.__ipadCompanionSetHostInfo && window.__ipadCompanionSetHostInfo(\(hostJson));
-        """
+        let js = "window.__ipadCompanionSetHostInfo && window.__ipadCompanionSetHostInfo(\(hostJson));"
         webView?.evaluateJavaScript(js, completionHandler: nil)
+        pushExtStatusToWebView(nil)
     }
 
     private func findButton(in root: UIView) -> UIButton? {
@@ -930,8 +1083,21 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
             }
 
         case "reloadLeftSafari":
-            let sent = extRelay.broadcastReload()
-            logger.info("Relayed Safari keep-alive reload command (delivered=\(sent))")
+            let keywords = body["keywords"] as? [String]
+            let allowActiveFallback = (body["allowActiveFallback"] as? Bool) ?? true
+            let testImmediate = (body["testImmediate"] as? Bool) ?? false
+            let delivery = extRelay.requestReload(
+                keywords: keywords,
+                allowActiveFallback: allowActiveFallback,
+                testImmediate: testImmediate
+            )
+            logger.info("Relayed Safari keep-alive reload command (delivery=\(delivery, privacy: .public), verified=\(self.extRelay.verifiedConnectionCount))")
+            pushExtStatusToWebView(nil)
+
+        case "requestExtStatus":
+            let keywords = body["keywords"] as? [String]
+            extRelay.requestTabDiag(keywords: keywords)
+            pushHostDiagnosticsToWebView()
 
         case "exportFile":
             guard let rawName = body["filename"] as? String,

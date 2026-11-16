@@ -91,6 +91,14 @@ self.onmessage = function (ev) {
   } else if (msg.type === "set_ext_connected") {
     runtime.extConnected = !!msg.connected;
     runtime.broadcast(runtime.buildStatusPayload());
+  } else if (msg.type === "set_ext_status") {
+    if (msg.status && typeof msg.status === "object") {
+      runtime.extDiag = Object.assign({}, runtime.extDiag || {}, msg.status);
+      if (typeof msg.status.connected === "boolean") {
+        runtime.extConnected = msg.status.connected;
+      }
+      runtime.broadcast(runtime.buildStatusPayload());
+    }
   } else if (msg.type === "set_host_info") {
     if (msg.info && typeof msg.info === "object") {
       runtime.hostInfo = Object.assign({}, runtime.hostInfo || {}, msg.info);
