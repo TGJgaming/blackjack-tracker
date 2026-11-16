@@ -1154,3 +1154,45 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   assert(nmb2.some((e) => e.type === "auto_watch"), "NO_MORE_BETS must flush auto_watch from completed round");
   console.log("   Test 19 PASSED");
 }
+
+// Test 20: Keepalive reload fires immediately on PLACE_BETS OR when player strip disappears
+{
+  console.log("20. Testing keepalive reload on PLACE_BETS (even with draftCount>0) and on player strip disappearance...");
+  const kaA = new Engine.WatchKeepaliveManager(cfg);
+  let reloadsA = 0;
+  // Advance elapsed to 605s
+  kaA._watchElapsedSec = 605;
+  kaA.step({ now: 705.0, windowFound: true, obs: { banner_state: "", player_cards: [{ rank: "8" }], dealer_cards: [{ rank: "10" }] }, smState: "DEALER_TURN", playMode: "watch", draftCount: 4, hasPrompt: false });
+  // Trigger 1: PLACE_BETS detected even while draftCount=4 -> fires immediately!
+  const evPB = kaA.step({
+    now: 705.2,
+    windowFound: true,
+    obs: { banner_state: "PLACE_BETS", place_bets_conf: 0.91, player_cards: [], dealer_cards: [] },
+    smState: "BETTING",
+    playMode: "watch",
+    draftCount: 4,
+    hasPrompt: false,
+    triggerRefreshCb: () => { reloadsA++; return [true, "safari_ext"]; },
+  });
+  assert.strictEqual(reloadsA, 1, "Reload must fire immediately on PLACE_BETS even with draftCount > 0");
+  assert(evPB.some((e) => e.event === "refreshing"));
+
+  // Trigger 2: Player strip disappears (no PLACE_BETS banner yet) -> fires immediately!
+  const kaB = new Engine.WatchKeepaliveManager(cfg);
+  let reloadsB = 0;
+  kaB._watchElapsedSec = 605;
+  kaB.step({ now: 705.0, windowFound: true, obs: { banner_state: "", player_cards: [{ rank: "A" }], dealer_cards: [{ rank: "9" }] }, smState: "DEALER_TURN", playMode: "watch", draftCount: 3, hasPrompt: false });
+  const evStripGone = kaB.step({
+    now: 705.2,
+    windowFound: true,
+    obs: { banner_state: "", player_cards: [], dealer_cards: [] },
+    smState: "DEALER_TURN",
+    playMode: "watch",
+    draftCount: 3,
+    hasPrompt: false,
+    triggerRefreshCb: () => { reloadsB++; return [true, "safari_ext"]; },
+  });
+  assert.strictEqual(reloadsB, 1, "Reload must fire immediately when player strip disappears");
+  assert(evStripGone.some((e) => e.event === "refreshing"));
+  console.log("   Test 20 PASSED");
+}
