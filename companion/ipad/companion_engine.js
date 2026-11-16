@@ -1681,6 +1681,9 @@
         if (!suit && !hasBadgeOcclusion && !highConfPipOk && (!hasPipBody || suitConf < 0.42 || d.conf < Math.max(0.82, minHudConf - 0.02))) {
           continue;
         }
+        if (d.rank === "4" && !hasBadgeOcclusion && d.conf < Math.max(0.82, minHudConf - 0.02)) {
+          continue;
+        }
       }
       out.push({
         rank: d.rank,
