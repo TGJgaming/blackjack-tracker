@@ -5,13 +5,30 @@
   "description": "Zero-DOM Safari Web Extension that reloads the Playtech/Newport tab via browser.tabs.reload during Watch-mode breaks without content scripts.",
   "permissions": [
     "tabs",
-    "alarms"
+    "alarms",
+    "activeTab"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
   "background": {
-    "scripts": ["background.js"],
+    "scripts": [
+      "background.js"
+    ],
     "persistent": false
+  },
+  "icons": {
+    "48": "icon-48.png",
+    "96": "icon-96.png",
+    "128": "icon-128.png",
+    "256": "icon-256.png"
+  },
+  "action": {
+    "default_title": "Newport Keep-Alive",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icon-48.png",
+      "96": "icon-96.png"
+    }
   }
 }

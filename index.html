@@ -1727,6 +1727,37 @@ function playAlertTone(kind = 'plus'){
   }catch(e){}
 }
 
+// iOS WKWebView only allows speechSynthesis after a user gesture has primed it, so alerts fired from companion
+// messages (e.g. the 10-min reload fallback) were silent. Prime it on the first touch/click and keep it alive.
+let _speechPrimed = false;
+function primeSpeech(){
+  if(_speechPrimed || typeof window.speechSynthesis === 'undefined') return;
+  try{
+    const u = new SpeechSynthesisUtterance(' ');
+    u.volume = 0;
+    window.speechSynthesis.speak(u);
+    _speechPrimed = true;
+  }catch(e){}
+}
+['pointerdown','touchend','click','keydown'].forEach(ev => document.addEventListener(ev, primeSpeech, { passive: true, capture: true }));
+
+function speakAlertText(text){
+  try{
+    const synth = window.speechSynthesis;
+    if(synth.paused) synth.resume();
+    if(synth.speaking || synth.pending) synth.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'en-US';
+    u.rate = 1.05;
+    u.volume = 1;
+    synth.speak(u);
+    // iOS occasionally drops the utterance queued right after cancel(); retry once if nothing started.
+    setTimeout(() => {
+      try{ if(!synth.speaking && !synth.pending) synth.speak(new SpeechSynthesisUtterance(text)); }catch(e){}
+    }, 350);
+  }catch(e){}
+}
+
 function triggerAlert(kind, title, body = '', opts = {}){
   const trig = (cfg().alertTriggers) || {};
   if(!opts.force && trig[kind] === false) return false;
@@ -1745,13 +1776,7 @@ function triggerAlert(kind, title, body = '', opts = {}){
 
   // 2. Optional Spoken Callout
   if(cfg().alertVoice && opts.speak && typeof window.speechSynthesis !== 'undefined'){
-    try{
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(opts.speak);
-      u.rate = 1.12;
-      u.volume = 0.85;
-      window.speechSynthesis.speak(u);
-    }catch(e){}
+    speakAlertText(opts.speak);
   }
 
   // 3. Visual Floating Toast
@@ -4444,7 +4469,7 @@ function handleCompanionMessage(msg){
       if(draft) draft.lastMsg = msg.message || `✅ Newport session kept alive (${msg.reloadSec ?? '?'}s reload) — back at live table.`;
     } else if(ev === 'alert_place_bets'){
       triggerAlert('window', '🔄 Refresh Newport Now (Watch)', msg.message || `Place Bets window (${Math.round(msg.elapsedSec || 0)}s watch) — ${_comp.ipadMode ? 'tap Reload (⟳) in Safari' : 'press F5 in the Newport window'} to avoid 15-min kick.`, {
-        key: `ka_pb_${Math.floor(Date.now() / 15000)}`, cooldownMs: 12000, speak: 'Refresh Newport now'
+        key: `ka_pb_${Math.floor(Date.now() / 15000)}`, cooldownMs: 12000, speak: _comp.ipadMode ? 'Reload now. Ten minute session limit. Tap reload in Safari.' : 'Reload now. Ten minute session limit. Press F5 in Newport.'
       });
     } else if(ev === 'hard_warn'){
       triggerAlert('disconnect', '⚠️ 15-Min Idle Disconnect Imminent', msg.message || `${Math.round(msg.elapsedSec || 0)}s watched without a refresh — ${_comp.ipadMode ? 'reload Safari' : 'press F5 in Newport'} at the next break!`, {

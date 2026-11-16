@@ -257,6 +257,16 @@ if (extApi && extApi.alarms) {
   });
 }
 
+if (extApi && extApi.runtime && extApi.runtime.onMessage) {
+  extApi.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg && msg.type === "popup_reload") {
+      handleReloadCommand({ testImmediate: true }).then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
+      return true;
+    }
+    return false;
+  });
+}
+
 if (extApi && extApi.runtime) {
   if (extApi.runtime.onStartup) extApi.runtime.onStartup.addListener(() => wakeAndSync(true));
   if (extApi.runtime.onInstalled) extApi.runtime.onInstalled.addListener(() => wakeAndSync(true));

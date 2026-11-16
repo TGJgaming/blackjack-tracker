@@ -72,6 +72,18 @@ targets:
         buildPhase: resources
       - path: SafariKeepaliveExtension/Resources/background.js
         buildPhase: resources
+      - path: SafariKeepaliveExtension/Resources/popup.html
+        buildPhase: resources
+      - path: SafariKeepaliveExtension/Resources/popup.js
+        buildPhase: resources
+      - path: SafariKeepaliveExtension/Resources/icon-48.png
+        buildPhase: resources
+      - path: SafariKeepaliveExtension/Resources/icon-96.png
+        buildPhase: resources
+      - path: SafariKeepaliveExtension/Resources/icon-128.png
+        buildPhase: resources
+      - path: SafariKeepaliveExtension/Resources/icon-256.png
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tgjgaming.blackjacktracker.SafariKeepaliveExtension

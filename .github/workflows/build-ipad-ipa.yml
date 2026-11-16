@@ -52,7 +52,9 @@ jobs:
             Payload/BlackjackTracker.app/PlugIns/BroadcastExtension.appex/Info.plist \
             Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/Info.plist \
             Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/manifest.json \
-            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/background.js
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/background.js \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/popup.html \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/icon-96.png
           do
             test -f "$f" || { echo "Missing expected bundle file: $f" >&2; exit 1; }
           done
