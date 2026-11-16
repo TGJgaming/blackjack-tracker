@@ -1498,13 +1498,17 @@
     if (!bgrPatch || bgrPatch.c !== 3 || bgrPatch.w === 0 || bgrPatch.h === 0) return false;
     const n = bgrPatch.w * bgrPatch.h;
     const d = bgrPatch.data;
-    let redCnt = 0, dotCnt = 0;
+    let redCnt = 0, dotCnt = 0, whiteCnt = 0;
     for (let i = 0, j = 0; i < n; i++, j += 3) {
       const b = d[j], g = d[j + 1], r = d[j + 2];
+      const mn = Math.min(b, g, r);
       if (r - Math.max(b, g) > 32) redCnt++;
-      if (Math.min(b, g, r) > 150) dotCnt++;
+      if (mn > 150) dotCnt++;
+      if (mn >= 225) whiteCnt++;
     }
-    return redCnt / n >= 0.24 && dotCnt / n >= 0.10;
+    // Face-up hearts/diamonds (red ink on a white card) are mostly near-white; a card back is mostly red
+    // with sparse white dots, so cap the near-white share to avoid mistaking a red face card for a BACK.
+    return redCnt / n >= 0.24 && dotCnt / n >= 0.10 && whiteCnt / n <= 0.42;
   }
 
   function classifySuit(normBgr, rankX, rankW, cwNorm, suitTemplates) {
@@ -2041,9 +2045,9 @@
       const dChanged = hudRoiSigChanged(dSig, this._lastDSig, 1);
       const dDiff = roiSigDiff(dSig, this._lastDSig);
       let dCards;
-      if (this._lastDSig && !dChanged && (dDiff === 0 || this._dSigAge < HUD_REFRESH_PERIOD)) {
+      // Dealer strip is small/cheap and holds the few cards that matter: only reuse the cache when pixels are identical.
+      if (this._lastDSig && !dChanged && dDiff === 0) {
         dCards = this._cachedD;
-        if (dDiff > 0) this._dSigAge++;
       } else {
         this._lastDSig = dSig;
         this._dSigAge = 0;

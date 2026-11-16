@@ -978,3 +978,34 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
 });
 
 
+
+// Test 16: red face-up dealer cards (hearts/diamonds) abutting the upcard must not be mistaken for a face-down BACK
+{
+  console.log("16. Testing dealer red face-up 2nd/3rd card is not misread as BACK...");
+  const det16 = new Engine.PlaytechDetector(cfg, pack);
+  const hudT = (r) => det16.banks.hud.find((t) => t.rank === r);
+  const suitT = (r) => det16.banks.suit.find((t) => t.rank === r);
+  const glyph16 = (strip, tpl, ox, oy, red) => {
+    for (let y = 0; y < tpl.bgr.h; y++) for (let x = 0; x < tpl.bgr.w; x++) {
+      if (tpl.min_gray.data[y * tpl.bgr.w + x] < 180 && ox + x < strip.w) {
+        const i = ((oy + y) * strip.w + ox + x) * 3;
+        strip.data[i] = red ? 25 : 15; strip.data[i + 1] = red ? 25 : 15; strip.data[i + 2] = red ? 215 : 15;
+      }
+    }
+  };
+  const card16 = (strip, x0, rank, suit, red) => {
+    fillRect(strip, x0, 12, 32, 45, 248, 248, 248);
+    glyph16(strip, hudT(rank), x0 + 3, 14, red);
+    glyph16(strip, suitT(suit), x0 + 3, 40, red);
+  };
+  for (const step of [36, 34, 30, 26, 22]) {
+    const strip = Engine.createImage(240, 70, 3, 25);
+    card16(strip, 12, "A", "S", false);
+    card16(strip, 12 + step, "K", "H", true);
+    card16(strip, 12 + 2 * step, "5", "D" in {} ? "D" : "H", true);
+    det16.invalidateCaches();
+    const [d16] = det16.detectHudStrip(strip, true);
+    assert.deepStrictEqual(d16.map((c) => c.rank), ["A", "K", "5"], `step ${step}: got ${d16.map((c) => c.rank)}`);
+  }
+  console.log("   Test 16 PASSED");
+}
