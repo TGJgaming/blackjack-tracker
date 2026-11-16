@@ -3542,6 +3542,8 @@
       this._lastBetRoundsCount = 0;
       this._manualArmed = false;
       this._refreshCount = 0;
+      this._pendingReloadRecovery = false;
+      this._sawStripsAbsentInWarn = false;
     }
 
     inGrace(now = performance.now() / 1000) {
@@ -3572,6 +3574,8 @@
       this._lastTickTs = now;
       this._manualArmed = false;
       this._graceUntilTs = 0.0;
+      this._pendingReloadRecovery = false;
+      this._sawStripsAbsentInWarn = false;
       if (this.cfg.keepalive_enabled === false || this.cfg.keepalive_mode === "off") {
         this.state = "OFF";
       } else {
@@ -3679,6 +3683,8 @@
           this._manualArmed = false;
           this._graceUntilTs = 0.0;
           this._lastCooldownEndTs = now + 90.0;
+          this._pendingReloadRecovery = false;
+          this._sawStripsAbsentInWarn = false;
           this.state = "WATCH_COUNTDOWN";
           events.push({
             type: "keepalive_status",
@@ -3691,6 +3697,7 @@
         if (reloadDur >= (this.cfg.keepalive_reload_grace_sec || 14.0)) {
           this.state = "WARN";
           this._graceUntilTs = 0.0;
+          this._pendingReloadRecovery = true;
           events.push({
             type: "keepalive_status",
             event: "timeout_warn",
@@ -3699,6 +3706,34 @@
           });
         }
         return events;
+      }
+
+      if (this.state === "WARN" && windowFound && obs !== null) {
+        const hasPlayerStrip = Boolean(
+          (obs.player_cards && obs.player_cards.length > 0) ||
+          (obs.player_hands && Object.keys(obs.player_hands).length > 0)
+        );
+        const hasDealerStrip = Boolean(obs.dealer_cards && obs.dealer_cards.length > 0);
+        if (!hasPlayerStrip && !hasDealerStrip) {
+          this._sawStripsAbsentInWarn = true;
+        } else if (hasPlayerStrip && hasDealerStrip && (this._pendingReloadRecovery || this._sawStripsAbsentInWarn)) {
+          const reloadDur = this._refreshStartedTs > 0 ? Math.max(0, now - this._refreshStartedTs) : 0.0;
+          this._watchElapsedSec = 0.0;
+          this._manualArmed = false;
+          this._graceUntilTs = 0.0;
+          this._lastCooldownEndTs = now + 90.0;
+          this._pendingReloadRecovery = false;
+          this._sawStripsAbsentInWarn = false;
+          this.state = "WATCH_COUNTDOWN";
+          events.push({
+            type: "keepalive_status",
+            event: "recovered",
+            reason: "strips_visible_fallback",
+            reloadSec: Math.round(reloadDur * 10) / 10,
+            keepalive: this.getStatus(now),
+          });
+          return events;
+        }
       }
 
       if (playMode === "bet") {

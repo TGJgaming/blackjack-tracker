@@ -1284,3 +1284,107 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 21 PASSED");
 }
 
+// Test 22: Reload timer resets from WARN/alert mode when player & dealer strips become visible
+{
+  console.log("22. Testing reload timer reset from WARN when player & dealer strips become visible...");
+  const mkC = (rank, val, conf = 0.93, suit = "S", x = 10) => ({ rank, val, conf, suit, x, y: 10, w: 12, h: 16, hand_index: 0 });
+  const ka22 = new Engine.WatchKeepaliveManager({ ...cfg, keepalive_interval_sec: 60, keepalive_reload_grace_sec: 14 });
+  ka22._watchElapsedSec = 62;
+  // 22a. Trigger refresh at t=100, then let it time out past 14s grace -> WARN
+  const evRef = ka22.step({
+    now: 100,
+    windowFound: true,
+    obs: { banner_state: "PLACE_BETS", place_bets_conf: 0.9, player_cards: [], dealer_cards: [] },
+    smState: "BETTING",
+    playMode: "watch",
+    draftCount: 0,
+    hasPrompt: false,
+    betRoundsCount: 0,
+    triggerRefreshCb: () => [true, "safari_ext"],
+  });
+  assert(evRef.some((e) => e.event === "refreshing"));
+  assert.strictEqual(ka22.state, "REFRESHING");
+
+  const evTimeout = ka22.step({
+    now: 116,
+    windowFound: true,
+    obs: { banner_state: "", place_bets_conf: 0, player_cards: [], dealer_cards: [] },
+    smState: "IDLE",
+    playMode: "watch",
+    draftCount: 0,
+    hasPrompt: false,
+    betRoundsCount: 0,
+  });
+  assert(evTimeout.some((e) => e.event === "timeout_warn"), "Slow reload should emit timeout_warn");
+  assert.strictEqual(ka22.state, "WARN");
+
+  // Only player strip visible -> stays WARN; once BOTH player & dealer strips are visible -> resets to WATCH_COUNTDOWN
+  ka22.step({
+    now: 117,
+    windowFound: true,
+    obs: { banner_state: "", player_cards: [mkC("10", 0)], dealer_cards: [] },
+    smState: "DEALING",
+    playMode: "watch",
+    draftCount: 1,
+    hasPrompt: false,
+    betRoundsCount: 0,
+  });
+  assert.strictEqual(ka22.state, "WARN", "Must wait until both player & dealer strips are visible");
+
+  const evRec = ka22.step({
+    now: 118,
+    windowFound: true,
+    obs: { banner_state: "", player_cards: [mkC("10", 0), mkC("8", 8)], dealer_cards: [mkC("7", 7)] },
+    smState: "PLAYER_TURN",
+    playMode: "watch",
+    draftCount: 3,
+    hasPrompt: false,
+    betRoundsCount: 0,
+  });
+  assert(evRec.some((e) => e.event === "recovered" && e.reason === "strips_visible_fallback"), "Must emit recovered when both strips become visible");
+  assert.strictEqual(ka22.state, "WATCH_COUNTDOWN");
+  assert.strictEqual(ka22._watchElapsedSec, 0);
+
+  // 22b. Alert WARN (triggerRefreshCb returns false) also resets once strips reappear after being absent
+  const ka22b = new Engine.WatchKeepaliveManager({ ...cfg, keepalive_interval_sec: 60 });
+  ka22b._watchElapsedSec = 65;
+  const evAlert = ka22b.step({
+    now: 200,
+    windowFound: true,
+    obs: { banner_state: "PLACE_BETS", place_bets_conf: 0.9, player_cards: [], dealer_cards: [] },
+    smState: "BETTING",
+    playMode: "watch",
+    draftCount: 0,
+    hasPrompt: false,
+    betRoundsCount: 0,
+    triggerRefreshCb: () => [false, "none"],
+  });
+  assert(evAlert.some((e) => e.event === "alert_place_bets"));
+  assert.strictEqual(ka22b.state, "WARN");
+  ka22b.step({
+    now: 201,
+    windowFound: true,
+    obs: { banner_state: "", player_cards: [], dealer_cards: [] },
+    smState: "IDLE",
+    playMode: "watch",
+    draftCount: 0,
+    hasPrompt: false,
+    betRoundsCount: 0,
+  });
+  const evRecB = ka22b.step({
+    now: 202,
+    windowFound: true,
+    obs: { banner_state: "", player_cards: [mkC("9", 9)], dealer_cards: [mkC("K", 0)] },
+    smState: "PLAYER_TURN",
+    playMode: "watch",
+    draftCount: 2,
+    hasPrompt: false,
+    betRoundsCount: 0,
+  });
+  assert(evRecB.some((e) => e.event === "recovered"), "Alert WARN must also reset once player & dealer strips reappear");
+  assert.strictEqual(ka22b.state, "WATCH_COUNTDOWN");
+  assert.strictEqual(ka22b._watchElapsedSec, 0);
+  console.log("   Test 22 PASSED");
+}
+
+
