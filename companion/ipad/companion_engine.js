@@ -79,12 +79,12 @@
     const base = Object.assign({}, (PRELOADED_PACK && PRELOADED_PACK.config) || {}, override || {});
     const roisRaw = Object.assign({}, (PRELOADED_PACK && PRELOADED_PACK.config && PRELOADED_PACK.config.rois) || {}, base.rois || {});
     const defRois = {
-      player_strip: [0.42, 0.66, 0.32, 0.22],
-      dealer_strip: [0.20, 0.34, 0.22, 0.27],
+      player_strip: [0.22, 0.66, 0.56, 0.22],
+      dealer_strip: [0.02, 0.27, 0.38, 0.22],
       community_roi: [0.44, 0.50, 0.21, 0.15],
       dealer_felt_roi: [0.38, 0.28, 0.24, 0.18],
       banner_roi: [0.35, 0.00, 0.30, 0.06],
-      place_bets_roi: [0.38, 0.30, 0.24, 0.11],
+      place_bets_roi: [0.20, 0.36, 0.60, 0.18],
       shuffle_roi: [0.30, 0.24, 0.40, 0.38],
     };
     const rois = {};
@@ -106,7 +106,7 @@
       shuffle_hold_sec: Number(base.shuffle_hold_sec || 2.0),
       min_hud_confidence: Number(base.min_hud_confidence || 0.84),
       min_felt_confidence: Number(base.min_felt_confidence || 0.78),
-      min_banner_confidence: Number(base.min_banner_confidence || 0.70),
+      min_banner_confidence: Number(base.min_banner_confidence || 0.74),
       hud_nms_min_dx_ratio: Number(base.hud_nms_min_dx_ratio || 0.018),
       hud_dedup_window_sec: Number(base.hud_dedup_window_sec || 2.8),
       enable_felt_community: base.enable_felt_community !== false,
@@ -1116,7 +1116,7 @@
     if (h < 120 || w < 160) return [0, 0, w, h];
 
     const gray = toGray(winBgr);
-    const searchX0 = Math.floor(w * 0.42);
+    const searchX0 = Math.floor(w * 0.25);
     const searchX1 = Math.floor(w * 0.78);
     const yBand0 = Math.floor(h * 0.12);
     const yBand1 = Math.max(yBand0 + 16, Math.floor(h * 0.88));
@@ -1137,24 +1137,25 @@
         }
         const mean = sum / bandH;
         const p90 = percentileU8(colBuf, 90);
-        if (p90 <= 22.0 && mean <= 14.0) darkCols[i] = 1;
+        if (p90 <= 24.0 && mean <= 19.0) darkCols[i] = 1;
       }
-      let bestRun = null;
+      let firstRun = null;
       let i = 0;
       while (i < nCols) {
         if (darkCols[i]) {
           let j = i;
           while (j < nCols && darkCols[j]) j++;
-          if (j - i >= 4 && (!bestRun || j - i > bestRun[1] - bestRun[0])) {
-            bestRun = [i, j];
+          if (j - i >= 4) {
+            firstRun = [i, j];
+            break;
           }
           i = j;
         } else {
           i++;
         }
       }
-      if (bestRun) {
-        splitW = Math.max(160, searchX0 + bestRun[0]);
+      if (firstRun) {
+        splitW = Math.max(160, searchX0 + firstRun[0]);
       } else if (w / Math.max(1, h) >= 1.22) {
         splitW = Math.max(160, Math.round(w * defaultSplitRatio));
       }
@@ -1650,7 +1651,7 @@
     peaks.sort((a, b) => b[0] - a[0]);
     const kept = [];
     for (const [, cand] of peaks) {
-      if (kept.some((k) => Math.abs(cand.x - k.x) < 11)) continue;
+      if (kept.some((k) => Math.abs(cand.x - k.x) < 11 || (cand.x < k.x + k.w && k.x < cand.x + cand.w))) continue;
       kept.push(cand);
     }
     kept.sort((a, b) => a.x - b.x);
@@ -1956,9 +1957,26 @@
         "..#####...",
         "..........",
       ],
+      "1b": [
+        "..........",
+        "....###...",
+        "...####...",
+        "..##.##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        "..........",
+      ],
     };
     const out = [];
-    for (const [digit, rows] of Object.entries(glyphs)) {
+    for (const [rawDigit, rows] of Object.entries(glyphs)) {
+      const digit = rawDigit === "1b" ? "1" : rawDigit;
       const n = 140;
       const vec = new Float32Array(n);
       let sum = 0;
@@ -1986,46 +2004,49 @@
     if (!grayImg || w < 2 || h < 5) return [null, 0.0];
     const targetH = 12;
     const scale = targetH / h;
-    const targetW = Math.max(2, Math.min(8, Math.round(w * scale)));
+    const baseW = Math.max(2, Math.min(8, Math.round(w * scale)));
+    const widths = baseW >= 5 && baseW < 8 ? [baseW, 8] : [baseW];
     const cropped = cropImage(grayImg, x, y, w, h);
-    const resized = resizeImage(cropped, targetW, targetH);
-    const baseOx = Math.floor((10 - targetW) / 2);
     const oy = 1;
     const tpls = getBadgeDigitTemplates();
     let bestD = null;
     let bestConf = -1.0;
 
-    const triedOx = new Set([
-      Math.max(0, Math.min(10 - targetW, baseOx - 1)),
-      Math.max(0, Math.min(10 - targetW, baseOx)),
-      Math.max(0, Math.min(10 - targetW, baseOx + 1)),
-    ]);
+    for (const targetW of widths) {
+      const resized = resizeImage(cropped, targetW, targetH);
+      const baseOx = Math.floor((10 - targetW) / 2);
+      const triedOx = new Set([
+        Math.max(0, Math.min(10 - targetW, baseOx - 1)),
+        Math.max(0, Math.min(10 - targetW, baseOx)),
+        Math.max(0, Math.min(10 - targetW, baseOx + 1)),
+      ]);
 
-    for (const ox of triedOx) {
-      const canvas = new Float32Array(140);
-      for (let ry = 0; ry < targetH; ry++) {
-        for (let rx = 0; rx < targetW; rx++) {
-          canvas[(oy + ry) * 10 + (ox + rx)] = resized.data[ry * targetW + rx];
+      for (const ox of triedOx) {
+        const canvas = new Float32Array(140);
+        for (let ry = 0; ry < targetH; ry++) {
+          for (let rx = 0; rx < targetW; rx++) {
+            canvas[(oy + ry) * 10 + (ox + rx)] = resized.data[ry * targetW + rx];
+          }
         }
-      }
-      let sum = 0;
-      for (let i = 0; i < 140; i++) sum += canvas[i];
-      const mean = sum / 140;
-      let normSq = 0;
-      for (let i = 0; i < 140; i++) {
-        canvas[i] -= mean;
-        normSq += canvas[i] * canvas[i];
-      }
-      const cNorm = Math.sqrt(normSq);
-      if (cNorm < 1e-4) continue;
+        let sum = 0;
+        for (let i = 0; i < 140; i++) sum += canvas[i];
+        const mean = sum / 140;
+        let normSq = 0;
+        for (let i = 0; i < 140; i++) {
+          canvas[i] -= mean;
+          normSq += canvas[i] * canvas[i];
+        }
+        const cNorm = Math.sqrt(normSq);
+        if (cNorm < 1e-4) continue;
 
-      for (const tpl of tpls) {
-        let dot = 0;
-        for (let i = 0; i < 140; i++) dot += canvas[i] * tpl.vec[i];
-        const conf = dot / (cNorm * tpl.norm);
-        if (conf > bestConf) {
-          bestConf = conf;
-          bestD = tpl.digit;
+        for (const tpl of tpls) {
+          let dot = 0;
+          for (let i = 0; i < 140; i++) dot += canvas[i] * tpl.vec[i];
+          const conf = dot / (cNorm * tpl.norm);
+          if (conf > bestConf) {
+            bestConf = conf;
+            bestD = tpl.digit;
+          }
         }
       }
     }
@@ -2058,7 +2079,7 @@
     const subGray = toGray(cropImage(dealerImg, bx0, by0, bw, bh));
     const mask = new Uint8Array(bw * bh);
     for (let i = 0; i < mask.length; i++) {
-      if (subGray.data[i] >= 165) mask[i] = 1;
+      if (subGray.data[i] >= 150) mask[i] = 1;
     }
 
     const { stats } = connectedComponentsWithStats(mask, bw, bh);
@@ -2067,7 +2088,7 @@
       const [x, y, w, h, area] = stats[lbl];
       if (h < minDigitH || h > maxDigitH) continue;
       if (w < 2 || w > Math.round(h * 1.05)) continue;
-      if (area < 8) continue;
+      if (area < 6) continue;
       if (x + w >= bw - 1 && h >= maxDigitH * 0.9) continue;
 
       // Verify surrounding badge ring is dark (white-on-dark circular pill, not card text on white)
@@ -2084,11 +2105,13 @@
           if (subGray.data[py * bw + px] < 135) darkBorder++;
         }
       }
-      if (borderCnt > 0 && darkBorder / borderCnt < 0.45) continue;
+      const darkRatio = borderCnt > 0 ? darkBorder / borderCnt : 0;
+      if (borderCnt > 0 && darkRatio < 0.45) continue;
 
       const [digit, conf] = matchBadgeDigitPatch(subGray, x, y, w, h);
-      if (digit !== null && conf >= 0.72) {
-        digitCands.push({ x, y, w, h, digit, conf });
+      const minSingleConf = darkRatio >= 0.80 ? 0.55 : 0.68;
+      if (digit !== null && conf >= minSingleConf) {
+        digitCands.push({ x, y, w, h, digit, conf, darkRatio });
       }
     }
 
@@ -2120,7 +2143,9 @@
       const numStr = g.map((c) => c.digit).join("");
       const total = parseInt(numStr, 10);
       const minConf = Math.min(...g.map((c) => c.conf));
-      if (Number.isInteger(total) && total >= 4 && total <= 26 && minConf >= 0.76) {
+      const allStrongDark = g.every((c) => (c.darkRatio || 0) >= 0.80);
+      const reqConf = allStrongDark ? 0.56 : 0.70;
+      if (Number.isInteger(total) && total >= 4 && total <= 26 && minConf >= reqConf) {
         bestTotal = total;
         bestConf = minConf;
         break;

@@ -1387,4 +1387,71 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 22 PASSED");
 }
 
+// 23. 1/3-2/3 Split View #111111 divider detection & small 5x7 dealer badge digits
+{
+  console.log("23. Testing 1/3-2/3 Split View divider (#111111) & small 5x7 dealer badge digits...");
+  const fw = 1024, fh = 711;
+  const f = Engine.createImage(fw, fh, 3, 20);
+  // Left pane: 16:9 game area at y=99..335 on dark browser chrome
+  for (let y = 99; y < 434; y++) {
+    for (let x = 0; x < 334; x++) {
+      const idx = (y * fw + x) * 3;
+      f.data[idx] = 45; f.data[idx + 1] = 95; f.data[idx + 2] = 40;
+    }
+  }
+  // iPadOS #111111 (17,17,17) Split View divider at x=334..339
+  for (let y = 0; y < fh; y++) {
+    for (let x = 334; x < 339; x++) {
+      const idx = (y * fw + x) * 3;
+      f.data[idx] = 17; f.data[idx + 1] = 17; f.data[idx + 2] = 17;
+    }
+    // Secondary internal dark gap at x=714..719 (must NOT override leftmost divider)
+    for (let x = 714; x < 719; x++) {
+      const idx = (y * fw + x) * 3;
+      f.data[idx] = 10; f.data[idx + 1] = 10; f.data[idx + 2] = 10;
+    }
+  }
+  const [vx, vy, vw, vh] = Engine.detectSplitViewLeftPane(f);
+  assert.strictEqual(vx, 0);
+  assert.strictEqual(vw, 334, `Expected 1/3 Split View width 334, got ${vw}`);
+  assert(vy >= 90 && vy <= 105 && vh >= 325 && vh <= 345, `Expected 16:9 vertical bounds, got y=${vy}, h=${vh}`);
+
+  // Small 5x7 '8' inside dark circular badge to left of dealer cluster
+  const dImg = Engine.createImage(127, 74, 3, 35);
+  // White card cluster at x=39..85, y=12..54
+  for (let y = 12; y < 54; y++) {
+    for (let x = 39; x < 85; x++) {
+      const idx = (y * 127 + x) * 3;
+      dImg.data[idx] = 240; dImg.data[idx + 1] = 240; dImg.data[idx + 2] = 240;
+    }
+  }
+  // Dark badge circle around x=30..40, y=28..39
+  for (let y = 26; y < 41; y++) {
+    for (let x = 27; x < 42; x++) {
+      const idx = (y * 127 + x) * 3;
+      dImg.data[idx] = 20; dImg.data[idx + 1] = 20; dImg.data[idx + 2] = 20;
+    }
+  }
+  const g8 = [
+    ".###.",
+    "#...#",
+    "#...#",
+    ".###.",
+    "#...#",
+    "#...#",
+    ".###.",
+  ];
+  for (let gy = 0; gy < 7; gy++) {
+    for (let gx = 0; gx < 5; gx++) {
+      if (g8[gy][gx] === "#") {
+        const idx = ((30 + gy) * 127 + (32 + gx)) * 3;
+        dImg.data[idx] = 235; dImg.data[idx + 1] = 235; dImg.data[idx + 2] = 235;
+      }
+    }
+  }
+  const [badge8] = Engine.detectDealerBadgeTotal(dImg, [[39, 12, 46, 42]]);
+  assert.strictEqual(badge8, 8, `Expected 5x7 badge digit 8, got ${badge8}`);
+  console.log("   Test 23 PASSED");
+}
+
 
