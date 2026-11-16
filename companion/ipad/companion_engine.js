@@ -2898,6 +2898,10 @@
       this._bestDealerTail = new Map();
       this._lastDealerBadgeTotal = null;
       this._lastDealerBadgeConf = 0.0;
+      this._reconcileSig = null;
+      this._reconcileFrames = 0;
+      this._reconcileSince = 0.0;
+      if (typeof this._lastReconcileTs !== "number") this._lastReconcileTs = -999.0;
     }
 
     resyncRound(clearPending = true) {
@@ -3605,7 +3609,173 @@
         events.push(...this._finalizeClearedRound(now));
         return events;
       }
+      if (!splitPending && !events.some((e) => e.type === "card" || e.type === "split")) {
+        this._maybeReconcileHud(obs, handsInput, events, now);
+      }
       return events;
+    }
+
+    _maybeReconcileHud(obs, handsInput, events, now) {
+      if (
+        !["DEALING", "PLAYER_TURN", "DEALER_TURN"].includes(this.state) ||
+        obs.shuffle_active ||
+        ["PLACE_BETS", "LAST_BETS", "NO_MORE_BETS"].includes(obs.banner_state) ||
+        !Object.keys(handsInput).length
+      ) {
+        this._reconcileSig = null;
+        this._reconcileFrames = 0;
+        return;
+      }
+
+      const minRecConf = Math.max(0.86, this.cfg.min_hud_confidence + 0.02);
+      const sortedKeys = Object.keys(handsInput).map(Number).sort((a, b) => a - b);
+      for (const h of sortedKeys) {
+        const cs = handsInput[h];
+        if (!cs || !cs.length || cs.some((d) => d.val === null || d.val === undefined || d.conf < minRecConf)) {
+          this._reconcileSig = null;
+          this._reconcileFrames = 0;
+          return;
+        }
+      }
+      const dReal = (obs.dealer_cards || []).filter((d) => d.val !== null && d.val !== undefined);
+      if (dReal.some((d) => d.conf < minRecConf)) {
+        this._reconcileSig = null;
+        this._reconcileFrames = 0;
+        return;
+      }
+
+      const pSig = sortedKeys.map((h) => `${h}:${handsInput[h].map((d) => `${d.rank}=${d.val}`).join(",")}`).join("|");
+      const dSig = dReal.map((d) => `${d.rank}=${d.val}`).join(",");
+      const sig = `${pSig}||${dSig}`;
+
+      if (sig === this._reconcileSig) {
+        this._reconcileFrames++;
+      } else {
+        this._reconcileSig = sig;
+        this._reconcileFrames = 1;
+        this._reconcileSince = now;
+      }
+
+      const reqFrames = Math.max(8, this.cfg.confirm_frames * 2);
+      if (this._reconcileFrames < reqFrames || (now - this._reconcileSince) < 0.75 || (now - this._lastReconcileTs) < 2.0) {
+        return;
+      }
+
+      // Monotonic guard: NEVER shrink or delete already-committed cards in player or dealer debouncers
+      const debKeys = Object.keys(this.pDebouncers).map(Number).sort((a, b) => a - b);
+      if (sortedKeys.length < debKeys.filter((k) => (this.pDebouncers[k]?.committedRanks || []).length > 0).length) {
+        return;
+      }
+      let sameLenRankDiff = false;
+      for (const h of sortedKeys) {
+        const commP = this.pDebouncers[h] ? this.pDebouncers[h].committedRanks.filter((r) => r !== "BACK") : [];
+        const hudP = handsInput[h];
+        if (hudP.length < commP.length) return;
+        if (hudP.length === commP.length) {
+          for (let j = 0; j < commP.length; j++) {
+            if (!sameBjValue(hudP[j].rank, commP[j])) {
+              sameLenRankDiff = true;
+              if (hudP[j].conf < 0.90) return;
+            }
+          }
+        }
+      }
+      const commD = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
+      if (dReal.length < commD.length) return;
+      if (dReal.length === commD.length) {
+        for (let j = 0; j < commD.length; j++) {
+          if (!sameBjValue(dReal[j].rank, commD[j])) {
+            sameLenRankDiff = true;
+            if (dReal[j].conf < 0.90) return;
+          }
+        }
+      }
+      if (sameLenRankDiff && this._reconcileFrames < Math.max(10, reqFrames + 2)) return;
+
+      const debHandsStr = debKeys
+        .filter((h) => this.pDebouncers[h] && this.pDebouncers[h].committedRanks.length)
+        .map((h) => `${h}:${this.pDebouncers[h].committedRanks.filter((r) => r !== "BACK").join(",")}`)
+        .join("|");
+      const hudHandsStr = sortedKeys.map((h) => `${h}:${handsInput[h].map((d) => d.rank).join(",")}`).join("|");
+      const debDealerStr = commD.join(",");
+      const hudDealerStr = dReal.map((d) => d.rank).join(",");
+      const debMismatch = debHandsStr !== hudHandsStr || debDealerStr !== hudDealerStr;
+
+      const hudHandsVals = sortedKeys.map((h) => handsInput[h].filter((d) => d.val !== null && d.val !== undefined).map((d) => Number(d.val)));
+      const hudDealerVals = dReal.filter((d) => d.val !== null && d.val !== undefined).map((d) => Number(d.val));
+
+      let pUiMismatch = false;
+      let dUiMismatch = false;
+      if (this.sync_round_id === this.round_id && Array.isArray(this.sync_draft_hands)) {
+        if (this.sync_draft_hands.length !== hudHandsVals.length) {
+          const totalUi = this.sync_draft_hands.reduce((a, x) => a + x.length, 0);
+          const totalHud = hudHandsVals.reduce((a, x) => a + x.length, 0);
+          if (!(this.sync_draft_hands_manual.some(Boolean) && totalHud <= totalUi) && totalHud >= totalUi) {
+            pUiMismatch = true;
+          }
+        } else {
+          for (let idx = 0; idx < hudHandsVals.length; idx++) {
+            const uiH = this.sync_draft_hands[idx] || [];
+            const hudH = hudHandsVals[idx];
+            if (hudH.length < uiH.length) return;
+            if (uiH.length !== hudH.length || uiH.some((v, j) => v !== hudH[j])) {
+              const isMan = idx < this.sync_draft_hands_manual.length && this.sync_draft_hands_manual[idx];
+              if (!(isMan && hudH.length <= uiH.length)) {
+                pUiMismatch = true;
+                break;
+              }
+            }
+          }
+        }
+        if (Array.isArray(this.sync_draft_dealer)) {
+          if (hudDealerVals.length < this.sync_draft_dealer.length) return;
+          if (this.sync_draft_dealer.length !== hudDealerVals.length || this.sync_draft_dealer.some((v, j) => v !== hudDealerVals[j])) {
+            if (!(this.sync_draft_dealer_manual && hudDealerVals.length <= this.sync_draft_dealer.length)) {
+              dUiMismatch = true;
+            }
+          }
+        }
+      }
+
+      if (!debMismatch && !pUiMismatch && !dUiMismatch) return;
+
+      const newDebouncers = {};
+      sortedKeys.forEach((hKey, posIdx) => {
+        const db = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
+        db.reanchor(handsInput[hKey].map((d) => d.rank));
+        newDebouncers[posIdx] = db;
+      });
+      this.pDebouncers = newDebouncers;
+      this.dDebouncer.reanchor((obs.dealer_cards || []).map((d) => d.rank));
+      this._emittedSplitHands = Math.max(1, sortedKeys.length);
+      this._splitDetected = sortedKeys.length >= 2;
+      this._emittedP = hudHandsVals.reduce((a, v) => a + v.length, 0);
+      this._emittedD = hudDealerVals.length;
+      this.sync_is_split = this._splitDetected;
+      this.sync_draft_hands = hudHandsVals.map((v) => v.slice());
+      this.sync_draft_dealer = hudDealerVals.slice();
+      this._uncertaintyFlags = [];
+      this._lastReconcileTs = now;
+
+      events.push({
+        type: "reconcile",
+        roundId: this.round_id,
+        handCount: this._emittedSplitHands,
+        hands: sortedKeys.map((h) =>
+          handsInput[h].map((d) => ({
+            val: d.val,
+            rankLabel: d.rank,
+            suit: d.suit,
+            conf: Number(d.conf.toFixed(3)),
+          }))
+        ),
+        dealer: dReal.map((d) => ({
+          val: d.val,
+          rankLabel: d.rank,
+          suit: d.suit,
+          conf: Number(d.conf.toFixed(3)),
+        })),
+      });
     }
   }
 

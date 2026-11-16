@@ -1536,6 +1536,74 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 25 PASSED");
 }
 
+// 26. Improved non-destructive auto-sync (reconcile) never shrinks committed cards & rescues UI desync
+{
+  console.log("26. Testing non-destructive monotonic auto-sync (reconcile)...");
+  const cfg26 = Engine.defaultConfig({
+    anchor_mode: "ipad_split_left",
+    confirm_frames: 2,
+    clear_frames: 4,
+    require_wait_banner: false,
+  });
+  const sm26 = new Engine.CompanionStateMachine(cfg26);
+  const mk = (rank, val, conf = 0.93) => ({ rank, val, conf, suit: "S", x: 10, y: 10, w: 12, h: 16, hand_index: 0 });
+
+  let t = 1.0;
+  sm26.step({ ts: t, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  for (let i = 0; i < 3; i++) {
+    t += 0.1;
+    sm26.step({
+      ts: t,
+      banner_state: "",
+      player_cards: [mk("5", 5), mk("9", 9), mk("10", 0)],
+      dealer_cards: [mk("3", 3)],
+      player_hands: { 0: [mk("5", 5), mk("9", 9), mk("10", 0)] },
+      hud_refreshed: true,
+    });
+  }
+  assert.deepStrictEqual(sm26.pDebouncers[0].committedRanks, ["5", "9", "10"]);
+
+  // 26a. Occluded HUD (missing first card '5' -> only [9, 10]) must NEVER shrink committed cards
+  let shrinkEvs = [];
+  for (let i = 0; i < 12; i++) {
+    t += 0.12;
+    shrinkEvs.push(...sm26.step({
+      ts: t,
+      banner_state: "",
+      player_cards: [mk("9", 9), mk("10", 0)],
+      dealer_cards: [mk("3", 3)],
+      player_hands: { 0: [mk("9", 9), mk("10", 0)] },
+      hud_refreshed: true,
+    }));
+  }
+  assert(!shrinkEvs.some((e) => e.type === "reconcile"), "Auto-sync must NEVER shrink committed cards");
+  assert.deepStrictEqual(sm26.pDebouncers[0].committedRanks, ["5", "9", "10"]);
+
+  // 26b. UI desync (UI only has [5, 9] while HUD stably shows [5, 9, 10]) must emit reconcile
+  sm26.sync_round_id = sm26.round_id;
+  sm26.sync_draft_hands = [[5, 9]];
+  sm26.sync_draft_hands_manual = [false];
+  sm26.sync_draft_dealer = [3];
+  sm26.sync_draft_dealer_manual = false;
+  let recEvs = [];
+  for (let i = 0; i < 10; i++) {
+    t += 0.12;
+    recEvs.push(...sm26.step({
+      ts: t,
+      banner_state: "",
+      player_cards: [mk("5", 5), mk("9", 9), mk("10", 0)],
+      dealer_cards: [mk("3", 3)],
+      player_hands: { 0: [mk("5", 5), mk("9", 9), mk("10", 0)] },
+      hud_refreshed: true,
+    }));
+  }
+  const rec = recEvs.find((e) => e.type === "reconcile");
+  assert(rec, "Auto-sync must emit reconcile when UI is missing committed cards");
+  assert.deepStrictEqual(rec.hands[0].map((c) => c.rankLabel), ["5", "9", "10"]);
+  console.log("   Test 26 PASSED");
+}
+
+
 
 
 
