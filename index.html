@@ -4642,54 +4642,6 @@ function handleCompanionMessage(msg){
     });
     return;
   }
-  if(msg.type === 'reconcile'){
-    _prepareIncomingCompRound();
-    const rawHands = Array.isArray(msg.hands) ? msg.hands : [];
-    const prevSplit = draft.hands && draft.hands.length > 1;
-    const nextHands = rawHands.map((cardsArr, hIdx) => {
-      const prevH = draft.hands && draft.hands[hIdx];
-      const cs = Array.isArray(cardsArr) ? cardsArr : [];
-      const vals = [];
-      const metas = [];
-      cs.forEach((c) => {
-        if(!c || typeof c.val !== 'number') return;
-        vals.push(c.val);
-        metas.push(_makeCardMeta(c.val, { rankLabel: c.rankLabel, suit: c.suit, source: 'comp' }));
-      });
-      const prevWasBust = !!(prevH && (prevH.res === 'LOSS' || prevH.res === 'DBL_LOSS') && evalHand(prevH.cards || [], prevSplit).isBust);
-      const prevWasBJ = !!(prevH && prevH.res === 'BJ' && !evalHand(vals, rawHands.length > 1).isBJ);
-      const baseRes = (!prevWasBust && !prevWasBJ && prevH && prevH.res) ? prevH.res : ((prevH && prevH.dbl) ? 'DBL_WIN' : 'WIN');
-      const hObj = {
-        cards: vals,
-        cardMeta: metas,
-        res: baseRes,
-        fromAceSplit: !!(prevH && prevH.fromAceSplit) || (rawHands.length > 1 && vals[0] === 1),
-        dbl: !!(prevH && prevH.dbl)
-      };
-      syncHandResultState(hObj, rawHands.length > 1);
-      return hObj;
-    });
-    if(nextHands.length){
-      draft.hands = nextHands;
-      draft.activeHand = Math.max(0, Math.min(draft.activeHand || 0, nextHands.length - 1));
-    }
-    if(Array.isArray(msg.dealer)){
-      draft.dCards = [];
-      draft.dMeta = [];
-      msg.dealer.forEach((c) => {
-        if(!c || typeof c.val !== 'number') return;
-        draft.dCards.push(c.val);
-        draft.dMeta.push(_makeCardMeta(c.val, { rankLabel: c.rankLabel, suit: c.suit, source: 'comp' }));
-      });
-    }
-    if(draft.compPrompt && draft.compPrompt.reason === 'HUD_GLITCH'){
-      draft.compPrompt = null;
-    }
-    draft.lastMsg = '↻ Auto-resynced tracker cards to match live HUD.';
-    render();
-    syncCompanionState(true);
-    return;
-  }
   if(msg.type === 'card'){
     if(typeof msg.val !== 'number') return;
     _prepareIncomingCompRound();

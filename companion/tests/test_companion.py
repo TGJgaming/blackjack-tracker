@@ -1174,52 +1174,6 @@ def test_qq_split_overlap_debounce_and_auto_resync(tmp_path: Path) -> None:
         )))
     assert [(e["handIndex"], e["slot"], e["rankLabel"]) for e in evs_hit if e["type"] == "card" and e["target"] == "P"] == [(0, 1, "Q")]
 
-    # Auto-resync fixes an extra drifted card in UI (e.g. phantom '4') after >=6 frames & >=0.55s
-    sm.resync_round()
-    sm.set_sync_state(play_mode="watch")
-    c4_a = CardDetection("4", 4, 0.93, 10, 0, 12, 22, suit="C", hand_index=0)
-    c4_b = CardDetection("4", 4, 0.95, 24, 0, 12, 22, suit="S", hand_index=0)
-    for ts in (5.0, 5.15):
-        sm.step(FrameObservation(ts=ts, banner_state="WAIT", player_cards=[c4_a, c4_b], player_hands={0: [c4_a, c4_b]}, dealer_cards=[d6]))
-    sm.set_sync_state(
-        comp_round_id=sm.round_id,
-        draft_hands=[[4, 4, 4]],
-        draft_dealer=[6],
-        draft_hands_manual=[False],
-        draft_dealer_manual=False,
-    )
-    rec_evs = []
-    for i in range(6):
-        rec_evs.extend(sm.step(FrameObservation(
-            ts=5.5 + i * 0.12,
-            banner_state="WAIT",
-            player_cards=[c4_a, c4_b],
-            player_hands={0: [c4_a, c4_b]},
-            dealer_cards=[d6],
-        )))
-    recs = [e for e in rec_evs if e["type"] == "reconcile"]
-    assert len(recs) == 1
-    assert [[c["val"] for c in h] for h in recs[0]["hands"]] == [[4, 4]]
-
-    # Manual-entry guard: manually typed card must NOT be shrunk away by fewer HUD cards
-    sm.set_sync_state(
-        comp_round_id=sm.round_id,
-        draft_hands=[[4, 4, 5]],
-        draft_dealer=[6],
-        draft_hands_manual=[True],
-        draft_dealer_manual=False,
-    )
-    man_evs = []
-    for i in range(7):
-        man_evs.extend(sm.step(FrameObservation(
-            ts=8.0 + i * 0.12,
-            banner_state="WAIT",
-            player_cards=[c4_a, c4_b],
-            player_hands={0: [c4_a, c4_b]},
-            dealer_cards=[d6],
-        )))
-    assert [e for e in man_evs if e["type"] == "reconcile"] == []
-
 
 def test_delayed_auto_watch_review_window_fallback_and_manual_clear() -> None:
     """auto_watch waits through PLACE_BETS/LAST_BETS until NO_MORE_BETS, flushes on fallback, and cancels on manual clear."""

@@ -1010,7 +1010,7 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 16 PASSED");
 }
 
-// Test 17: Split-hand reliability (debounce, overlap guard, re-anchor, seed lock, auto-watch, reconcile)
+// Test 17: Split-hand reliability (debounce, overlap guard, re-anchor, seed lock, auto-watch)
 {
   console.log("17. Testing split-hand debounce, overlap guard, re-anchor, seed lock & auto-watch...");
   const sm17 = new Engine.CompanionStateMachine(cfg);

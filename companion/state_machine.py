@@ -846,11 +846,6 @@ class CompanionStateMachine:
         self._round_felt_sightings: list[dict[str, Any]] = []
         self._last_sighting_by_zone: dict[tuple[str, str], float] = {}
 
-        self._reconcile_sig: tuple[Any, ...] | None = None
-        self._reconcile_frames: int = 0
-        self._reconcile_since: float = 0.0
-        self._last_reconcile_ts: float = -999.0
-
         self._last_banner_emitted: str = ""
         self._last_bet_banner: str = ""
         self._seen_wait_in_round: bool = False
@@ -891,9 +886,6 @@ class CompanionStateMachine:
         self._split_cand_target = 1
         self._split_pending_seqs.clear()
         self._split_seed_cards.clear()
-        self._reconcile_sig = None
-        self._reconcile_frames = 0
-        self._reconcile_since = 0.0
         self._uncertainty_flags.clear()
         self._unread_community_pulses = 0
         self._recent_hud_p.clear()
@@ -1668,138 +1660,4 @@ class CompanionStateMachine:
             events.extend(self._finalize_cleared_round(obs.ts))
             return events
 
-        # 6. Auto-Resync fallback: reconcile drifted debouncer / UI cards against stably held crisp HUD snapshot
-        if not split_pending and not any(e.get("type") in ("card", "split") for e in events):
-            self._maybe_reconcile_hud(obs, hands_input, events)
-
         return events
-
-    def _maybe_reconcile_hud(
-        self,
-        obs: FrameObservation,
-        hands_input: dict[int, list[CardDetection]],
-        events: list[dict[str, Any]],
-    ) -> None:
-        if (
-            self.state not in ("DEALING", "PLAYER_TURN", "DEALER_TURN")
-            or obs.shuffle_active
-            or obs.banner_state in ("PLACE_BETS", "LAST_BETS", "NO_MORE_BETS")
-            or not hands_input
-        ):
-            self._reconcile_sig = None
-            self._reconcile_frames = 0
-            return
-
-        min_rec_conf = max(0.80, self.cfg.min_hud_confidence - 0.04)
-        for cs in hands_input.values():
-            if not cs or any(d.val is None or d.conf < min_rec_conf for d in cs):
-                self._reconcile_sig = None
-                self._reconcile_frames = 0
-                return
-        d_real = [d for d in obs.dealer_cards if d.val is not None]
-        if any(d.conf < min_rec_conf for d in d_real):
-            self._reconcile_sig = None
-            self._reconcile_frames = 0
-            return
-
-        sorted_keys = sorted(hands_input.keys())
-        p_sig = tuple((h, tuple((d.rank, d.val) for d in hands_input[h])) for h in sorted_keys)
-        d_sig = tuple((d.rank, d.val) for d in d_real)
-        sig = (p_sig, d_sig)
-
-        if sig == self._reconcile_sig:
-            self._reconcile_frames += 1
-        else:
-            self._reconcile_sig = sig
-            self._reconcile_frames = 1
-            self._reconcile_since = obs.ts
-
-        req_frames = max(6, self.cfg.confirm_frames * 2)
-        if (
-            self._reconcile_frames < req_frames
-            or (obs.ts - self._reconcile_since) < 0.55
-            or (obs.ts - self._last_reconcile_ts) < 1.5
-        ):
-            return
-
-        deb_hands = {
-            h: [r for r in db.committed_ranks if r != "BACK"]
-            for h, db in sorted(self.p_debouncers.items())
-            if db.committed_ranks
-        }
-        hud_hands_ranks = {h: [d.rank for d in hands_input[h]] for h in sorted_keys}
-        deb_dealer = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
-        hud_dealer_real_ranks = [d.rank for d in d_real]
-        deb_mismatch = (deb_hands != hud_hands_ranks) or (deb_dealer != hud_dealer_real_ranks)
-
-        hud_hands_vals = [[int(d.val) for d in hands_input[h] if d.val is not None] for h in sorted_keys]
-        hud_dealer_vals = [int(d.val) for d in d_real if d.val is not None]
-
-        p_ui_mismatch = False
-        d_ui_mismatch = False
-        if self.sync_round_id == self.round_id and self.sync_draft_hands is not None:
-            if len(self.sync_draft_hands) != len(hud_hands_vals):
-                total_ui = sum(len(x) for x in self.sync_draft_hands)
-                total_hud = sum(len(x) for x in hud_hands_vals)
-                if not (any(self.sync_draft_hands_manual) and total_hud < total_ui):
-                    p_ui_mismatch = True
-            else:
-                for idx, (ui_h, hud_h) in enumerate(zip(self.sync_draft_hands, hud_hands_vals)):
-                    if ui_h != hud_h:
-                        is_man = idx < len(self.sync_draft_hands_manual) and self.sync_draft_hands_manual[idx]
-                        if not (is_man and len(hud_h) < len(ui_h)):
-                            p_ui_mismatch = True
-                            break
-            if self.sync_draft_dealer is not None and self.sync_draft_dealer != hud_dealer_vals:
-                if not (self.sync_draft_dealer_manual and len(hud_dealer_vals) < len(self.sync_draft_dealer)):
-                    d_ui_mismatch = True
-
-        if not (deb_mismatch or p_ui_mismatch or d_ui_mismatch):
-            return
-
-        new_debouncers: dict[int, SequenceDebouncer] = {}
-        for pos_idx, h_key in enumerate(sorted_keys):
-            db = SequenceDebouncer(self.cfg.confirm_frames, self.cfg.clear_frames)
-            db.reanchor(hud_hands_ranks[h_key])
-            new_debouncers[pos_idx] = db
-        self.p_debouncers = new_debouncers
-
-        self.d_debouncer.reanchor([d.rank for d in obs.dealer_cards])
-        self._emitted_split_hands = max(1, len(sorted_keys))
-        self._split_detected = len(sorted_keys) >= 2
-        self._emitted_p = sum(len(v) for v in hud_hands_vals)
-        self._emitted_d = len(hud_dealer_vals)
-        self.sync_is_split = self._split_detected
-        self.sync_draft_hands = [list(v) for v in hud_hands_vals]
-        self.sync_draft_dealer = list(hud_dealer_vals)
-        self._uncertainty_flags = [f for f in self._uncertainty_flags if f == "MISSED_COMMUNITY_CARD"]
-        self._last_reconcile_ts = obs.ts
-
-        events.append(
-            {
-                "type": "reconcile",
-                "roundId": self.round_id,
-                "handCount": self._emitted_split_hands,
-                "hands": [
-                    [
-                        {
-                            "val": d.val,
-                            "rankLabel": d.rank,
-                            "suit": d.suit,
-                            "conf": round(d.conf, 3),
-                        }
-                        for d in hands_input[h]
-                    ]
-                    for h in sorted_keys
-                ],
-                "dealer": [
-                    {
-                        "val": d.val,
-                        "rankLabel": d.rank,
-                        "suit": d.suit,
-                        "conf": round(d.conf, 3),
-                    }
-                    for d in d_real
-                ],
-            }
-        )
