@@ -1673,10 +1673,10 @@
         const hasBadgeOcclusion = !isDealer && d.x <= 9 && sz.data.length > 0 && lt140 / sz.data.length >= 0.25 && d.conf >= Math.max(0.75, floorConf);
         if (!clusterHasBack && !edgeClipped && !hasBadgeOcclusion) {
           const remRight = effRight - d.x;
-          if (remRight < 15 && (d.conf < Math.max(0.84, minHudConf) || (!suit && !hasPipBody))) continue;
-          if (remRight < 22 && d.conf < Math.max(0.78, minHudConf - 0.06)) continue;
+          if (remRight < 15 && (d.conf < Math.max(isDealer ? 0.78 : 0.84, isDealer ? 0.78 : minHudConf) || (!suit && !hasPipBody))) continue;
+          if (remRight < 22 && d.conf < Math.max(0.75, minHudConf - 0.09)) continue;
         }
-        const highConfPipOk = hasPipBody && d.conf >= Math.max(isDealer ? 0.84 : 0.86, minHudConf);
+        const highConfPipOk = hasPipBody && d.conf >= Math.max(isDealer ? 0.75 : 0.86, isDealer ? 0.75 : minHudConf);
         if (!suit && !hasBadgeOcclusion && !highConfPipOk && (!hasPipBody || suitConf < 0.42 || d.conf < Math.max(0.82, minHudConf - 0.02))) {
           continue;
         }
@@ -1791,6 +1791,369 @@
     return false;
   }
 
+  let _BADGE_DIGIT_TPLS = null;
+  function getBadgeDigitTemplates() {
+    if (_BADGE_DIGIT_TPLS) return _BADGE_DIGIT_TPLS;
+    // 10x14 white-on-dark sans-serif digit bitmaps (1px border, 8x12 glyph; '1' is narrower & centered)
+    const glyphs = {
+      "0": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+      ],
+      "1": [
+        "..........",
+        "....###...",
+        "...####...",
+        "..##.##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        "..#######.",
+        "..........",
+      ],
+      "2": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".......##.",
+        "......##..",
+        ".....##...",
+        "....##....",
+        "...##.....",
+        "..##......",
+        ".##.......",
+        ".##.......",
+        ".########.",
+        "..........",
+      ],
+      "3": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".......##.",
+        ".......##.",
+        "......##..",
+        "...#####..",
+        "......##..",
+        ".......##.",
+        ".......##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+      ],
+      "4": [
+        "..........",
+        ".....###..",
+        "....####..",
+        "...##.##..",
+        "..##..##..",
+        ".##...##..",
+        ".##...##..",
+        ".########.",
+        "......##..",
+        "......##..",
+        "......##..",
+        "......##..",
+        "......##..",
+        "..........",
+      ],
+      "5": [
+        "..........",
+        ".########.",
+        ".##.......",
+        ".##.......",
+        ".##.......",
+        ".#######..",
+        ".......##.",
+        ".......##.",
+        ".......##.",
+        ".......##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+      ],
+      "6": [
+        "..........",
+        "...#####..",
+        "..##...##.",
+        ".##.......",
+        ".##.......",
+        ".#######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+      ],
+      "7": [
+        "..........",
+        ".########.",
+        ".##....##.",
+        ".......##.",
+        "......##..",
+        ".....##...",
+        ".....##...",
+        "....##....",
+        "....##....",
+        "...##.....",
+        "...##.....",
+        "...##.....",
+        "...##.....",
+        "..........",
+      ],
+      "8": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+      ],
+      "9": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..#######.",
+        ".......##.",
+        ".......##.",
+        "......##..",
+        ".##...##..",
+        "..#####...",
+        "..........",
+      ],
+    };
+    const out = [];
+    for (const [digit, rows] of Object.entries(glyphs)) {
+      const n = 140;
+      const vec = new Float32Array(n);
+      let sum = 0;
+      for (let y = 0; y < 14; y++) {
+        const row = rows[y];
+        for (let x = 0; x < 10; x++) {
+          const v = row[x] === "#" ? 255 : 0;
+          vec[y * 10 + x] = v;
+          sum += v;
+        }
+      }
+      const mean = sum / n;
+      let normSq = 0;
+      for (let i = 0; i < n; i++) {
+        vec[i] -= mean;
+        normSq += vec[i] * vec[i];
+      }
+      out.push({ digit, vec, norm: Math.sqrt(normSq) });
+    }
+    _BADGE_DIGIT_TPLS = out;
+    return out;
+  }
+
+  function matchBadgeDigitPatch(grayImg, x, y, w, h) {
+    if (!grayImg || w < 2 || h < 5) return [null, 0.0];
+    const targetH = 12;
+    const scale = targetH / h;
+    const targetW = Math.max(2, Math.min(8, Math.round(w * scale)));
+    const cropped = cropImage(grayImg, x, y, w, h);
+    const resized = resizeImage(cropped, targetW, targetH);
+    const baseOx = Math.floor((10 - targetW) / 2);
+    const oy = 1;
+    const tpls = getBadgeDigitTemplates();
+    let bestD = null;
+    let bestConf = -1.0;
+
+    const triedOx = new Set([
+      Math.max(0, Math.min(10 - targetW, baseOx - 1)),
+      Math.max(0, Math.min(10 - targetW, baseOx)),
+      Math.max(0, Math.min(10 - targetW, baseOx + 1)),
+    ]);
+
+    for (const ox of triedOx) {
+      const canvas = new Float32Array(140);
+      for (let ry = 0; ry < targetH; ry++) {
+        for (let rx = 0; rx < targetW; rx++) {
+          canvas[(oy + ry) * 10 + (ox + rx)] = resized.data[ry * targetW + rx];
+        }
+      }
+      let sum = 0;
+      for (let i = 0; i < 140; i++) sum += canvas[i];
+      const mean = sum / 140;
+      let normSq = 0;
+      for (let i = 0; i < 140; i++) {
+        canvas[i] -= mean;
+        normSq += canvas[i] * canvas[i];
+      }
+      const cNorm = Math.sqrt(normSq);
+      if (cNorm < 1e-4) continue;
+
+      for (const tpl of tpls) {
+        let dot = 0;
+        for (let i = 0; i < 140; i++) dot += canvas[i] * tpl.vec[i];
+        const conf = dot / (cNorm * tpl.norm);
+        if (conf > bestConf) {
+          bestConf = conf;
+          bestD = tpl.digit;
+        }
+      }
+    }
+    return [bestD, bestConf];
+  }
+
+  function detectDealerBadgeTotal(dealerImg, clusters = []) {
+    if (!dealerImg || dealerImg.w < 16 || dealerImg.h < 16) return [null, 0.0];
+    let bx0 = 0;
+    let by0 = Math.round(dealerImg.h * 0.20);
+    let bx1 = Math.round(dealerImg.w * 0.55);
+    let by1 = dealerImg.h;
+    let minDigitH = 7;
+    let maxDigitH = Math.round(dealerImg.h * 0.65);
+
+    if (clusters && clusters.length > 0) {
+      const [cx, cy, , ch] = clusters[0];
+      bx0 = Math.max(0, Math.round(cx - ch * 1.40));
+      bx1 = Math.min(dealerImg.w, Math.round(cx + ch * 0.35));
+      by0 = Math.max(0, Math.round(cy - ch * 0.08));
+      by1 = Math.min(dealerImg.h, Math.round(cy + ch * 1.35));
+      minDigitH = Math.max(6, Math.round(ch * 0.16));
+      maxDigitH = Math.max(minDigitH + 4, Math.round(ch * 0.65));
+    }
+
+    const bw = bx1 - bx0;
+    const bh = by1 - by0;
+    if (bw < 10 || bh < 10) return [null, 0.0];
+
+    const subGray = toGray(cropImage(dealerImg, bx0, by0, bw, bh));
+    const mask = new Uint8Array(bw * bh);
+    for (let i = 0; i < mask.length; i++) {
+      if (subGray.data[i] >= 165) mask[i] = 1;
+    }
+
+    const { stats } = connectedComponentsWithStats(mask, bw, bh);
+    const digitCands = [];
+    for (let lbl = 1; lbl < stats.length; lbl++) {
+      const [x, y, w, h, area] = stats[lbl];
+      if (h < minDigitH || h > maxDigitH) continue;
+      if (w < 2 || w > Math.round(h * 1.05)) continue;
+      if (area < 8) continue;
+      if (x + w >= bw - 1 && h >= maxDigitH * 0.9) continue;
+
+      // Verify surrounding badge ring is dark (white-on-dark circular pill, not card text on white)
+      const mx0 = Math.max(0, x - 3);
+      const my0 = Math.max(0, y - 3);
+      const mx1 = Math.min(bw, x + w + 3);
+      const my1 = Math.min(bh, y + h + 3);
+      let darkBorder = 0;
+      let borderCnt = 0;
+      for (let py = my0; py < my1; py++) {
+        for (let px = mx0; px < mx1; px++) {
+          if (px >= x && px < x + w && py >= y && py < y + h) continue;
+          borderCnt++;
+          if (subGray.data[py * bw + px] < 135) darkBorder++;
+        }
+      }
+      if (borderCnt > 0 && darkBorder / borderCnt < 0.45) continue;
+
+      const [digit, conf] = matchBadgeDigitPatch(subGray, x, y, w, h);
+      if (digit !== null && conf >= 0.72) {
+        digitCands.push({ x, y, w, h, digit, conf });
+      }
+    }
+
+    if (!digitCands.length) return [null, 0.0];
+    digitCands.sort((a, b) => a.x - b.x);
+
+    // Group horizontally adjacent digits on the same baseline (take rightmost group if soft X/Y)
+    const groups = [];
+    for (const c of digitCands) {
+      const lastG = groups.length ? groups[groups.length - 1] : null;
+      if (lastG) {
+        const prev = lastG[lastG.length - 1];
+        const sameRow = Math.abs(c.y - prev.y) <= Math.max(3, Math.round(prev.h * 0.25));
+        const sameH = c.h >= prev.h * 0.70 && c.h <= prev.h * 1.40;
+        const gap = c.x - (prev.x + prev.w);
+        if (sameRow && sameH && gap >= -2 && gap <= Math.max(4, Math.round(prev.h * 0.55)) && lastG.length < 2) {
+          lastG.push(c);
+          continue;
+        }
+      }
+      groups.push([c]);
+    }
+
+    let bestTotal = null;
+    let bestConf = 0.0;
+    // Prefer rightmost valid 2-digit (or 1-digit) blackjack total in [4..26]
+    for (let gi = groups.length - 1; gi >= 0; gi--) {
+      const g = groups[gi];
+      const numStr = g.map((c) => c.digit).join("");
+      const total = parseInt(numStr, 10);
+      const minConf = Math.min(...g.map((c) => c.conf));
+      if (Number.isInteger(total) && total >= 4 && total <= 26 && minConf >= 0.76) {
+        bestTotal = total;
+        bestConf = minConf;
+        break;
+      }
+    }
+    return [bestTotal, bestConf];
+  }
+
+  function deduceMissingDealerCard(dCommittedRanks, badgeTotal) {
+    if (!Array.isArray(dCommittedRanks) || !dCommittedRanks.length) return null;
+    if (!Number.isInteger(badgeTotal) || badgeTotal < 4 || badgeTotal > 26) return null;
+    const [curTotal] = evalBjRanks(dCommittedRanks);
+    if (curTotal === badgeTotal) return null;
+    const candidates = [
+      { rank: "A", val: 1 },
+      { rank: "2", val: 2 },
+      { rank: "3", val: 3 },
+      { rank: "4", val: 4 },
+      { rank: "5", val: 5 },
+      { rank: "6", val: 6 },
+      { rank: "7", val: 7 },
+      { rank: "8", val: 8 },
+      { rank: "9", val: 9 },
+      { rank: "10", val: 0 },
+    ];
+    const matches = [];
+    for (const c of candidates) {
+      const [tot] = evalBjRanks([...dCommittedRanks, c.rank]);
+      if (tot === badgeTotal) matches.push(c);
+    }
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   class PlaytechDetector {
     constructor(cfg, initialPack = null) {
       this.cfg = cfg;
@@ -1806,7 +2169,7 @@
       this._cachedP = [[], {}, false];
       this._pSigAge = 0;
       this._lastDSig = null;
-      this._cachedD = [];
+      this._cachedD = [[], null, 0.0];
       this._dSigAge = 0;
       this._lastBannerSig = null;
       this._cachedTopBanner = ["", 0.0];
@@ -1941,11 +2304,11 @@
     detectHudStrip(roiImg, isDealer) {
       const hudTpls = (this.banks.hud || []).filter((t) => t.rank !== "BACK" && t.rank !== "SHUFFLE");
       if (!roiImg || roiImg.w === 0 || roiImg.h === 0 || !hudTpls.length) {
-        return [[], {}, false];
+        return [[], {}, false, []];
       }
       const floorConf = Math.max(0.68, this.cfg.min_hud_confidence - 0.10);
       const clusters = findWhiteCardClusters(roiImg);
-      if (!clusters.length) return [[], {}, false];
+      if (!clusters.length) return [[], {}, false, []];
 
       const clusterHits = [];
       let backSeen = false;
@@ -1964,7 +2327,7 @@
         backSeen = backSeen || clBack;
         if (dets.length) clusterHits.push([cl, dets]);
       }
-      if (!clusterHits.length) return [[], {}, false];
+      if (!clusterHits.length) return [[], {}, false, clusters];
 
       if (isDealer) {
         const flatD = clusterHits.flatMap(([, ds]) => ds).sort((a, b) => a.x - b.x);
@@ -1992,7 +2355,7 @@
             });
           }
         }
-        return [flatD, { 0: flatD }, false];
+        return [flatD, { 0: flatD }, false, clusters];
       }
 
       const avgCh = clusterHits.reduce((acc, [cl]) => acc + cl[3], 0) / clusterHits.length;
@@ -2020,7 +2383,7 @@
         }
         prevCl = cl;
       }
-      return [allP, hands, Object.keys(hands).length >= 2];
+      return [allP, hands, Object.keys(hands).length >= 2, clusters];
     }
 
     processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, ts = null }) {
@@ -2046,15 +2409,17 @@
       const dSig = computeRoiSignature(dealerImg, 80, 36, true);
       const dChanged = hudRoiSigChanged(dSig, this._lastDSig, 1);
       const dDiff = roiSigDiff(dSig, this._lastDSig);
-      let dCards;
+      let dCards, dBadgeTotal, dBadgeConf;
       // Dealer strip is small/cheap and holds the few cards that matter: only reuse the cache when pixels are identical.
       if (this._lastDSig && !dChanged && dDiff === 0) {
-        dCards = this._cachedD;
+        [dCards, dBadgeTotal, dBadgeConf] = this._cachedD;
       } else {
         this._lastDSig = dSig;
         this._dSigAge = 0;
-        [dCards] = this.detectHudStrip(dealerImg, true);
-        this._cachedD = dCards;
+        let dClusters = [];
+        [dCards, , , dClusters] = this.detectHudStrip(dealerImg, true);
+        [dBadgeTotal, dBadgeConf] = detectDealerBadgeTotal(dealerImg, dClusters);
+        this._cachedD = [dCards, dBadgeTotal, dBadgeConf];
       }
 
       const cardsPresent = pCards.length > 0 || dCards.length > 0;
@@ -2190,6 +2555,8 @@
         dealer_only: false,
         place_bets_conf: pbConf,
         banner_source: bannerSource,
+        dealer_badge_total: dBadgeTotal,
+        dealer_badge_conf: dBadgeConf,
       };
     }
   }
@@ -2491,6 +2858,9 @@
       this._blankCardFrames = 0;
       this._sawEmptyHudInBetting = false;
       this._predealObs = null;
+      this._bestDealerTail = new Map();
+      this._lastDealerBadgeTotal = null;
+      this._lastDealerBadgeConf = 0.0;
     }
 
     resyncRound(clearPending = true) {
@@ -2581,7 +2951,31 @@
       }
     }
 
-    _emitDealerCards(pairs, events) {
+    _recordDealerObs(obs) {
+      if (!obs) return;
+      const bTot = obs.dealer_badge_total;
+      const bConf = Number(obs.dealer_badge_conf || 0.85);
+      if (Number.isInteger(bTot) && bTot >= 4 && bTot <= 26 && bConf >= 0.76) {
+        this._lastDealerBadgeTotal = bTot;
+        this._lastDealerBadgeConf = bConf;
+      }
+      const dList = obs.dealer_cards || [];
+      for (let idx = 0; idx < dList.length; idx++) {
+        const det = dList[idx];
+        if (!det || det.rank === "BACK" || det.val === null || det.val === undefined) continue;
+        if ((det.conf || 0) < 0.70) continue;
+        const alreadyReal =
+          idx < this.dDebouncer.committedRanks.length &&
+          this.dDebouncer.committedRanks[idx] !== "BACK";
+        if (alreadyReal) continue;
+        const prev = this._bestDealerTail.get(idx);
+        if (!prev || det.conf > prev.conf) {
+          this._bestDealerTail.set(idx, det);
+        }
+      }
+    }
+
+    _emitDealerCards(pairs, events, source = "hud") {
       let dealerFlippedOrDrew = false;
       for (const [slotIdx, det] of pairs) {
         if (det.val === null || det.val === undefined) continue;
@@ -2601,7 +2995,7 @@
           slot: slotIdx,
           rankLabel: det.rank,
           conf: Number(det.conf.toFixed(3)),
-          source: "hud",
+          source,
           roundId: this.round_id,
         };
         if (det.suit) evtD.suit = det.suit;
@@ -2612,6 +3006,7 @@
 
     _finalizeClearedRound(now = Date.now() / 1000) {
       const events = [];
+      // Fallback B1: standard wipe rescue
       const rescuedD = this.dDebouncer.flushPendingOnWipe(Math.max(0.78, this.cfg.min_hud_confidence - 0.06));
       if (rescuedD.length) {
         this._emitDealerCards(rescuedD, events);
@@ -2630,20 +3025,84 @@
         pHandsRanks.length > 0 &&
         pHandsRanks.every((hr) => hr.length === 2 && evalBjRanks(hr)[0] === 21);
 
+      const isDealerStillIncomplete = () => {
+        const dComm = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
+        const [dTot] = evalBjRanks(dComm);
+        const hasBack = this.dDebouncer.committedRanks.includes("BACK");
+        return (
+          this._emittedP >= 2 &&
+          anyPlayerAlive &&
+          (
+            (dComm.length >= 2 && dTot < 17) ||
+            (hasBack && dComm.length >= 1) ||
+            (dComm.length === 1 && !allPlayersNaturalBJ)
+          )
+        );
+      };
+
+      // Fallback B2: lower-confidence wipe rescue if dealer hand is still incomplete
+      if (isDealerStillIncomplete()) {
+        const rescuedLow = this.dDebouncer.flushPendingOnWipe(0.72);
+        if (rescuedLow.length) {
+          this._emitDealerCards(rescuedLow, events);
+        }
+      }
+
+      // Fallback C: transient best-seen dealer card buffer across the round
+      if (isDealerStillIncomplete() && this._bestDealerTail && this._bestDealerTail.size) {
+        const tailRecovered = [];
+        for (let idx = 0; idx < this.dDebouncer.committedRanks.length; idx++) {
+          if (this.dDebouncer.committedRanks[idx] === "BACK" && this._bestDealerTail.has(idx)) {
+            const det = this._bestDealerTail.get(idx);
+            if (det && det.conf >= 0.72) {
+              this.dDebouncer.committedRanks[idx] = det.rank;
+              tailRecovered.push([idx, det]);
+            }
+          }
+        }
+        if (!this.dDebouncer.committedRanks.includes("BACK")) {
+          while (true) {
+            const idx = this.dDebouncer.committedRanks.length;
+            const det = this._bestDealerTail.get(idx);
+            if (!det || det.conf < 0.72) break;
+            this.dDebouncer.committedRanks.push(det.rank);
+            tailRecovered.push([idx, det]);
+          }
+        }
+        if (tailRecovered.length) {
+          this._emitDealerCards(tailRecovered, events);
+        }
+      }
+
+      // Fallback D: deduce missing final dealer card rank from Dealer Score Badge total
+      if (isDealerStillIncomplete() && this._lastDealerBadgeTotal !== null) {
+        const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
+        const deduced = deduceMissingDealerCard(dCommBefore, this._lastDealerBadgeTotal);
+        if (deduced) {
+          const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
+          const slotIdx = backIdx >= 0 ? backIdx : this.dDebouncer.committedRanks.length;
+          if (backIdx >= 0) {
+            this.dDebouncer.committedRanks[backIdx] = deduced.rank;
+          } else {
+            this.dDebouncer.committedRanks.push(deduced.rank);
+          }
+          const deducedDet = {
+            rank: deduced.rank,
+            val: deduced.val,
+            conf: Math.max(0.78, this._lastDealerBadgeConf || 0.85),
+            suit: null,
+          };
+          this._emitDealerCards([[slotIdx, deducedDet]], events, "badge_deduced");
+        }
+      }
+
       const dCommitted = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
       const [dTotal] = evalBjRanks(dCommitted);
       const hasUnrevealedBack = this.dDebouncer.committedRanks.includes("BACK");
       const flags = this._uncertaintyFlags.slice();
       if (this._emittedP < 2 || this._emittedD < 1) flags.push("HUD_GLITCH");
 
-      const dealerIncomplete =
-        this._emittedP >= 2 &&
-        anyPlayerAlive &&
-        (
-          (dCommitted.length >= 2 && dTotal < 17) ||
-          (hasUnrevealedBack && dCommitted.length >= 1) ||
-          (dCommitted.length === 1 && !allPlayersNaturalBJ)
-        );
+      const dealerIncomplete = isDealerStillIncomplete();
       if (dealerIncomplete && !flags.includes("HUD_GLITCH") && !flags.includes("DEALER_INCOMPLETE")) {
         flags.push("DEALER_INCOMPLETE");
       }
@@ -2728,6 +3187,11 @@
 
       if (["PLACE_BETS", "LAST_BETS", "NO_MORE_BETS"].includes(banner)) {
         if (activeRound && hasCards) {
+          this._recordDealerObs(obs);
+          if (obs.dealer_cards && obs.dealer_cards.length) {
+            const [newDPre] = this.dDebouncer.update(obs.dealer_cards);
+            if (newDPre.length) this._emitDealerCards(newDPre, events);
+          }
           events.push(...this._finalizeClearedRound(now));
         }
         if (banner === "NO_MORE_BETS") {
@@ -3046,6 +3510,7 @@
         if (!Object.keys(this.pDebouncers).length) pCleared = true;
       }
 
+      this._recordDealerObs(obs);
       const [newD, dCleared] = this.dDebouncer.update(obs.dealer_cards || []);
       const dealerFlippedOrDrew = this._emitDealerCards(newD, events);
 
@@ -4630,6 +5095,8 @@
     trimCardGlyph,
     findWhiteCardClusters,
     detectClusterCards,
+    detectDealerBadgeTotal,
+    deduceMissingDealerCard,
     computeRoiSignature,
     roiSigDiff,
     hudRoiSigChanged,

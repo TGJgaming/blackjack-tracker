@@ -691,11 +691,11 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
     sm12a.step({ ts: 1.3, banner_state: "WAIT", banner_conf: 0.95, player_cards: p98, dealer_cards: [mkDet("10", 0, 0.94, "S", 10), mkDet("6", 6, 0.93, "H", 30)], player_hands: { 0: p98 } });
     sm12a.step({ ts: 1.4, banner_state: "WAIT", banner_conf: 0.95, player_cards: p98, dealer_cards: [mkDet("10", 0, 0.94, "S", 10), mkDet("6", 6, 0.93, "H", 30)], player_hands: { 0: p98 } });
     // Final "2D" visible for ONLY 1 frame, then brief 1-frame partial drop of "2D" before wipe
-    sm12a.step({ ts: 1.5, banner_state: "WAIT", banner_conf: 0.95, player_cards: p98, dealer_cards: [mkDet("10", 0, 0.94, "S", 10), mkDet("6", 6, 0.93, "H", 30), mkDet("2", 2, 0.91, "D", 50)], player_hands: { 0: p98 } });
+    const s15 = sm12a.step({ ts: 1.5, banner_state: "WAIT", banner_conf: 0.95, player_cards: p98, dealer_cards: [mkDet("10", 0, 0.94, "S", 10), mkDet("6", 6, 0.93, "H", 30), mkDet("2", 2, 0.91, "D", 50)], player_hands: { 0: p98 } });
     sm12a.step({ ts: 1.6, banner_state: "WAIT", banner_conf: 0.95, player_cards: p98, dealer_cards: [mkDet("10", 0, 0.94, "S", 10), mkDet("6", 6, 0.93, "H", 30)], player_hands: { 0: p98 } });
     const pb12a = sm12a.step({ ts: 1.7, banner_state: "PLACE_BETS", banner_conf: 0.94, player_cards: [], dealer_cards: [], player_hands: {} });
-    const rescued2 = pb12a.find((e) => e.type === "card" && e.target === "D" && e.rankLabel === "2");
-    assert(rescued2, "Final 1-frame dealer card '2' must be rescued on wipe");
+    const rescued2 = [...s15, ...pb12a].find((e) => e.type === "card" && e.target === "D" && e.rankLabel === "2");
+    assert(rescued2, "Final 1-frame dealer card '2' must be recorded (instant or rescued on wipe)");
     const nmb12a = sm12a.step({ ts: 1.8, banner_state: "NO_MORE_BETS", banner_conf: 0.94, player_cards: [], dealer_cards: [], player_hands: {} });
     assert(nmb12a.some((e) => e.type === "auto_watch"), "Rescued 18 dealer total should auto_watch cleanly");
 
@@ -705,9 +705,9 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
     sm12b.step({ ts: 2.0, banner_state: "WAIT", banner_conf: 0.95, player_cards: [], dealer_cards: [], player_hands: {} });
     sm12b.step({ ts: 2.1, banner_state: "WAIT", banner_conf: 0.95, player_cards: p19, dealer_cards: [mkDet("10", 0, 0.94, "D", 10), mkDet("BACK", null, 0.92, null, 30)], player_hands: { 0: p19 } });
     sm12b.step({ ts: 2.2, banner_state: "WAIT", banner_conf: 0.95, player_cards: p19, dealer_cards: [mkDet("10", 0, 0.94, "D", 10), mkDet("BACK", null, 0.92, null, 30)], player_hands: { 0: p19 } });
-    sm12b.step({ ts: 2.3, banner_state: "", banner_conf: 0, player_cards: p19, dealer_cards: [mkDet("10", 0, 0.94, "D", 10), mkDet("7", 7, 0.90, "C", 30)], player_hands: { 0: p19 } });
+    const s23 = sm12b.step({ ts: 2.3, banner_state: "", banner_conf: 0, player_cards: p19, dealer_cards: [mkDet("10", 0, 0.94, "D", 10), mkDet("7", 7, 0.90, "C", 30)], player_hands: { 0: p19 } });
     const pb12b = sm12b.step({ ts: 2.4, banner_state: "PLACE_BETS", banner_conf: 0.94, player_cards: [], dealer_cards: [], player_hands: {} });
-    assert(pb12b.some((e) => e.type === "card" && e.target === "D" && e.rankLabel === "7" && e.slot === 1), "1-frame hole card '7' replacing BACK must be rescued on wipe");
+    assert([...s23, ...pb12b].some((e) => e.type === "card" && e.target === "D" && e.rankLabel === "7" && e.slot === 1), "1-frame hole card '7' replacing BACK must be recorded (instant or rescued on wipe)");
     const nmb12b = sm12b.step({ ts: 2.5, banner_state: "NO_MORE_BETS", banner_conf: 0.94, player_cards: [], dealer_cards: [], player_hands: {} });
     assert(nmb12b.some((e) => e.type === "auto_watch"), "Rescued hole card reaching 17 should emit auto_watch");
 
@@ -1189,3 +1189,98 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   assert(kaEvWipe.some((e) => e.event === "refreshing"), "Keepalive must trigger immediately when both strips are wiped in ROUND_OVER");
   console.log("   Test 20 PASSED");
 }
+
+// Test 21: Multi-fallback final dealer card rescue (same-frame PLACE_BETS, transient tail buffer, badge OCR & rank deduction)
+{
+  console.log("21. Testing multi-fallback final dealer card rescue & badge deduction...");
+  const mkC = (rank, val, conf = 0.93, suit = "S", x = 10) => ({ rank, val, conf, suit, x, y: 10, w: 12, h: 16, hand_index: 0 });
+  const p1 = mkC("10", 0, 0.94, "S", 20);
+  const p2 = mkC("8", 8, 0.94, "H", 40);
+  const d10 = mkC("10", 0, 0.94, "C", 10);
+  const d6 = mkC("6", 6, 0.93, "D", 30);
+  const dA = mkC("A", 1, 0.93, "S", 10);
+  const d5 = mkC("5", 5, 0.93, "H", 30);
+
+  // 21a. Final dealer card appearing ONLY on the PLACE_BETS frame is still captured before round finalizes
+  const sm21a = new Engine.CompanionStateMachine(cfg);
+  let t = 100.0;
+  sm21a.step({ ts: (t += 0.1), banner_state: "NO_MORE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  for (let i = 0; i < 3; i++) {
+    sm21a.step({ ts: (t += 0.1), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d10, d6], player_hands: { 0: [p1, p2] } });
+  }
+  const d3SameFrame = mkC("4", 4, 0.80, null, 50);
+  const evPb = sm21a.step({ ts: (t += 0.1), banner_state: "PLACE_BETS", banner_conf: 0.92, player_cards: [p1, p2], dealer_cards: [d10, d6, d3SameFrame], player_hands: { 0: [p1, p2] } });
+  assert(evPb.some((e) => e.type === "card" && e.target === "D" && e.rankLabel === "4"), "Final dealer card on PLACE_BETS frame must be rescued");
+  const evNmb = sm21a.step({ ts: (t += 0.1), banner_state: "NO_MORE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  assert(evNmb.some((e) => e.type === "auto_watch"), "Rescued 20 dealer total should auto_watch cleanly");
+
+  // 21b. Transient 0.74 blurred final dealer card that vanished 2 frames before PLACE_BETS is rescued via _bestDealerTail
+  const sm21b = new Engine.CompanionStateMachine(cfg);
+  sm21b.step({ ts: (t += 0.1), banner_state: "NO_MORE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  for (let i = 0; i < 3; i++) {
+    sm21b.step({ ts: (t += 0.1), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d10, d6], player_hands: { 0: [p1, p2] } });
+  }
+  sm21b.step({ ts: (t += 0.08), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d10, d6, mkC("3", 3, 0.74, null, 50)], player_hands: { 0: [p1, p2] } });
+  sm21b.step({ ts: (t += 0.08), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d10, d6], player_hands: { 0: [p1, p2] } });
+  sm21b.step({ ts: (t += 0.08), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d10, d6], player_hands: { 0: [p1, p2] } });
+  const evPbB = sm21b.step({ ts: (t += 0.1), banner_state: "PLACE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  assert(evPbB.some((e) => e.type === "card" && e.target === "D" && e.rankLabel === "3"), "Transient 0.74 dealer tail card must be rescued via _bestDealerTail");
+
+  // 21c. deduceMissingDealerCard math & CompanionStateMachine badge deduction fallback
+  assert.deepStrictEqual(Engine.deduceMissingDealerCard(["10", "6"], 21), { rank: "5", val: 5 });
+  assert.deepStrictEqual(Engine.deduceMissingDealerCard(["10", "6"], 26), { rank: "10", val: 0 });
+  assert.deepStrictEqual(Engine.deduceMissingDealerCard(["A", "5"], 18), { rank: "2", val: 2 });
+  assert.deepStrictEqual(Engine.deduceMissingDealerCard(["10"], 20), { rank: "10", val: 0 });
+  assert.deepStrictEqual(Engine.deduceMissingDealerCard(["9"], 20), { rank: "A", val: 1 });
+
+  // Synthetic dark badge OCR test ("21" and "17" to the left of a dealer card cluster)
+  const glyphMap = {
+    "1": ["....###...", "...####...", "..##.##...", ".....##...", ".....##...", ".....##...", ".....##...", ".....##...", ".....##...", ".....##...", ".....##...", "..#######."],
+    "2": ["..######..", ".##....##.", ".##....##.", ".......##.", "......##..", ".....##...", "....##....", "...##.....", "..##......", ".##.......", ".##.......", ".########."],
+    "7": [".########.", ".##....##.", ".......##.", "......##..", ".....##...", ".....##...", "....##....", "....##....", "...##.....", "...##.....", "...##.....", "...##....."],
+  };
+  const mkBadgeImg = (digits) => {
+    const img = Engine.createImage(140, 80, 3);
+    // Green felt background
+    for (let i = 0; i < img.data.length; i += 3) { img.data[i] = 20; img.data[i + 1] = 85; img.data[i + 2] = 35; }
+    // Dark circular badge at x=8..44, y=38..72
+    for (let y = 38; y < 72; y++) {
+      for (let x = 8; x < 44; x++) {
+        const idx = (y * 140 + x) * 3;
+        img.data[idx] = 22; img.data[idx + 1] = 22; img.data[idx + 2] = 22;
+      }
+    }
+    // White digits inside badge
+    digits.forEach((d, di) => {
+      const rows = glyphMap[d];
+      const ox = 12 + di * 12;
+      const oy = 48;
+      for (let r = 0; r < rows.length; r++) {
+        for (let c = 0; c < rows[r].length; c++) {
+          if (rows[r][c] === "#") {
+            const idx = ((oy + r) * 140 + (ox + c)) * 3;
+            img.data[idx] = 245; img.data[idx + 1] = 245; img.data[idx + 2] = 245;
+          }
+        }
+      }
+    });
+    return img;
+  };
+  const [b21, c21] = Engine.detectDealerBadgeTotal(mkBadgeImg(["2", "1"]), [[50, 14, 48, 44]]);
+  assert.strictEqual(b21, 21, `Expected badge total 21, got ${b21} (conf=${c21})`);
+  const [b17, c17] = Engine.detectDealerBadgeTotal(mkBadgeImg(["1", "7"]), [[50, 14, 48, 44]]);
+  assert.strictEqual(b17, 17, `Expected badge total 17, got ${b17} (conf=${c17})`);
+
+  // End-to-end CompanionStateMachine badge deduction when final card is completely unseen
+  const sm21c = new Engine.CompanionStateMachine(cfg);
+  sm21c.step({ ts: (t += 0.1), banner_state: "NO_MORE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  for (let i = 0; i < 3; i++) {
+    sm21c.step({ ts: (t += 0.1), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [dA, d5], player_hands: { 0: [p1, p2] }, dealer_badge_total: 16, dealer_badge_conf: 0.90 });
+  }
+  // Badge updates to 18 on final frame while 3rd card was too fast/missed
+  const evBadge = sm21c.step({ ts: (t += 0.1), banner_state: "PLACE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {}, dealer_badge_total: 18, dealer_badge_conf: 0.91 });
+  const deducedCard = evBadge.find((e) => e.type === "card" && e.target === "D" && e.source === "badge_deduced");
+  assert(deducedCard && deducedCard.rankLabel === "2" && deducedCard.val === 2, `Expected deduced '2', got ${JSON.stringify(evBadge)}`);
+  console.log("   Test 21 PASSED");
+}
+

@@ -4661,6 +4661,10 @@ function handleCompanionMessage(msg){
       }
       draft.lastMsg = `🛡️ Dealer Felt Fallback rescued [${rk}] into Dealer [D] (digital HUD wiped early).`;
       render();
+    } else if(msg.source === 'badge_deduced'){
+      const rk = msg.rankLabel || RANK_LABEL[msg.val] || msg.val;
+      draft.lastMsg = `🔢 Dealer Score Badge deduced final card [${rk}] into Dealer [D].`;
+      render();
     } else if(typeof msg.conf === 'number' && msg.conf < 0.74){
       const sSym = { S:'♠', H:'♥', C:'♣', D:'♦' };
       const lbl = `${msg.rankLabel || msg.val}${(msg.suit && sSym[msg.suit]) || ''}`;
