@@ -1501,6 +1501,17 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   const promptEv = endEvs.find((e) => e.type === "prompt_confirm" && e.reason === "DEALER_INCOMPLETE");
   assert(promptEv, "Must emit DEALER_INCOMPLETE prompt so user can remove guessed card if desired");
   assert.strictEqual(promptEv.educatedGuessRank, "10");
+  assert(sm24._pendingAutoWatch, "Must queue _pendingAutoWatch for NO_MORE_BETS after educated guess");
+  const nmb24 = sm24.step({ ts: 4, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  assert(nmb24.some((e) => e.type === "auto_watch" && e.fromWatch === true), "Must emit auto_watch at NO_MORE_BETS after educated guess");
+
+  // 24b. Dealer [2, 3] (total 5 < 17) must guess enough cards to reach >= 17
+  sm24.step({ ts: 5, banner_state: "", player_cards: [mk("10", 0), mk("9", 9)], dealer_cards: [mk("2", 2), mk("3", 3)], player_hands: { 0: [mk("10", 0), mk("9", 9)] }, hud_refreshed: true });
+  const end24b = sm24.step({ ts: 6, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  const g24b = end24b.filter((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess");
+  assert.strictEqual(g24b.length, 2, "Dealer [2, 3] must guess 2 cards to reach >= 17");
+  const p24b = end24b.find((e) => e.type === "prompt_confirm");
+  assert(p24b.dealerTotal >= 17, `Expected dealerTotal >= 17, got ${p24b.dealerTotal}`);
   console.log("   Test 24 PASSED");
 }
 

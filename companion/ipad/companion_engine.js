@@ -2996,7 +2996,7 @@
       if (!obs) return;
       const bTot = obs.dealer_badge_total;
       const bConf = Number(obs.dealer_badge_conf || 0.85);
-      if (Number.isInteger(bTot) && bTot >= 4 && bTot <= 26 && bConf >= 0.76) {
+      if (Number.isInteger(bTot) && bTot >= 4 && bTot <= 26 && bConf >= 0.56) {
         this._lastDealerBadgeTotal = bTot;
         this._lastDealerBadgeConf = bConf;
       }
@@ -3026,7 +3026,7 @@
           dealerFlippedOrDrew = true;
           this.state = "DEALER_TURN";
         }
-        if (det.conf < this.cfg.min_auto_confidence) {
+        if (source !== "educated_guess" && det.conf < this.cfg.min_auto_confidence) {
           this._uncertaintyFlags.push(`D${slotIdx + 1}:${det.rank}@${det.conf.toFixed(2)}`);
         }
         const evtD = {
@@ -3137,28 +3137,29 @@
         }
       }
 
-      // Fallback E: educated guess for missing final dealer card when dealer hand is still incomplete
+      // Fallback E: educated guess for missing final dealer card(s) so dealer reaches >= 17
       let educatedGuessRank = null;
-      if (isDealerStillIncomplete()) {
+      let guessCount = 0;
+      while (isDealerStillIncomplete() && guessCount < 2) {
         const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
         const guess = guessMissingDealerCard(dCommBefore);
-        if (guess) {
-          const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
-          const slotIdx = backIdx >= 0 ? backIdx : this.dDebouncer.committedRanks.length;
-          if (backIdx >= 0) {
-            this.dDebouncer.committedRanks[backIdx] = guess.rank;
-          } else {
-            this.dDebouncer.committedRanks.push(guess.rank);
-          }
-          educatedGuessRank = guess.rank;
-          const guessDet = {
-            rank: guess.rank,
-            val: guess.val,
-            conf: 0.50,
-            suit: null,
-          };
-          this._emitDealerCards([[slotIdx, guessDet]], events, "educated_guess");
+        if (!guess) break;
+        const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
+        const slotIdx = backIdx >= 0 ? backIdx : this.dDebouncer.committedRanks.length;
+        if (backIdx >= 0) {
+          this.dDebouncer.committedRanks[backIdx] = guess.rank;
+        } else {
+          this.dDebouncer.committedRanks.push(guess.rank);
         }
+        educatedGuessRank = educatedGuessRank ? `${educatedGuessRank},${guess.rank}` : guess.rank;
+        const guessDet = {
+          rank: guess.rank,
+          val: guess.val,
+          conf: 0.50,
+          suit: null,
+        };
+        this._emitDealerCards([[slotIdx, guessDet]], events, "educated_guess");
+        guessCount++;
       }
 
       const dCommitted = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
@@ -3185,11 +3186,12 @@
         flags.length === 0 &&
         this._emittedD >= 1;
 
-      const splitAutoOnNoMoreBets =
+      const nonDealerIncompleteFlags = flags.filter((f) => f !== "DEALER_INCOMPLETE");
+      const autoOnNoMoreBets =
         !canAutoWatch &&
         this.sync_play_mode === "watch" &&
-        splitBlocksAuto &&
-        flags.length === 0 &&
+        nonDealerIncompleteFlags.length === 0 &&
+        (splitBlocksAuto || educatedGuessRank !== null) &&
         this._emittedP >= 2 &&
         this._emittedD >= 1;
 
@@ -3204,7 +3206,7 @@
           fromWatch: true,
         };
       } else {
-        if (splitAutoOnNoMoreBets) {
+        if (autoOnNoMoreBets) {
           const sumP = this._emittedSplitHands >= 2 ? `${this._emittedP}P(${this._emittedSplitHands}H)` : `${this._emittedP}P`;
           this._flushPendingAutoWatch(events);
           this._pendingAutoWatch = {
@@ -3237,7 +3239,7 @@
           feltSightings: [],
         });
       }
-      this.resyncRound(!(canAutoWatch || splitAutoOnNoMoreBets));
+      this.resyncRound(!(canAutoWatch || autoOnNoMoreBets));
       return events;
     }
 
