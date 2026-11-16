@@ -94,9 +94,10 @@
     for (const k of Object.keys(roisRaw)) {
       if (!rois[k]) rois[k] = normalizeRoi(roisRaw[k]);
     }
+    const anchorMode = base.anchor_mode || "ipad_split_left";
     return {
       window_titles: base.window_titles || ["Live Games", "All Bets Blackjack", "epicworld", "Playtech"],
-      anchor_mode: base.anchor_mode || "ipad_split_left",
+      anchor_mode: anchorMode,
       frame_rotation: normalizeRotationDeg(base.frame_rotation || 0),
       fps: Number(base.fps || 10.0),
       burst_fps: Number(base.burst_fps || 20.0),
@@ -110,7 +111,7 @@
       hud_dedup_window_sec: Number(base.hud_dedup_window_sec || 2.8),
       enable_felt_community: base.enable_felt_community !== false,
       enable_dealer_felt_fallback: base.enable_dealer_felt_fallback !== false,
-      require_wait_banner: base.require_wait_banner !== false,
+      require_wait_banner: anchorMode === "ipad_split_left" ? false : base.require_wait_banner !== false,
       pause_on_unmatched_felt: !!base.pause_on_unmatched_felt,
       min_auto_confidence: Number(base.min_auto_confidence || 0.70),
       player_strip: rois.player_strip,
@@ -2129,13 +2130,19 @@
       }
 
       let pbConf = 0.0;
-      if (placeBetsImg && placeBetsImg.w > 0 && !cardsPresent && bannerTpls.length) {
-        const pbTpls = bannerTpls.filter((t) => t.rank === "PLACE_BETS");
+      let pbRank = "";
+      if (placeBetsImg && placeBetsImg.w > 0 && bannerTpls.length) {
+        const pbTpls = bannerTpls.filter((t) => t.rank === "PLACE_BETS" || t.rank === "LAST_BETS" || t.rank === "NO_MORE_BETS");
         if (pbTpls.length) {
           const pbSig = computeRoiSignature(placeBetsImg, 36, 12, false);
           const pbDiff = roiSigDiff(pbSig, this._lastPbSig);
           if (this._lastPbSig && (pbDiff === 0 || (pbDiff <= SIG_TOL && this._pbSigAge < REFRESH_PERIOD))) {
-            pbConf = this._cachedPb;
+            if (Array.isArray(this._cachedPb)) {
+              [pbRank, pbConf] = this._cachedPb;
+            } else {
+              pbRank = this._cachedPb > 0 ? "PLACE_BETS" : "";
+              pbConf = Number(this._cachedPb) || 0.0;
+            }
             if (pbDiff > 0) this._pbSigAge++;
           } else {
             this._lastPbSig = pbSig;
@@ -2147,19 +2154,21 @@
               PLACE_BETS_SCALES,
               "place_bets"
             );
+            pbRank = ptpl ? ptpl.rank : "";
             pbConf = ptpl ? pconf : 0.0;
-            this._cachedPb = pbConf;
+            this._cachedPb = [pbRank, pbConf];
           }
-          if (pbConf > 0.0 && !bannerState) {
-            bannerState = "PLACE_BETS";
+          if (pbRank && pbConf > 0.0 && !bannerState) {
+            bannerState = pbRank;
             bannerConf = pbConf;
             bannerSource = "place_bets_roi";
           }
         }
       } else {
         this._lastPbSig = null;
-        this._cachedPb = 0.0;
+        this._cachedPb = ["", 0.0];
       }
+      if (pbRank !== "PLACE_BETS") pbConf = 0.0;
 
       if (bannerState === "SHUFFLE") {
         shufOn = true;
@@ -2830,7 +2839,7 @@
             }
           }
         } else if (this.state === "BETTING") {
-          if ((!banner && this._lastBetBanner === "NO_MORE_BETS") || hasObsCards) {
+          if ((!banner && this._lastBetBanner === "NO_MORE_BETS") || (hasObsCards && (this._sawEmptyHudInBetting || this._lastBetBanner === "NO_MORE_BETS"))) {
             const predeal = this._sawEmptyHudInBetting ? this._predealObs : null;
             this._flushPendingAutoWatch(events);
             this._startNewRound();
@@ -3582,6 +3591,7 @@
       this.cfg = defaultConfig(initialPack && initialPack.config ? initialPack.config : {});
       if (!this.options.preserveDesktopAnchor && (!initialPack || !initialPack.config || initialPack.config.anchor_mode === "game_viewport")) {
         this.cfg.anchor_mode = "ipad_split_left";
+        this.cfg.require_wait_banner = false;
       }
       this.detector = new PlaytechDetector(this.cfg, initialPack);
       this.sm = new CompanionStateMachine(this.cfg);
@@ -4122,6 +4132,7 @@
         }
         if (["ipad_split_left", "game_viewport", "window"].includes(msg.anchorMode)) {
           this.cfg.anchor_mode = msg.anchorMode;
+          this.cfg.require_wait_banner = msg.anchorMode !== "ipad_split_left";
         }
         this.smoother.reset();
         this.detector.invalidateCaches();

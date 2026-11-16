@@ -1105,3 +1105,52 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   assert.deepStrictEqual(dCardsOut, ["6", "4"], `Expected 2-frame suitless dealer flip+draw [6, 4], got ${JSON.stringify(dCardsOut)}`);
   console.log("   Test 18 PASSED");
 }
+
+// Test 19: iPad center-banner-only round lifecycle (no top WAIT banner; NO_MORE_BETS starts, PLACE_BETS ends)
+{
+  console.log("19. Testing iPad center-banner-only lifecycle (NO_MORE_BETS starts, PLACE_BETS ends)...");
+  const ipadCfg = Engine.defaultConfig({ ...pack.config, anchor_mode: "ipad_split_left" });
+  assert.strictEqual(ipadCfg.require_wait_banner, false, "ipad_split_left must set require_wait_banner=false");
+  const sm19 = new Engine.CompanionStateMachine(ipadCfg);
+  const mkC = (rank, val, conf = 0.94, suit = "S", x = 10) => ({ rank, val, conf, suit, x, y: 10, w: 12, h: 16, hand_index: 0 });
+  const p1 = mkC("A", 1, 0.94, "S", 20);
+  const p2 = mkC("10", 0, 0.94, "H", 40);
+  const d1 = mkC("9", 9, 0.95, "C", 10);
+  const d2 = mkC("8", 8, 0.93, "D", 35);
+
+  let t = 50.0;
+  // 1. Center "Place Your Bets" -> BETTING
+  let ev = sm19.step({ ts: (t += 0.1), banner_state: "PLACE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  assert(ev.some((e) => e.type === "phase" && e.phase === "PLACE_BETS"));
+  assert.strictEqual(sm19.state, "BETTING");
+
+  // 2. Center "No More Bets" -> fades -> round starts (DEALING) with NO WAIT banner
+  sm19.step({ ts: (t += 0.1), banner_state: "NO_MORE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  ev = sm19.step({ ts: (t += 0.1), banner_state: "", banner_conf: 0, player_cards: [], dealer_cards: [], player_hands: {} });
+  assert(ev.some((e) => e.type === "phase" && e.phase === "DEALING"), "Round must start after NO_MORE_BETS without WAIT");
+
+  // 3. Cards dealt (no WAIT banner)
+  const dealEv = [];
+  for (let i = 0; i < 3; i++) {
+    dealEv.push(...sm19.step({ ts: (t += 0.1), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d1], player_hands: { 0: [p1, p2] } }));
+  }
+  for (let i = 0; i < 2; i++) {
+    dealEv.push(...sm19.step({ ts: (t += 0.1), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d1, d2], player_hands: { 0: [p1, p2] } }));
+  }
+  assert.strictEqual(dealEv.filter((e) => e.type === "card" && e.target === "P").length, 2);
+  assert.strictEqual(dealEv.filter((e) => e.type === "card" && e.target === "D").length, 2);
+
+  // 4. Center "Place Your Bets" appears even while old cards are still fading -> finalizes round immediately!
+  const endEv = sm19.step({ ts: (t += 0.1), banner_state: "PLACE_BETS", banner_conf: 0.92, player_cards: [p1, p2], dealer_cards: [d1, d2], player_hands: { 0: [p1, p2] } });
+  assert.strictEqual(sm19.state, "BETTING");
+  assert(endEv.some((e) => e.type === "phase" && e.phase === "PLACE_BETS"));
+  // Next frame with old fading cards still visible must NOT re-start a round prematurely
+  const fadeEv = sm19.step({ ts: (t += 0.1), banner_state: "", banner_conf: 0, player_cards: [p1, p2], dealer_cards: [d1, d2], player_hands: { 0: [p1, p2] } });
+  assert.strictEqual(sm19.state, "BETTING", "Old fading cards after PLACE_BETS must not start a new round");
+  assert.strictEqual(fadeEv.filter((e) => e.type === "card").length, 0);
+
+  // 5. Next NO_MORE_BETS flushes staged auto_watch from previous round
+  const nmb2 = sm19.step({ ts: (t += 0.1), banner_state: "NO_MORE_BETS", banner_conf: 0.92, player_cards: [], dealer_cards: [], player_hands: {} });
+  assert(nmb2.some((e) => e.type === "auto_watch"), "NO_MORE_BETS must flush auto_watch from completed round");
+  console.log("   Test 19 PASSED");
+}
