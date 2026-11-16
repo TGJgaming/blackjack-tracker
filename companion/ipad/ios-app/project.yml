@@ -39,6 +39,7 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: BlackjackTracker/Info.plist
         CODE_SIGN_ENTITLEMENTS: BlackjackTracker/BlackjackTracker.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     dependencies:
       - target: BroadcastExtension
         embed: true

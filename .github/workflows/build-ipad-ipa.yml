@@ -93,7 +93,7 @@ jobs:
               actual = set(app_pl.get(key) or [])
               assert expected_orients.issubset(actual), f"{key} missing orientations: {expected_orients - actual}"
           assert app_pl.get("CFBundleShortVersionString") == "1.0.0", f"Unexpected version: {app_pl.get('CFBundleShortVersionString')}"
-          assert app_pl.get("CFBundleDisplayName") == "BJ Tracker", f"Unexpected display name: {app_pl.get('CFBundleDisplayName')}"
+          assert app_pl.get("CFBundleDisplayName") == "BlackTrack", f"Unexpected display name: {app_pl.get('CFBundleDisplayName')}"
           assert str(app_pl.get("NSLocalNetworkUsageDescription") or "").strip(), "Missing NSLocalNetworkUsageDescription"
           scene_manifest = app_pl.get("UIApplicationSceneManifest") or {}
           assert scene_manifest.get("UIApplicationSupportsMultipleScenes") is False
