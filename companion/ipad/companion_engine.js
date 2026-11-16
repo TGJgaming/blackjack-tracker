@@ -1675,7 +1675,8 @@
           if (remRight < 15 && (d.conf < Math.max(0.84, minHudConf) || (!suit && !hasPipBody))) continue;
           if (remRight < 22 && d.conf < Math.max(0.78, minHudConf - 0.06)) continue;
         }
-        if (!suit && !hasBadgeOcclusion && (!hasPipBody || suitConf < 0.42 || d.conf < Math.max(0.82, minHudConf - 0.02))) {
+        const highConfPipOk = hasPipBody && d.conf >= Math.max(isDealer ? 0.84 : 0.86, minHudConf);
+        if (!suit && !hasBadgeOcclusion && !highConfPipOk && (!hasPipBody || suitConf < 0.42 || d.conf < Math.max(0.82, minHudConf - 0.02))) {
           continue;
         }
       }
@@ -1995,7 +1996,7 @@
 
       const avgCh = clusterHits.reduce((acc, [cl]) => acc + cl[3], 0) / clusterHits.length;
       const clSepThr = Math.max(4, Math.round(avgCh * 0.30));
-      const cardSepThr = Math.max(10, Math.round(avgCh * 0.60));
+      const cardSepThr = Math.max(12, Math.round(avgCh * 0.78));
       const hands = {};
       const allP = [];
       let curHand = 0;
@@ -2210,6 +2211,14 @@
     return [total, aces > 0, total > 21];
   }
 
+  function sameBjValue(rA, rB) {
+    if (!rA || !rB) return false;
+    if (rA === rB) return true;
+    const vA = RANK_TO_VAL[rA];
+    const vB = RANK_TO_VAL[rB];
+    return vA !== undefined && vA !== null && vA === vB;
+  }
+
   class SequenceDebouncer {
     constructor(confirmFrames = 3, clearFrames = 4, fastTailConfirm = false, fastTailMinConf = 0.84) {
       this.confirmFrames = confirmFrames;
@@ -2347,7 +2356,7 @@
       for (let idx = 0; idx < Math.min(this.committedRanks.length, detections.length); idx++) {
         if (this.committedRanks[idx] === "BACK" && this._slotCands.has(idx)) {
           const { rank, cnt, det } = this._slotCands.get(idx);
-          const fastOk = this.fastTailConfirm && (det.conf >= this.fastTailMinConf || (det.suit && det.conf >= 0.78));
+          const fastOk = this.fastTailConfirm && (det.conf >= Math.min(0.82, this.fastTailMinConf) || (det.suit && det.conf >= 0.78));
           const req = fastOk ? Math.min(this.confirmFrames, 2) : this.confirmFrames;
           if (cnt >= req) {
             this.committedRanks[idx] = rank;
@@ -2366,7 +2375,7 @@
         if (!this._slotCands.has(idx)) break;
         const { rank, cnt, det } = this._slotCands.get(idx);
         const useFast = (this.fastTailConfirm && idx >= 1) || (this.fastInitialDeal && idx < 2);
-        const fastOk = useFast && (det.conf >= this.fastTailMinConf || (det.suit && det.conf >= 0.80));
+        const fastOk = useFast && (det.conf >= (this.fastTailConfirm ? Math.min(0.82, this.fastTailMinConf) : this.fastTailMinConf) || (det.suit && det.conf >= 0.80));
         const req = fastOk ? Math.min(this.confirmFrames, 2) : this.confirmFrames;
         if (cnt < req) break;
         this.committedRanks.push(rank);
@@ -2434,6 +2443,10 @@
       this.sync_round_id = "";
       this.sync_has_prompt = false;
       this.sync_bet_rounds_count = 0;
+      this.sync_draft_hands = null;
+      this.sync_draft_hands_manual = [];
+      this.sync_draft_dealer = null;
+      this.sync_draft_dealer_manual = false;
       this.state = "IDLE";
       this._roundSeq = 0;
       this.round_id = "r_0";
@@ -2442,6 +2455,7 @@
       this._sawClearSinceRoundOver = true;
       this._shuffleSince = null;
       this._shuffleEmitted = false;
+      this._lastReconcileTs = -999.0;
       this._resetRoundAccumulators();
     }
 
@@ -2455,6 +2469,13 @@
       this._emittedB = 0;
       this._emittedSplitHands = 1;
       this._splitDetected = false;
+      this._splitCandCount = 0;
+      this._splitCandTarget = 1;
+      this._splitPendingSeqs = new Map();
+      this._splitSeedCards = new Map();
+      this._reconcileSig = null;
+      this._reconcileFrames = 0;
+      this._reconcileSince = 0.0;
       this._uncertaintyFlags = [];
       this._lastBetBanner = "";
       this._seenWaitInRound = false;
@@ -2491,7 +2512,10 @@
       if (msg.playMode === "watch" || msg.playMode === "bet") {
         this.sync_play_mode = msg.playMode;
       }
-      if (msg.isSplit !== undefined) this.sync_is_split = !!msg.isSplit;
+      if (msg.isSplit !== undefined) {
+        this.sync_is_split = !!msg.isSplit;
+        if (this.sync_is_split) this._splitDetected = true;
+      }
       if (msg.draftCount !== undefined) {
         const nc = Math.max(0, Number(msg.draftCount) || 0);
         if (nc === 0 && this._pendingAutoWatch) this._pendingAutoWatch = null;
@@ -2501,6 +2525,18 @@
       if (msg.compRoundId !== undefined) this.sync_round_id = String(msg.compRoundId || "");
       if (msg.hasPrompt !== undefined) this.sync_has_prompt = !!msg.hasPrompt;
       if (msg.betRoundsCount !== undefined) this.sync_bet_rounds_count = Math.max(0, Number(msg.betRoundsCount) || 0);
+      if (Array.isArray(msg.draftHands)) {
+        this.sync_draft_hands = msg.draftHands.map((h) => (Array.isArray(h) ? h.map((v) => Number(v)) : []));
+      }
+      if (Array.isArray(msg.draftHandsManual)) {
+        this.sync_draft_hands_manual = msg.draftHandsManual.map((b) => !!b);
+      }
+      if (Array.isArray(msg.draftDealer)) {
+        this.sync_draft_dealer = msg.draftDealer.map((v) => Number(v));
+      }
+      if (msg.draftDealerManual !== undefined) {
+        this.sync_draft_dealer_manual = !!msg.draftDealerManual;
+      }
     }
 
     _flushPendingAutoWatch(events) {
@@ -2605,24 +2641,31 @@
         flags.push("DEALER_INCOMPLETE");
       }
 
+      const pDbVals = Object.values(this.pDebouncers);
+      const splitCleanMulti =
+        this._emittedSplitHands >= 2 &&
+        pDbVals.length >= 2 &&
+        pDbVals.every((db) => db.committedRanks.length >= 2);
+      const splitBlocksAuto = (this._splitDetected || this.sync_is_split) && !splitCleanMulti;
+
       const canAutoWatch =
         this.sync_play_mode === "watch" &&
-        !this._splitDetected &&
-        !this.sync_is_split &&
+        !splitBlocksAuto &&
         flags.length === 0 &&
         this._emittedD >= 1;
 
       if (canAutoWatch) {
+        const sumP = this._emittedSplitHands >= 2 ? `${this._emittedP}P(${this._emittedSplitHands}H)` : `${this._emittedP}P`;
         this._flushPendingAutoWatch(events);
         this._pendingAutoWatch = {
           type: "auto_watch",
           roundId: this.round_id,
           handCount: this._emittedSplitHands,
-          summary: `${this._emittedP}P+${this._emittedD}D+${this._emittedB}B`,
+          summary: `${sumP}+${this._emittedD}D+${this._emittedB}B`,
           fromWatch: true,
         };
       } else {
-        const reason = this._splitDetected || this.sync_is_split
+        const reason = splitBlocksAuto || (this.sync_play_mode === "bet" && (this._splitDetected || this.sync_is_split))
           ? "SPLIT"
           : this.sync_play_mode === "bet"
           ? "BET_MODE"
@@ -2727,11 +2770,18 @@
             this._waitAbsentFrames = 0;
             if (this._waitMissingWithCardsSince === null) {
               this._waitMissingWithCardsSince = now;
-            } else if (hasCards && (now - this._waitMissingWithCardsSince) >= 3.0) {
-              events.push(...this._finalizeClearedRound(now));
-              this.state = "ROUND_OVER";
-              this._sawClearSinceRoundOver = false;
-              return events;
+            } else if (hasCards) {
+              const dRanks = this.dDebouncer.committedRanks || [];
+              const dRealRanks = dRanks.filter((r) => r !== "BACK");
+              const [dTot, , dBust] = evalBjRanks(dRealRanks);
+              const dealerDone = !dRanks.includes("BACK") && dRealRanks.length >= 2 && (dTot >= 17 || dBust);
+              const waitTimeout = dealerDone ? 3.0 : 9.0;
+              if ((now - this._waitMissingWithCardsSince) >= waitTimeout) {
+                events.push(...this._finalizeClearedRound(now));
+                this.state = "ROUND_OVER";
+                this._sawClearSinceRoundOver = false;
+                return events;
+              }
             }
           } else {
             this._waitMissingWithCardsSince = null;
@@ -2794,71 +2844,348 @@
 
       if (!hudRefreshed) return events;
 
-      if (obs.split_detected && !this._splitDetected) {
-        this._splitDetected = true;
-        const handKeys = Object.keys(obs.player_hands || {});
-        if (handKeys.length >= 2) {
-          this._beginRoundIfIdle(events);
-          this._emittedSplitHands = handKeys.length;
-          events.push({
-            type: "split",
-            handCount: handKeys.length,
-            roundId: this.round_id,
-            splitCards: handKeys.slice(0, 2).map((hk) => {
-              const c0 = obs.player_hands[hk][0];
-              return { val: c0.val, rankLabel: c0.rank, suit: c0.suit };
-            }),
-          });
+      if (obs.split_detected) this._splitDetected = true;
+
+      const handsInput = {};
+      if (obs.player_hands && Object.keys(obs.player_hands).length) {
+        for (const [k, cs] of Object.entries(obs.player_hands)) {
+          if (cs && cs.length) handsInput[Number(k)] = cs.slice();
+        }
+      } else if (obs.player_cards && obs.player_cards.length) {
+        handsInput[0] = obs.player_cards.slice();
+      }
+
+      if (this._splitSeedCards.size) {
+        for (const [hK, seed] of this._splitSeedCards.entries()) {
+          const curList = handsInput[hK];
+          if (curList && curList.length && !sameBjValue(curList[0].rank, seed.rank)) {
+            handsInput[hK] = [seed, ...curList];
+          }
         }
       }
 
-      const handsInput = obs.player_hands && Object.keys(obs.player_hands).length
-        ? obs.player_hands
-        : obs.player_cards && obs.player_cards.length
-        ? { 0: obs.player_cards }
-        : {};
+      let splitPending = false;
+      let handsForDebouncers = handsInput;
+      const inputKeys = Object.keys(handsInput).map(Number).sort((a, b) => a - b);
+
+      if (inputKeys.length >= 2 && inputKeys.length > this._emittedSplitHands) {
+        const prevH0 = this.pDebouncers[0] ? this.pDebouncers[0].committedRanks.slice() : [];
+        let h0List = handsInput[0] || [];
+        let h1List = handsInput[1] || [];
+        const unseparatedOverlap =
+          this._emittedSplitHands === 1 &&
+          prevH0.length === 2 &&
+          sameBjValue(prevH0[0], prevH0[1]) &&
+          h0List.length >= 2 &&
+          sameBjValue(h0List[0].rank, prevH0[0]) &&
+          sameBjValue(h0List[1].rank, prevH0[1]);
+
+        if (unseparatedOverlap) {
+          this._splitCandCount = 0;
+          this._splitCandTarget = 1;
+          this._splitPendingSeqs.clear();
+          splitPending = true;
+          handsForDebouncers = { 0: h0List };
+        } else {
+          const priorPending = new Map(this._splitPendingSeqs);
+          const targetCnt = inputKeys.length;
+          if (this._splitCandTarget !== targetCnt) {
+            this._splitCandTarget = targetCnt;
+            this._splitCandCount = 1;
+            priorPending.clear();
+          } else {
+            this._splitCandCount++;
+          }
+          this._splitPendingSeqs.clear();
+          for (const hK of inputKeys) {
+            const seqK = handsInput[hK].map((d) => d.rank).join(",");
+            const prevEntry = priorPending.get(hK);
+            const pCnt = prevEntry && prevEntry[0] === seqK ? prevEntry[1] + 1 : 1;
+            this._splitPendingSeqs.set(hK, [seqK, pCnt]);
+          }
+
+          const splitConfirm = this.cfg.confirm_frames <= 1 ? 1 : Math.max(2, Math.min(3, this.cfg.confirm_frames));
+          if (this._splitCandCount < splitConfirm) {
+            splitPending = true;
+            handsForDebouncers = {};
+          } else {
+            this._beginRoundIfIdle(events);
+            this._emittedSplitHands = targetCnt;
+            this._splitDetected = true;
+            this._splitCandCount = 0;
+            this._splitCandTarget = targetCnt;
+
+            const pairCanReanchor = prevH0.length === 2 && sameBjValue(prevH0[0], prevH0[1]);
+            let inferredSeedRk = null;
+            if (pairCanReanchor) {
+              inferredSeedRk = prevH0[0];
+            } else if (prevH0.length === 1 && prevH0[0] !== "BACK") {
+              inferredSeedRk = prevH0[0];
+            } else if (h0List.length && h1List.length) {
+              if (sameBjValue(h0List[0].rank, h1List[0].rank)) inferredSeedRk = h0List[0].rank;
+              else if (h1List.length >= 2 && h0List.length === 1) inferredSeedRk = h1List[0].rank;
+              else if (h0List.length >= 2 && h1List.length === 1) inferredSeedRk = h0List[0].rank;
+            }
+
+            const splitCards = [];
+            for (const hK of inputKeys.slice(0, 2)) {
+              const c0 = handsInput[hK][0];
+              const rk0 = pairCanReanchor && hK < 2 ? prevH0[hK] : (inferredSeedRk !== null ? inferredSeedRk : c0.rank);
+              const val0 = RANK_TO_VAL[rk0] !== undefined && RANK_TO_VAL[rk0] !== null ? RANK_TO_VAL[rk0] : c0.val;
+              const suit0 = sameBjValue(c0.rank, rk0) ? c0.suit : null;
+              const seedDet = {
+                rank: rk0,
+                val: val0,
+                conf: Math.max(0.92, c0.conf || 0.92),
+                x: typeof c0.x === "number" ? Math.max(0, Math.round(c0.x) - 12) : 0,
+                y: c0.y || 0,
+                w: c0.w || 12,
+                h: c0.h || 16,
+                suit: suit0,
+                hand_index: hK,
+              };
+              this._splitSeedCards.set(hK, seedDet);
+              if (!sameBjValue(c0.rank, rk0)) {
+                handsInput[hK] = [seedDet, ...handsInput[hK]];
+              }
+              splitCards.push({ val: val0, rankLabel: rk0, suit: suit0 });
+            }
+
+            h0List = handsInput[0] || [];
+            h1List = handsInput[1] || [];
+
+            events.push({
+              type: "split",
+              handCount: targetCnt,
+              roundId: this.round_id,
+              splitCards,
+            });
+
+            if (pairCanReanchor) {
+              const seq0Cur = h0List.map((d) => d.rank).join(",");
+              const p0Entry = priorPending.get(0);
+              const p0Seq = p0Entry ? p0Entry[0] : "";
+              const p0Cnt = p0Entry ? p0Entry[1] : 0;
+              const p0Arr = p0Seq ? p0Seq.split(",") : [];
+              const p0Norm = (p0Arr.length && sameBjValue(p0Arr[0], prevH0[0])) ? p0Seq : (p0Arr.length ? [prevH0[0], ...p0Arr].join(",") : "");
+              if (p0Norm === seq0Cur && p0Cnt > 0 && h0List.length > 1) {
+                this.pDebouncers[0].reanchor([prevH0[0]], seq0Cur, p0Cnt);
+              } else {
+                this.pDebouncers[0].reanchor([prevH0[0]]);
+              }
+
+              const d1 = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
+              if (h1List.length) {
+                const seq1Cur = h1List.map((d) => d.rank).join(",");
+                const p1Entry = priorPending.get(1);
+                const p1Seq = p1Entry ? p1Entry[0] : "";
+                const p1Cnt = p1Entry ? p1Entry[1] : 0;
+                const p1Arr = p1Seq ? p1Seq.split(",") : [];
+                const p1Norm = (p1Arr.length && sameBjValue(p1Arr[0], prevH0[1])) ? p1Seq : (p1Arr.length ? [prevH0[1], ...p1Arr].join(",") : "");
+                if (sameBjValue(h1List[0].rank, prevH0[1]) && p1Norm === seq1Cur && p1Cnt > 0 && h1List.length > 1) {
+                  d1.reanchor([prevH0[1]], seq1Cur, p1Cnt);
+                } else {
+                  d1.reanchor([prevH0[1]]);
+                }
+              } else {
+                d1.reanchor([prevH0[1]]);
+              }
+              this.pDebouncers[1] = d1;
+            }
+            this._splitPendingSeqs.clear();
+          }
+        }
+      } else {
+        this._splitCandCount = 0;
+        this._splitCandTarget = Math.max(1, inputKeys.length);
+        this._splitPendingSeqs.clear();
+      }
 
       let pCleared = true;
-      const handIndices = Array.from(new Set([...Object.keys(this.pDebouncers), ...Object.keys(handsInput)])).map(Number).sort((a, b) => a - b);
-      for (const hIdx of handIndices) {
-        if (!this.pDebouncers[hIdx]) {
-          this.pDebouncers[hIdx] = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
-        }
-        const [newCards, hCleared] = this.pDebouncers[hIdx].update(handsInput[hIdx] || []);
-        if (!hCleared) pCleared = false;
-        for (const [slotIdx, det] of newCards) {
-          if (det.val === null || det.val === undefined) continue;
-          this._beginRoundIfIdle(events);
-          this._emittedP++;
-          if (det.conf < this.cfg.min_auto_confidence) {
-            this._uncertaintyFlags.push(`P${hIdx}:${slotIdx + 1}:${det.rank}@${det.conf.toFixed(2)}`);
+      if (splitPending && !Object.keys(handsForDebouncers).length) {
+        pCleared = false;
+      } else {
+        const iterHands = splitPending
+          ? Object.keys(handsForDebouncers).map(Number).sort((a, b) => a - b)
+          : Array.from(new Set([...Object.keys(this.pDebouncers), ...Object.keys(handsForDebouncers)])).map(Number).sort((a, b) => a - b);
+        for (const hIdx of iterHands) {
+          if (!this.pDebouncers[hIdx]) {
+            this.pDebouncers[hIdx] = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
           }
-          const evt = {
-            type: "card",
-            target: "P",
-            handIndex: hIdx,
-            val: det.val,
-            slot: slotIdx,
-            rankLabel: det.rank,
-            conf: Number(det.conf.toFixed(3)),
-            source: "hud",
-            roundId: this.round_id,
-          };
-          if (det.suit) evt.suit = det.suit;
-          events.push(evt);
+          const [newCards, hCleared] = this.pDebouncers[hIdx].update(handsForDebouncers[hIdx] || []);
+          if (!hCleared) pCleared = false;
+          for (const [slotIdx, det] of newCards) {
+            if (det.val === null || det.val === undefined) continue;
+            this._beginRoundIfIdle(events);
+            this._emittedP++;
+            if (det.conf < this.cfg.min_auto_confidence) {
+              this._uncertaintyFlags.push(`P${hIdx}:${slotIdx + 1}:${det.rank}@${det.conf.toFixed(2)}`);
+            }
+            const evt = {
+              type: "card",
+              target: "P",
+              handIndex: hIdx,
+              val: det.val,
+              slot: slotIdx,
+              rankLabel: det.rank,
+              conf: Number(det.conf.toFixed(3)),
+              source: "hud",
+              roundId: this.round_id,
+            };
+            if (det.suit) evt.suit = det.suit;
+            events.push(evt);
+          }
         }
+        if (!Object.keys(this.pDebouncers).length) pCleared = true;
       }
 
       const [newD, dCleared] = this.dDebouncer.update(obs.dealer_cards || []);
-      this._emitDealerCards(newD, events);
+      const dealerFlippedOrDrew = this._emitDealerCards(newD, events);
 
       if (this.state === "DEALING" && this.dDebouncer.committedRanks.length >= 1 && this._emittedP >= 1) {
         this.state = "PLAYER_TURN";
       }
+      if (dealerFlippedOrDrew) {
+        this.state = "DEALER_TURN";
+      }
       if (!["IDLE", "BETTING", "ROUND_OVER"].includes(this.state) && pCleared && dCleared) {
         events.push(...this._finalizeClearedRound(now));
+        return events;
+      }
+      if (!splitPending && !events.some((e) => e.type === "card" || e.type === "split")) {
+        this._maybeReconcileHud(obs, handsInput, events, now);
       }
       return events;
+    }
+
+    _maybeReconcileHud(obs, handsInput, events, now) {
+      if (
+        !["DEALING", "PLAYER_TURN", "DEALER_TURN"].includes(this.state) ||
+        obs.shuffle_active ||
+        ["PLACE_BETS", "LAST_BETS", "NO_MORE_BETS"].includes(obs.banner_state) ||
+        !Object.keys(handsInput).length
+      ) {
+        this._reconcileSig = null;
+        this._reconcileFrames = 0;
+        return;
+      }
+
+      const minRecConf = Math.max(0.80, this.cfg.min_hud_confidence - 0.04);
+      const sortedKeys = Object.keys(handsInput).map(Number).sort((a, b) => a - b);
+      for (const h of sortedKeys) {
+        const cs = handsInput[h];
+        if (!cs || !cs.length || cs.some((d) => d.val === null || d.val === undefined || d.conf < minRecConf)) {
+          this._reconcileSig = null;
+          this._reconcileFrames = 0;
+          return;
+        }
+      }
+      const dReal = (obs.dealer_cards || []).filter((d) => d.val !== null && d.val !== undefined);
+      if (dReal.some((d) => d.conf < minRecConf)) {
+        this._reconcileSig = null;
+        this._reconcileFrames = 0;
+        return;
+      }
+
+      const pSig = sortedKeys.map((h) => `${h}:${handsInput[h].map((d) => `${d.rank}=${d.val}`).join(",")}`).join("|");
+      const dSig = dReal.map((d) => `${d.rank}=${d.val}`).join(",");
+      const sig = `${pSig}||${dSig}`;
+
+      if (sig === this._reconcileSig) {
+        this._reconcileFrames++;
+      } else {
+        this._reconcileSig = sig;
+        this._reconcileFrames = 1;
+        this._reconcileSince = now;
+      }
+
+      const reqFrames = Math.max(6, this.cfg.confirm_frames * 2);
+      if (this._reconcileFrames < reqFrames || (now - this._reconcileSince) < 0.55 || (now - this._lastReconcileTs) < 1.5) {
+        return;
+      }
+
+      const debHandsStr = Object.keys(this.pDebouncers)
+        .map(Number)
+        .sort((a, b) => a - b)
+        .filter((h) => this.pDebouncers[h] && this.pDebouncers[h].committedRanks.length)
+        .map((h) => `${h}:${this.pDebouncers[h].committedRanks.filter((r) => r !== "BACK").join(",")}`)
+        .join("|");
+      const hudHandsStr = sortedKeys.map((h) => `${h}:${handsInput[h].map((d) => d.rank).join(",")}`).join("|");
+      const debDealerStr = this.dDebouncer.committedRanks.filter((r) => r !== "BACK").join(",");
+      const hudDealerStr = dReal.map((d) => d.rank).join(",");
+      const debMismatch = debHandsStr !== hudHandsStr || debDealerStr !== hudDealerStr;
+
+      const hudHandsVals = sortedKeys.map((h) => handsInput[h].filter((d) => d.val !== null && d.val !== undefined).map((d) => Number(d.val)));
+      const hudDealerVals = dReal.filter((d) => d.val !== null && d.val !== undefined).map((d) => Number(d.val));
+
+      let pUiMismatch = false;
+      let dUiMismatch = false;
+      if (this.sync_round_id === this.round_id && Array.isArray(this.sync_draft_hands)) {
+        if (this.sync_draft_hands.length !== hudHandsVals.length) {
+          const totalUi = this.sync_draft_hands.reduce((a, x) => a + x.length, 0);
+          const totalHud = hudHandsVals.reduce((a, x) => a + x.length, 0);
+          if (!(this.sync_draft_hands_manual.some(Boolean) && totalHud < totalUi)) {
+            pUiMismatch = true;
+          }
+        } else {
+          for (let idx = 0; idx < hudHandsVals.length; idx++) {
+            const uiH = this.sync_draft_hands[idx] || [];
+            const hudH = hudHandsVals[idx];
+            if (uiH.length !== hudH.length || uiH.some((v, j) => v !== hudH[j])) {
+              const isMan = idx < this.sync_draft_hands_manual.length && this.sync_draft_hands_manual[idx];
+              if (!(isMan && hudH.length < uiH.length)) {
+                pUiMismatch = true;
+                break;
+              }
+            }
+          }
+        }
+        if (Array.isArray(this.sync_draft_dealer) && (this.sync_draft_dealer.length !== hudDealerVals.length || this.sync_draft_dealer.some((v, j) => v !== hudDealerVals[j]))) {
+          if (!(this.sync_draft_dealer_manual && hudDealerVals.length < this.sync_draft_dealer.length)) {
+            dUiMismatch = true;
+          }
+        }
+      }
+
+      if (!debMismatch && !pUiMismatch && !dUiMismatch) return;
+
+      const newDebouncers = {};
+      sortedKeys.forEach((hKey, posIdx) => {
+        const db = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
+        db.reanchor(handsInput[hKey].map((d) => d.rank));
+        newDebouncers[posIdx] = db;
+      });
+      this.pDebouncers = newDebouncers;
+      this.dDebouncer.reanchor((obs.dealer_cards || []).map((d) => d.rank));
+      this._emittedSplitHands = Math.max(1, sortedKeys.length);
+      this._splitDetected = sortedKeys.length >= 2;
+      this._emittedP = hudHandsVals.reduce((a, v) => a + v.length, 0);
+      this._emittedD = hudDealerVals.length;
+      this.sync_is_split = this._splitDetected;
+      this.sync_draft_hands = hudHandsVals.map((v) => v.slice());
+      this.sync_draft_dealer = hudDealerVals.slice();
+      this._uncertaintyFlags = [];
+      this._lastReconcileTs = now;
+
+      events.push({
+        type: "reconcile",
+        roundId: this.round_id,
+        handCount: this._emittedSplitHands,
+        hands: sortedKeys.map((h) =>
+          handsInput[h].map((d) => ({
+            val: d.val,
+            rankLabel: d.rank,
+            suit: d.suit,
+            conf: Number(d.conf.toFixed(3)),
+          }))
+        ),
+        dealer: dReal.map((d) => ({
+          val: d.val,
+          rankLabel: d.rank,
+          suit: d.suit,
+          conf: Number(d.conf.toFixed(3)),
+        })),
+      });
     }
   }
 

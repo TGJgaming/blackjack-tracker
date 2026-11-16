@@ -1009,3 +1009,99 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   }
   console.log("   Test 16 PASSED");
 }
+
+// Test 17: Split-hand reliability (debounce, overlap guard, re-anchor, seed lock, auto-watch, reconcile)
+{
+  console.log("17. Testing split-hand debounce, overlap guard, re-anchor, seed lock & auto-watch...");
+  const sm17 = new Engine.CompanionStateMachine(cfg);
+  const mkC = (rank, val, conf = 0.93, suit = "S", x = 10) => ({ rank, val, conf, suit, x, y: 10, w: 12, h: 16, hand_index: 0 });
+  const c8a = mkC("8", 8, 0.94, "S", 20);
+  const c8b = mkC("8", 8, 0.94, "H", 40);
+  const c5 = mkC("5", 5, 0.93, "C", 55);
+  const c3 = mkC("3", 3, 0.92, "D", 140);
+  const d10 = mkC("10", 0, 0.95, "S", 10);
+  const d7 = mkC("7", 7, 0.94, "H", 35);
+
+  let t = 10.0;
+  sm17.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [], dealer_cards: [], player_hands: {} });
+  // Commit initial pair [8, 8] + dealer [10]
+  for (let i = 0; i < 3; i++) {
+    sm17.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [c8a, c8b], dealer_cards: [d10], player_hands: { 0: [c8a, c8b] } });
+  }
+  assert.deepStrictEqual(sm17.pDebouncers[0].committedRanks, ["8", "8"]);
+
+  // Single-frame noisy split must NOT emit split
+  const evNoise = sm17.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [c8a, c8b], dealer_cards: [d10], player_hands: { 0: [c8a], 1: [c8b] }, split_detected: true });
+  assert(!evNoise.some((e) => e.type === "split"), "Single frame must not emit split");
+
+  // Unseparated overlap frame (H0 still [8,8] while H1 emerging) must NOT emit split
+  const evOverlap = sm17.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [c8a, c8b, c8b], dealer_cards: [d10], player_hands: { 0: [c8a, c8b], 1: [c8b] }, split_detected: true });
+  assert(!evOverlap.some((e) => e.type === "split"), "Unseparated overlap must hold off split");
+
+  // Separated split across 3 frames confirms split and re-anchors H0=[8], H1=[8]
+  let splitEvts = [];
+  for (let i = 0; i < 3; i++) {
+    splitEvts.push(...sm17.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [c8a, c8b], dealer_cards: [d10], player_hands: { 0: [c8a], 1: [c8b] }, split_detected: true }));
+  }
+  const sp = splitEvts.filter((e) => e.type === "split");
+  assert.strictEqual(sp.length, 1, "Confirmed split must emit exactly once");
+  assert.strictEqual(splitEvts.filter((e) => e.type === "card").length, 0, "Split re-anchor must not duplicate Card 0");
+
+  // H0 draws 5, H1 draws 3 (with H1 Card 0 occluded by score badge -> only [3] visible!)
+  const drawEvts = [];
+  for (let i = 0; i < 3; i++) {
+    drawEvts.push(...sm17.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [c8a, c5, c3], dealer_cards: [d10], player_hands: { 0: [c8a, c5], 1: [c3] }, split_detected: true }));
+  }
+  const pCardEvts = drawEvts.filter((e) => e.type === "card" && e.target === "P");
+  assert(pCardEvts.some((e) => e.handIndex === 0 && e.rankLabel === "5"), "H0 must emit drawn 5 after re-anchor");
+  assert(pCardEvts.some((e) => e.handIndex === 1 && e.rankLabel === "3"), "H1 must emit drawn 3 with seed-card lock");
+
+  // Dealer flips 7
+  for (let i = 0; i < 2; i++) {
+    sm17.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [c8a, c5, c3], dealer_cards: [d10, d7], player_hands: { 0: [c8a, c5], 1: [c3] }, split_detected: true });
+  }
+  // Table clears -> clean multi-hand split in Watch mode stages auto_watch (2H)
+  let finEvts = [];
+  for (let i = 0; i < 4; i++) {
+    finEvts.push(...sm17.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [], dealer_cards: [], player_hands: {} }));
+  }
+  const nmbEvts = sm17.step({ ts: (t += 0.1), banner_state: "NO_MORE_BETS", banner_conf: 0.95, player_cards: [], dealer_cards: [], player_hands: {} });
+  const aw = [...finEvts, ...nmbEvts].find((e) => e.type === "auto_watch");
+  assert(aw && aw.handCount === 2 && aw.summary.includes("(2H)"), `Clean 2H split should auto_watch, got ${JSON.stringify([...finEvts, ...nmbEvts])}`);
+  console.log("   Test 17 PASSED");
+}
+
+// Test 18: Digital dealer card reliability (slow turn missing WAIT, 2-frame suitless draw, blurred-suit high-conf pip)
+{
+  console.log("18. Testing dealer slow-turn WAIT-fade survival, 2-frame suitless draw & blurred-suit card...");
+  const sm18 = new Engine.CompanionStateMachine(cfg);
+  const mkC = (rank, val, conf = 0.90, suit = null, x = 10) => ({ rank, val, conf, suit, x, y: 10, w: 12, h: 16, hand_index: 0 });
+  const pA = mkC("A", 1, 0.94, "S", 20);
+  const p9 = mkC("9", 9, 0.94, "H", 40);
+  const dK = mkC("K", 0, 0.95, "S", 10);
+  const dBack = { rank: "BACK", val: null, conf: 0.92, suit: null, x: 35, y: 10, w: 12, h: 16, hand_index: 0 };
+  const d6 = mkC("6", 6, 0.83, null, 35);
+  const d4 = mkC("4", 4, 0.82, null, 60);
+
+  let t = 20.0;
+  sm18.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [], dealer_cards: [], player_hands: {} });
+  for (let i = 0; i < 3; i++) {
+    sm18.step({ ts: (t += 0.1), banner_state: "WAIT", banner_conf: 0.95, player_cards: [pA, p9], dealer_cards: [dK, dBack], player_hands: { 0: [pA, p9] } });
+  }
+  // WAIT fades for 4.5s while player/table thinks and dealer still has [K, BACK] -> MUST NOT finalize early
+  for (let i = 0; i < 9; i++) {
+    const evWaitGone = sm18.step({ ts: (t += 0.5), banner_state: "", banner_conf: 0, player_cards: [pA, p9], dealer_cards: [dK, dBack], player_hands: { 0: [pA, p9] } });
+    assert(!evWaitGone.some((e) => e.type === "prompt_confirm" || e.type === "auto_watch"), "Must not finalize while dealer still has BACK");
+  }
+  // Dealer flips 6 (0.83, suit=null) across 2 frames, then draws 4 (0.82, suit=null) across 2 frames
+  const dEvts = [];
+  for (let i = 0; i < 2; i++) {
+    dEvts.push(...sm18.step({ ts: (t += 0.08), banner_state: "", banner_conf: 0, player_cards: [pA, p9], dealer_cards: [dK, d6], player_hands: { 0: [pA, p9] } }));
+  }
+  for (let i = 0; i < 2; i++) {
+    dEvts.push(...sm18.step({ ts: (t += 0.08), banner_state: "", banner_conf: 0, player_cards: [pA, p9], dealer_cards: [dK, d6, d4], player_hands: { 0: [pA, p9] } }));
+  }
+  const dCardsOut = dEvts.filter((e) => e.type === "card" && e.target === "D").map((e) => e.rankLabel);
+  assert.deepStrictEqual(dCardsOut, ["6", "4"], `Expected 2-frame suitless dealer flip+draw [6, 4], got ${JSON.stringify(dCardsOut)}`);
+  console.log("   Test 18 PASSED");
+}
