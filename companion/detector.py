@@ -60,6 +60,8 @@ class FrameObservation:
     banner_source: str = ""
     dealer_badge_total: int | None = None
     dealer_badge_conf: float = 0.0
+    dealer_sub_cards: list[dict[str, Any]] = field(default_factory=list)
+    dealer_badge_hint: dict[str, Any] | None = None
 
 
 @dataclass
@@ -945,6 +947,7 @@ def _detect_cluster_cards(
     is_dealer: bool,
     min_hud_conf: float = 0.84,
     ref_ch: float | None = None,
+    sub_out: list[dict[str, Any]] | None = None,
 ) -> tuple[list[CardDetection], bool]:
     """Detect cards and suits inside one normalized H=45 white card cluster."""
     cx, cy, cw, ch = cluster
@@ -1014,6 +1017,8 @@ def _detect_cluster_cards(
 
     min_tail = 11 if is_dealer else (14 if (not cluster_has_back and not edge_clipped) else 12)
     peaks: list[tuple[float, CardDetection]] = []
+    sub_peaks: list[tuple[float, CardDetection]] = []
+    sub_floor = 0.42 if (is_dealer and sub_out is not None) else floor_conf
     roi_h, roi_w = norm_top.shape[:2]
     for tpl in rank_templates:
         for tsc in (0.90, 0.96, 1.0, 1.05, 1.10):
@@ -1027,7 +1032,7 @@ def _detect_cluster_cards(
             if max_x_for_tpl < 0:
                 continue
             res = cv2.matchTemplate(norm_top, scaled, cv2.TM_CCOEFF_NORMED)
-            ys, xs = np.where(res >= floor_conf)
+            ys, xs = np.where(res >= sub_floor)
             for y_pos, x_pos in zip(ys.tolist(), xs.tolist()):
                 if y_pos > 8 or x_pos > max_x_for_tpl:
                     continue
@@ -1048,21 +1053,20 @@ def _detect_cluster_cards(
                     continue
                 if _is_back_column(x_pos, sw):
                     continue
-                priority = conf + (0.015 if tpl.rank == "10" else 0.0)
-                peaks.append(
-                    (
-                        priority,
-                        CardDetection(
-                            rank=tpl.rank,
-                            val=tpl.val,
-                            conf=conf,
-                            x=int(x_pos),
-                            y=int(y_pos),
-                            w=sw,
-                            h=sh,
-                        ),
-                    )
+                cand_det = CardDetection(
+                    rank=tpl.rank,
+                    val=tpl.val,
+                    conf=conf,
+                    x=int(x_pos),
+                    y=int(y_pos),
+                    w=sw,
+                    h=sh,
                 )
+                if conf >= floor_conf:
+                    priority = conf + (0.015 if tpl.rank == "10" else 0.0)
+                    peaks.append((priority, cand_det))
+                elif is_dealer and sub_out is not None:
+                    sub_peaks.append((conf, cand_det))
 
     if not peaks:
         kept: list[CardDetection] = []
@@ -1127,6 +1131,35 @@ def _detect_cluster_cards(
             if best_left is not None:
                 kept.insert(0, best_left[1])
 
+    def _record_sub(cand_d: CardDetection, suit_v: str | None, pip_ok: bool) -> None:
+        if not is_dealer or sub_out is None:
+            return
+        sub_out.append(
+            {
+                "rank": cand_d.rank,
+                "val": cand_d.val,
+                "conf": float(cand_d.conf),
+                "x": cx + int(round(cand_d.x / sc)),
+                "y": cy + int(round(cand_d.y / sc)),
+                "w": max(4, int(round(cand_d.w / sc))),
+                "h": max(4, int(round(cand_d.h / sc))),
+                "suit": suit_v,
+                "has_pip_body": bool(pip_ok),
+                "rem_right": int(eff_right - cand_d.x),
+                "cw_norm": int(cw_norm),
+            }
+        )
+
+    if is_dealer and sub_out is not None and sub_peaks:
+        sub_peaks.sort(key=lambda item: item[0], reverse=True)
+        seen_sub: set[tuple[str, int]] = set()
+        for _, sp in sub_peaks[:12]:
+            key_s = (sp.rank, sp.x // 6)
+            if key_s in seen_sub:
+                continue
+            seen_sub.add(key_s)
+            _record_sub(sp, None, False)
+
     if not kept:
         return [], cluster_has_back
 
@@ -1156,20 +1189,26 @@ def _detect_cluster_cards(
                 if rem_right < 15:
                     min_r15 = max(0.74 if is_dealer else 0.84, (min_hud_conf - 0.10) if is_dealer else min_hud_conf)
                     if d.conf < min_r15 or (suit is None and not has_pip_body):
+                        _record_sub(d, suit, has_pip_body)
                         continue
                 elif rem_right < 22:
                     min_r22 = max(0.72 if is_dealer else 0.75, min_hud_conf - (0.12 if is_dealer else 0.09))
                     if d.conf < min_r22:
+                        _record_sub(d, suit, has_pip_body)
                         continue
                     if suit is None and (not has_pip_body or d.conf < max(0.82, min_hud_conf - 0.02)):
+                        _record_sub(d, suit, has_pip_body)
                         continue
             high_conf_pip_ok = has_pip_body and d.conf >= max(0.75 if is_dealer else 0.86, 0.75 if is_dealer else min_hud_conf)
             if suit is None and not has_badge_occlusion and not high_conf_pip_ok:
                 if not has_pip_body or suit_conf < 0.42 or d.conf < max(0.82, min_hud_conf - 0.02):
+                    _record_sub(d, suit, has_pip_body)
                     continue
             elif suit is not None and d.conf < max(0.78, min_hud_conf - 0.06) and suit_conf < 0.60:
+                _record_sub(d, suit, has_pip_body)
                 continue
             if d.rank == "4" and not has_badge_occlusion and d.conf < max(0.82, min_hud_conf - 0.02):
+                _record_sub(d, suit, has_pip_body)
                 continue
         out.append(
             CardDetection(
@@ -1482,11 +1521,13 @@ def _match_badge_digit_patch(gray_img: np.ndarray, x: int, y: int, w: int, h: in
 
 
 def detect_dealer_badge_total(
-    dealer_img: np.ndarray, clusters: list[tuple[int, int, int, int]] | None = None
-) -> tuple[int | None, float]:
+    dealer_img: np.ndarray,
+    clusters: list[tuple[int, int, int, int]] | None = None,
+    return_hint: bool = False,
+) -> tuple[int | None, float] | tuple[int | None, float, dict[str, Any] | None]:
     """Read the white-on-dark circular Dealer Score Badge total ([4..26]) beside/below dealer cards."""
     if dealer_img.size == 0 or dealer_img.ndim < 2 or dealer_img.shape[0] < 16 or dealer_img.shape[1] < 16:
-        return None, 0.0
+        return (None, 0.0, None) if return_hint else (None, 0.0)
     dh, dw = dealer_img.shape[:2]
     if clusters:
         cx, cy, _, ch = clusters[0]
@@ -1507,12 +1548,13 @@ def detect_dealer_badge_total(
     bw = bx1 - bx0
     bh = by1 - by0
     if bw < 10 or bh < 10:
-        return None, 0.0
+        return (None, 0.0, None) if return_hint else (None, 0.0)
 
     sub_gray = _to_gray(dealer_img[by0:by1, bx0:bx1])
     mask = (sub_gray >= 165).astype(np.uint8)
     num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
     digit_cands: list[tuple[int, int, int, int, str, float]] = []
+    soft_cands: list[tuple[int, int, int, int, str, float]] = []
     for lbl in range(1, num):
         x, y, w, h, area = [int(v) for v in stats[lbl]]
         if h < min_digit_h or h > max_digit_h:
@@ -1534,33 +1576,74 @@ def detect_dealer_badge_total(
             continue
 
         digit, conf = _match_badge_digit_patch(sub_gray, x, y, w, h)
-        if digit is not None and conf >= 0.72:
-            digit_cands.append((x, y, w, h, digit, conf))
+        if digit is not None and conf >= 0.54:
+            soft_cands.append((x, y, w, h, digit, conf))
+            if conf >= 0.72:
+                digit_cands.append((x, y, w, h, digit, conf))
 
-    if not digit_cands:
-        return None, 0.0
-    digit_cands.sort(key=lambda c: c[0])
+    if not soft_cands:
+        return (None, 0.0, None) if return_hint else (None, 0.0)
 
-    groups: list[list[tuple[int, int, int, int, str, float]]] = []
-    for cand in digit_cands:
-        x, y, w, h, _, _ = cand
-        if groups:
-            last_g = groups[-1]
-            px, py, pw, ph, _, _ = last_g[-1]
-            same_row = abs(y - py) <= max(3, int(round(ph * 0.25)))
-            same_h = (ph * 0.70) <= h <= (ph * 1.40)
-            gap = x - (px + pw)
-            if same_row and same_h and -2 <= gap <= max(4, int(round(ph * 0.55))) and len(last_g) < 2:
-                last_g.append(cand)
-                continue
-        groups.append([cand])
+    def _group_digits(cands: list[tuple[int, int, int, int, str, float]]) -> list[list[tuple[int, int, int, int, str, float]]]:
+        cands.sort(key=lambda c: c[0])
+        grps: list[list[tuple[int, int, int, int, str, float]]] = []
+        for cand in cands:
+            x, y, w, h, _, _ = cand
+            if grps:
+                last_g = grps[-1]
+                px, py, pw, ph, _, _ = last_g[-1]
+                same_row = abs(y - py) <= max(3, int(round(ph * 0.25)))
+                same_h = (ph * 0.70) <= h <= (ph * 1.40)
+                gap = x - (px + pw)
+                if same_row and same_h and -2 <= gap <= max(4, int(round(ph * 0.55))) and len(last_g) < 2:
+                    last_g.append(cand)
+                    continue
+            grps.append([cand])
+        return grps
 
-    for g in reversed(groups):
-        total = int("".join(c[4] for c in g))
-        min_conf = min(c[5] for c in g)
-        if 4 <= total <= 26 and min_conf >= 0.56:
-            return total, float(min_conf)
-    return None, 0.0
+    best_total: int | None = None
+    best_conf = 0.0
+    if digit_cands:
+        for g in reversed(_group_digits(digit_cands)):
+            total = int("".join(c[4] for c in g))
+            min_conf = min(c[5] for c in g)
+            if 4 <= total <= 26 and min_conf >= 0.56:
+                best_total = total
+                best_conf = float(min_conf)
+                break
+
+    if not return_hint:
+        return best_total, best_conf
+
+    soft_hint: dict[str, Any] | None = None
+    for g in reversed(_group_digits(soft_cands)):
+        if len(g) == 2:
+            t_dig, o_dig = int(g[0][4]), int(g[1][4])
+            t_conf, o_conf = float(g[0][5]), float(g[1][5])
+            tot = t_dig * 10 + o_dig
+            if 10 <= tot <= 26:
+                soft_hint = {
+                    "total": tot,
+                    "conf": min(t_conf, o_conf),
+                    "tensDigit": t_dig,
+                    "tensConf": t_conf,
+                    "onesDigit": o_dig,
+                    "onesConf": o_conf,
+                }
+                break
+        elif len(g) == 1:
+            dig = int(g[0][4])
+            d_conf = float(g[0][5])
+            soft_hint = {
+                "total": dig if 4 <= dig <= 9 else None,
+                "conf": d_conf,
+                "tensDigit": dig if dig in (1, 2) else None,
+                "tensConf": d_conf if dig in (1, 2) else 0.0,
+                "onesDigit": dig,
+                "onesConf": d_conf,
+            }
+            break
+    return best_total, best_conf, soft_hint
 
 
 class PlaytechDetector:
@@ -1587,7 +1670,8 @@ class PlaytechDetector:
         self._banner_tpl_hints: dict[str, tuple[str, float]] = {}
         self._cached_p: tuple[list[CardDetection], dict[int, list[CardDetection]], bool] = ([], {}, False)
         self._cached_d: list[CardDetection] = []
-        self._cached_d_badge: tuple[int | None, float] = (None, 0.0)
+        self._cached_d_sub: list[dict[str, Any]] = []
+        self._cached_d_badge: tuple[int | None, float, dict[str, Any] | None] = (None, 0.0, None)
         self._last_d_clusters: list[tuple[int, int, int, int]] = []
         self._cached_top_banner: tuple[str, float] = ("", 0.0)
         self._cached_pb: tuple[float, bool] = (0.0, False)
@@ -1694,7 +1778,10 @@ class PlaytechDetector:
         self.invalidate_cache()
 
     def _detect_hud_strip(
-        self, roi_img: np.ndarray, is_dealer: bool
+        self,
+        roi_img: np.ndarray,
+        is_dealer: bool,
+        sub_out: list[dict[str, Any]] | None = None,
     ) -> tuple[list[CardDetection], dict[int, list[CardDetection]], bool]:
         """Detect cards, suits, and optional horizontal splits inside player or dealer HUD ROI."""
         if roi_img.size == 0 or not self.hud_bank.card_templates:
@@ -1721,6 +1808,7 @@ class PlaytechDetector:
                     is_dealer=is_dealer,
                     min_hud_conf=self.cfg.min_hud_confidence,
                     ref_ch=ref_ch,
+                    sub_out=sub_out if is_dealer else None,
                 )
                 back_seen = back_seen or cl_back
                 if dets:
@@ -1849,16 +1937,22 @@ class PlaytechDetector:
             )
             if not force_dealer_scan and d_sig == self._last_d_sig:
                 d_cards = self._cached_d
-                d_badge_total, d_badge_conf = self._cached_d_badge
+                d_sub_cards = self._cached_d_sub
+                d_badge_total, d_badge_conf, d_badge_hint = self._cached_d_badge
             else:
                 self._last_d_sig = d_sig
-                d_cards, _, _ = self._detect_hud_strip(dealer_img, is_dealer=True)
-                d_badge_total, d_badge_conf = detect_dealer_badge_total(dealer_img, self._last_d_clusters)
+                d_sub_cards = []
+                d_cards, _, _ = self._detect_hud_strip(dealer_img, is_dealer=True, sub_out=d_sub_cards)
+                d_badge_total, d_badge_conf, d_badge_hint = detect_dealer_badge_total(
+                    dealer_img, self._last_d_clusters, return_hint=True
+                )
                 self._cached_d = d_cards
-                self._cached_d_badge = (d_badge_total, d_badge_conf)
+                self._cached_d_sub = d_sub_cards
+                self._cached_d_badge = (d_badge_total, d_badge_conf, d_badge_hint)
         else:
             d_cards = self._cached_d
-            d_badge_total, d_badge_conf = self._cached_d_badge
+            d_sub_cards = self._cached_d_sub
+            d_badge_total, d_badge_conf, d_badge_hint = self._cached_d_badge
 
         cards_present = bool(p_cards or d_cards)
 
@@ -2077,4 +2171,6 @@ class PlaytechDetector:
             banner_source=banner_source,
             dealer_badge_total=d_badge_total,
             dealer_badge_conf=d_badge_conf,
+            dealer_sub_cards=list(d_sub_cards),
+            dealer_badge_hint=d_badge_hint,
         )

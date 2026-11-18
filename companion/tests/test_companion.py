@@ -2452,6 +2452,89 @@ def test_ipados_parity_badge_deduction_educated_guess_split_watch_and_warn_recov
     assert mgr.state == "WATCH_COUNTDOWN"
 
 
+def test_educated_guess_all_ranks_and_signals() -> None:
+    from state_machine import guess_missing_dealer_card
+
+    # 1. Signal 1: Sub-threshold template runner-up peak + narrow card width (rem_right=13)
+    g1 = guess_missing_dealer_card(
+        ["10"],
+        {
+            "sub_candidates": [
+                {"rank": "10", "val": 0, "conf": 0.56, "slotIdx": 1, "rem_right": 13, "has_pip_body": True},
+                {"rank": "8", "val": 8, "conf": 0.55, "slotIdx": 1, "rem_right": 13, "has_pip_body": True},
+            ]
+        },
+    )
+    assert g1 == {"rank": "8", "val": 8}
+
+    # 2. Signal 2: Partial/soft dealer score badge hints (tensDigit=1, onesDigit=8)
+    g2 = guess_missing_dealer_card(
+        ["10", "2"],
+        {"badge_hint": {"total": None, "conf": 0.62, "tensDigit": 1, "tensConf": 0.72, "onesDigit": 8, "onesConf": 0.65}},
+    )
+    assert g2 == {"rank": "6", "val": 6}
+
+    # 3. Signal 3: Physical felt sightings
+    g3 = guess_missing_dealer_card(
+        ["10", "3"],
+        {"felt_sightings": [{"rank": "5", "val": 5, "conf": 0.74}]},
+    )
+    assert g3 == {"rank": "5", "val": 5}
+
+    # 4 & 5. Signal 4 & 5: Live shoe depletion + stratified round_seed across all 10 ranks
+    full_shoe = [128, 32, 32, 32, 32, 32, 32, 32, 32, 32]
+    seen_ranks = set()
+    for seed in range(1, 61):
+        g = guess_missing_dealer_card(["10", "6"], {"shoe_rem": full_shoe, "round_seed": seed})
+        assert g is not None
+        seen_ranks.add(g["rank"])
+    for r in ("10", "A", "2", "3", "4", "5", "6", "7", "8", "9"):
+        assert r in seen_ranks, f"Missing rank {r} from stratified shoe sampling: {seen_ranks}"
+
+    # Shoe depletion: only 4s remaining
+    only_fours = [0, 0, 0, 0, 12, 0, 0, 0, 0, 0]
+    g_dep = guess_missing_dealer_card(["10", "3"], {"shoe_rem": only_fours, "round_seed": 1})
+    assert g_dep == {"rank": "4", "val": 4}
+
+    # End-to-end CompanionStateMachine Fallback E with dealer_sub_cards
+    cfg = CompanionConfig(confirm_frames=1, clear_frames=2)
+    sm = CompanionStateMachine(cfg)
+    sm.set_sync_state(play_mode="watch")
+    sm.step(
+        FrameObservation(
+            ts=1.0,
+            banner_state="NO_MORE_BETS",
+            player_cards=[],
+            dealer_cards=[],
+            player_hands={},
+        )
+    )
+    sm.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)],
+            dealer_cards=[CardDetection("9", 9, 0.94, 10), CardDetection("BACK", None, 0.92, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)]},
+            dealer_sub_cards=[{"rank": "8", "val": 8, "conf": 0.59, "suit": "H", "has_pip_body": True, "slotIdx": 1, "rem_right": 13}],
+        )
+    )
+    end_evs = sm.step(
+        FrameObservation(
+            ts=3.0,
+            banner_state="PLACE_BETS",
+            player_cards=[],
+            dealer_cards=[],
+            player_hands={},
+        )
+    )
+    guess_ev = next((e for e in end_evs if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"), None)
+    assert guess_ev is not None
+    assert guess_ev["rankLabel"] == "8"
+    assert guess_ev["val"] == 8
+
+
+
 
 
 

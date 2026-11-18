@@ -94,14 +94,180 @@ def deduce_missing_dealer_pair(d_committed_ranks: list[str], badge_total: int | 
     return best_pair
 
 
-def guess_missing_dealer_card(d_committed_ranks: list[str]) -> dict[str, Any] | None:
-    """Return highest-frequency educated guess (10, or A when standing on hard 6 vs Ace) for incomplete dealer hand."""
+_ALL_GUESS_RANKS: list[dict[str, Any]] = [
+    {"rank": "10", "val": 0},
+    {"rank": "A", "val": 1},
+    {"rank": "2", "val": 2},
+    {"rank": "3", "val": 3},
+    {"rank": "4", "val": 4},
+    {"rank": "5", "val": 5},
+    {"rank": "6", "val": 6},
+    {"rank": "7", "val": 7},
+    {"rank": "8", "val": 8},
+    {"rank": "9", "val": 9},
+]
+
+_RANK_TO_VAL: dict[str, int] = {
+    "10": 0, "J": 0, "Q": 0, "K": 0, "0": 0,
+    "A": 1, "1": 1,
+    "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+}
+
+
+def guess_missing_dealer_card(
+    d_committed_ranks: list[str],
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Multi-signal educated guess across all 10 blackjack ranks (A, 2..9, 10) for incomplete dealer hands."""
     if not d_committed_ranks:
         return None
     d_tot, d_soft, _ = _eval_bj_ranks(d_committed_ranks)
+    if not context:
+        if d_tot == 6 and not d_soft:
+            return {"rank": "A", "val": 1}
+        return {"rank": "10", "val": 0}
+
+    must_reach_17 = context.get("must_reach_17", True)
+    slot_idx = int(context.get("slot_idx", len(d_committed_ranks)))
+
+    # 1. Sub-threshold template runner-up peaks + visual width prior (rem_right)
+    sub_cands_raw = context.get("sub_candidates")
+    if isinstance(sub_cands_raw, dict):
+        sub_cands = sub_cands_raw.get(slot_idx) or []
+    elif isinstance(sub_cands_raw, list):
+        sub_cands = sub_cands_raw
+    else:
+        sub_cands = []
+
+    if sub_cands:
+        best_sub: dict[str, Any] | None = None
+        best_score = -1.0
+        for sc in sub_cands:
+            if not isinstance(sc, dict):
+                continue
+            rk_raw = sc.get("rank")
+            if not rk_raw or rk_raw == "BACK":
+                continue
+            val = _RANK_TO_VAL.get(rk_raw) if rk_raw in _RANK_TO_VAL else sc.get("val")
+            if val is None:
+                continue
+            canon_rank = "10" if val == 0 else ("A" if val == 1 else str(val))
+            new_tot, _, _ = _eval_bj_ranks([*d_committed_ranks, canon_rank])
+            if must_reach_17 and d_tot >= 7 and new_tot < 17:
+                continue
+            score = float(sc.get("conf") or 0.0)
+            rem_r = sc.get("rem_right")
+            if rem_r is None:
+                rem_r = sc.get("remRight")
+            if isinstance(rem_r, (int, float)) and 0 < rem_r < 16:
+                if canon_rank == "10":
+                    score -= 0.14
+                else:
+                    score += 0.06
+            if sc.get("has_pip_body") or sc.get("hasPipBody"):
+                score += 0.04
+            if sc.get("suit"):
+                score += 0.03
+            if score >= 0.48 and score > best_score:
+                best_score = score
+                best_sub = {"rank": canon_rank, "val": int(val)}
+        if best_sub is not None:
+            return best_sub
+
+    # 2. Partial / soft dealer score badge hints (tensDigit / onesDigit)
+    badge_hint = context.get("badge_hint") or context.get("badgeHint")
+    if isinstance(badge_hint, dict):
+        hint_tot = badge_hint.get("total")
+        hint_conf = float(badge_hint.get("conf") or 0.0)
+        if isinstance(hint_tot, int) and 17 <= hint_tot <= 26 and hint_conf >= 0.56:
+            exact = deduce_missing_dealer_card(d_committed_ranks, hint_tot)
+            if exact is not None:
+                return exact
+        tens_dig = badge_hint.get("tensDigit")
+        tens_conf = float(badge_hint.get("tensConf") or 0.0)
+        ones_dig = badge_hint.get("onesDigit")
+        ones_conf = float(badge_hint.get("onesConf") or 0.0)
+        if tens_dig in (1, 2) and tens_conf >= 0.58:
+            lo = 17 if tens_dig == 1 else 20
+            hi = 19 if tens_dig == 1 else 26
+            tens_matches = [
+                c for c in _ALL_GUESS_RANKS
+                if lo <= _eval_bj_ranks([*d_committed_ranks, c["rank"]])[0] <= hi
+            ]
+            if tens_matches:
+                if isinstance(ones_dig, int) and ones_conf >= 0.54:
+                    for c in tens_matches:
+                        if (_eval_bj_ranks([*d_committed_ranks, c["rank"]])[0] % 10) == ones_dig:
+                            return c
+                if tens_dig == 2:
+                    for c in tens_matches:
+                        if c["rank"] == "10":
+                            return c
+                return tens_matches[len(tens_matches) // 2]
+
+    # 3. Physical felt sightings recorded during the round
+    felt_sightings = context.get("felt_sightings") or context.get("feltSightings")
+    if isinstance(felt_sightings, list):
+        for fs in felt_sightings:
+            if not isinstance(fs, dict):
+                continue
+            rk_raw = fs.get("rank") or fs.get("rankLabel")
+            val = _RANK_TO_VAL.get(rk_raw) if rk_raw in _RANK_TO_VAL else fs.get("val")
+            if val is not None:
+                canon_rank = "10" if val == 0 else ("A" if val == 1 else str(val))
+                new_tot, _, _ = _eval_bj_ranks([*d_committed_ranks, canon_rank])
+                if not must_reach_17 or d_tot < 7 or new_tot >= 17:
+                    return {"rank": canon_rank, "val": int(val)}
+
+    # 4. Live shoe depletion & stopping-rule Bayesian stratified selection across all 10 ranks
+    default_rem = [128, 32, 32, 32, 32, 32, 32, 32, 32, 32]
+    raw_rem = context.get("shoe_rem") if context.get("shoe_rem") is not None else context.get("shoeRem")
+    if isinstance(raw_rem, list) and len(raw_rem) == 10:
+        shoe_rem = [max(0, int(n)) if isinstance(n, (int, float)) else default_rem[i] for i, n in enumerate(raw_rem)]
+    else:
+        shoe_rem = default_rem
+
+    valid_pool = [
+        c for c in _ALL_GUESS_RANKS
+        if not (must_reach_17 and d_tot >= 7 and _eval_bj_ranks([*d_committed_ranks, c["rank"]])[0] < 17)
+    ]
+    if not valid_pool:
+        valid_pool = list(_ALL_GUESS_RANKS)
+
+    tail_rem_right = context.get("tail_rem_right")
+    if isinstance(tail_rem_right, (int, float)) and 0 < tail_rem_right < 15:
+        non_ten = [c for c in valid_pool if c["rank"] != "10"]
+        if non_ten:
+            valid_pool = non_ten
+
+    non_depleted = [c for c in valid_pool if shoe_rem[c["val"]] > 0]
+    if non_depleted:
+        valid_pool = non_depleted
+
+    weights = [shoe_rem[c["val"]] if shoe_rem[c["val"]] > 0 else 1 for c in valid_pool]
+    total_weight = sum(weights)
+
+    round_seed = context.get("round_seed")
+    if isinstance(round_seed, (int, float)) and total_weight > 0:
+        u = (float(round_seed) * 0.618033988749895) % 1.0
+        target = u * total_weight
+        acc = 0.0
+        for idx, c in enumerate(valid_pool):
+            acc += weights[idx]
+            if target <= acc:
+                return c
+
     if d_tot == 6 and not d_soft:
-        return {"rank": "A", "val": 1}
-    return {"rank": "10", "val": 0}
+        for c in valid_pool:
+            if c["rank"] == "A":
+                return c
+    best_cand = valid_pool[0]
+    best_w = -1
+    for idx, c in enumerate(valid_pool):
+        if weights[idx] > best_w:
+            best_w = weights[idx]
+            best_cand = c
+    return best_cand
 
 
 @dataclass
@@ -923,6 +1089,7 @@ class CompanionStateMachine:
         self.sync_draft_dealer_manual: bool = False
         self.sync_has_prompt: bool = False
         self.sync_bet_rounds_count: int = 0
+        self.sync_shoe_rem: list[int] | None = None
 
         self.state: str = "IDLE"  # IDLE | BETTING | DEALING | PLAYER_TURN | DEALER_TURN | ROUND_OVER | SHUFFLING
         self._round_seq: int = 0
@@ -952,8 +1119,10 @@ class CompanionStateMachine:
         self._reconcile_since: float = 0.0
         self._last_reconcile_ts: float = -999.0
         self._best_dealer_tail: dict[int, CardDetection] = {}
+        self._best_sub_dealer_tail: dict[int, list[dict[str, Any]]] = {}
         self._last_dealer_badge_total: int | None = None
         self._last_dealer_badge_conf: float = 0.0
+        self._last_dealer_badge_hint: dict[str, Any] | None = None
         self._dealer_badge_history: list[dict[str, Any]] = []
 
         self._last_banner_emitted: str = ""
@@ -1000,8 +1169,10 @@ class CompanionStateMachine:
         self._reconcile_frames = 0
         self._reconcile_since = 0.0
         self._best_dealer_tail.clear()
+        self._best_sub_dealer_tail.clear()
         self._last_dealer_badge_total = None
         self._last_dealer_badge_conf = 0.0
+        self._last_dealer_badge_hint = None
         self._dealer_badge_history.clear()
         self._uncertainty_flags.clear()
         self._unread_community_pulses = 0
@@ -1052,7 +1223,12 @@ class CompanionStateMachine:
         draft_dealer_manual: bool | None = None,
         has_prompt: bool | None = None,
         bet_rounds_count: int | None = None,
+        shoe_rem: list[int] | None = None,
     ) -> None:
+        if isinstance(shoe_rem, list) and len(shoe_rem) == 10:
+            self.sync_shoe_rem = [max(0, int(n)) for n in shoe_rem]
+        elif shoe_rem is None:
+            pass
         was_armed = self.felt_tracking_armed
         if play_mode in ("watch", "bet"):
             self.sync_play_mode = play_mode
@@ -1221,8 +1397,12 @@ class CompanionStateMachine:
                 self._dealer_badge_history.append({"total": int(b_tot), "conf": b_conf})
             elif b_conf > self._dealer_badge_history[-1]["conf"]:
                 self._dealer_badge_history[-1]["conf"] = b_conf
+        b_hint = getattr(obs, "dealer_badge_hint", None)
+        if isinstance(b_hint, dict):
+            if self._last_dealer_badge_hint is None or float(b_hint.get("conf") or 0.0) >= float(self._last_dealer_badge_hint.get("conf") or 0.0):
+                self._last_dealer_badge_hint = b_hint
         for idx, det in enumerate(obs.dealer_cards):
-            if det.rank == "BACK" or det.val is None or det.conf < 0.70:
+            if det.rank == "BACK" or det.val is None:
                 continue
             already_real = (
                 idx < len(self.d_debouncer.committed_ranks)
@@ -1230,9 +1410,31 @@ class CompanionStateMachine:
             )
             if already_real:
                 continue
-            prev = self._best_dealer_tail.get(idx)
-            if prev is None or det.conf > prev.conf:
-                self._best_dealer_tail[idx] = det
+            if det.conf >= 0.70:
+                prev = self._best_dealer_tail.get(idx)
+                if prev is None or det.conf > prev.conf:
+                    self._best_dealer_tail[idx] = det
+            elif det.conf >= 0.42:
+                self._best_sub_dealer_tail.setdefault(idx, []).append(
+                    {
+                        "rank": det.rank,
+                        "val": det.val,
+                        "conf": det.conf,
+                        "suit": det.suit,
+                        "has_pip_body": getattr(det, "has_pip_body", False),
+                    }
+                )
+        d_sub_list = getattr(obs, "dealer_sub_cards", None) or []
+        if d_sub_list:
+            base_slot = max(
+                sum(1 for d in obs.dealer_cards if d.rank != "BACK"),
+                sum(1 for r in self.d_debouncer.committed_ranks if r != "BACK"),
+            )
+            for i, sdet in enumerate(d_sub_list):
+                if not isinstance(sdet, dict) or not sdet.get("rank") or sdet.get("rank") == "BACK":
+                    continue
+                slot_idx = int(sdet["slotIdx"]) if isinstance(sdet.get("slotIdx"), int) else (base_slot + i)
+                self._best_sub_dealer_tail.setdefault(slot_idx, []).append(sdet)
 
     def _emit_dealer_cards(
         self,
@@ -1409,19 +1611,32 @@ class CompanionStateMachine:
                     _commit_deduced_card(pair[0], self._last_dealer_badge_conf)
                     _commit_deduced_card(pair[1], self._last_dealer_badge_conf)
 
-        # Fallback E: educated guess for missing final dealer card(s) so dealer reaches >= 17
+        # Fallback E: multi-signal educated guess across all 10 ranks (A, 2..9, 10) so dealer reaches >= 17
         educated_guess_rank: str | None = None
         guess_count = 0
         while _is_dealer_still_incomplete(include_ten_ace_back=False) and guess_count < 2:
             d_comm_before = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
-            guess = guess_missing_dealer_card(d_comm_before)
+            if "BACK" in self.d_debouncer.committed_ranks:
+                slot_idx = self.d_debouncer.committed_ranks.index("BACK")
+            else:
+                slot_idx = len(self.d_debouncer.committed_ranks)
+            guess = guess_missing_dealer_card(
+                d_comm_before,
+                {
+                    "slot_idx": slot_idx,
+                    "sub_candidates": self._best_sub_dealer_tail,
+                    "badge_hint": self._last_dealer_badge_hint,
+                    "felt_sightings": self._round_felt_sightings,
+                    "shoe_rem": self.sync_shoe_rem,
+                    "round_seed": (self._round_seq + guess_count * 7) if self.sync_shoe_rem is not None else None,
+                    "must_reach_17": True,
+                },
+            )
             if not guess:
                 break
             if "BACK" in self.d_debouncer.committed_ranks:
-                slot_idx = self.d_debouncer.committed_ranks.index("BACK")
                 self.d_debouncer.committed_ranks[slot_idx] = guess["rank"]
             else:
-                slot_idx = len(self.d_debouncer.committed_ranks)
                 self.d_debouncer.committed_ranks.append(guess["rank"])
             educated_guess_rank = f"{educated_guess_rank},{guess['rank']}" if educated_guess_rank else guess["rank"]
             guess_det = CardDetection(rank=guess["rank"], val=guess["val"], conf=0.50, x=0)

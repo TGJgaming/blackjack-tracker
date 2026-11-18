@@ -319,6 +319,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 draft_dealer_manual=msg.get("draftDealerManual"),
                 has_prompt=msg.get("hasPrompt"),
                 bet_rounds_count=msg.get("betRoundsCount"),
+                shoe_rem=msg.get("shoeRem"),
             )
             return None
 
