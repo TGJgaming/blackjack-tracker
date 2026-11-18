@@ -1090,10 +1090,25 @@ class CompanionStateMachine:
         self.sync_has_prompt: bool = False
         self.sync_bet_rounds_count: int = 0
         self.sync_shoe_rem: list[int] | None = None
+        self.sync_dealer_guess_removed: bool = False
 
         self.state: str = "IDLE"  # IDLE | BETTING | DEALING | PLAYER_TURN | DEALER_TURN | ROUND_OVER | SHUFFLING
         self._round_seq: int = 0
         self.round_id: str = "r_0"
+
+        self._review_round_id: str = ""
+        self._review_player_ranks: list[list[str]] = []
+        self._review_dealer_ranks: list[str] = []
+        self._review_sub_dealer_tail: dict[int, list[dict[str, Any]]] = {}
+        self._review_badge_hint: dict[str, Any] | None = None
+        self._review_felt_sightings: list[dict[str, Any]] = []
+        self._review_emitted_p: int = 0
+        self._review_emitted_d: int = 0
+        self._review_emitted_b: int = 0
+        self._review_emitted_split_hands: int = 1
+        self._place_bets_entered_ts: float | None = None
+        self._place_bets_recheck_0_done: bool = False
+        self._place_bets_recheck_3_done: bool = False
 
         self._emitted_p: int = 0
         self._emitted_d: int = 0
@@ -1191,6 +1206,7 @@ class CompanionStateMachine:
         self._predeal_obs = None
 
     def _start_new_round(self) -> None:
+        self._clear_review_snapshot()
         self._round_seq += 1
         self.round_id = f"r_{self._round_seq}"
         self._reset_round_accumulators()
@@ -1224,11 +1240,14 @@ class CompanionStateMachine:
         has_prompt: bool | None = None,
         bet_rounds_count: int | None = None,
         shoe_rem: list[int] | None = None,
+        dealer_guess_removed: bool | None = None,
     ) -> None:
         if isinstance(shoe_rem, list) and len(shoe_rem) == 10:
             self.sync_shoe_rem = [max(0, int(n)) for n in shoe_rem]
         elif shoe_rem is None:
             pass
+        if dealer_guess_removed is not None:
+            self.sync_dealer_guess_removed = bool(dealer_guess_removed)
         was_armed = self.felt_tracking_armed
         if play_mode in ("watch", "bet"):
             self.sync_play_mode = play_mode
@@ -1250,6 +1269,10 @@ class CompanionStateMachine:
             if new_count == 0 and self._pending_auto_watch is not None:
                 # User manually logged or cleared the review draft in UI.
                 self._pending_auto_watch = None
+            if new_count == 0:
+                self._review_round_id = ""
+                self._review_player_ranks.clear()
+                self._review_dealer_ranks.clear()
             self.sync_draft_count = new_count
         if comp_round_id is not None:
             self.sync_round_id = str(comp_round_id)
@@ -1266,10 +1289,27 @@ class CompanionStateMachine:
         if bet_rounds_count is not None:
             self.sync_bet_rounds_count = max(0, int(bet_rounds_count))
 
+    def _clear_review_snapshot(self) -> None:
+        self._review_round_id = ""
+        self._review_player_ranks.clear()
+        self._review_dealer_ranks.clear()
+        self._review_sub_dealer_tail.clear()
+        self._review_badge_hint = None
+        self._review_felt_sightings.clear()
+        self._review_emitted_p = 0
+        self._review_emitted_d = 0
+        self._review_emitted_b = 0
+        self._review_emitted_split_hands = 1
+        self._place_bets_entered_ts = None
+        self._place_bets_recheck_0_done = False
+        self._place_bets_recheck_3_done = False
+        self.sync_dealer_guess_removed = False
+
     def resync_round(self, clear_pending: bool = True) -> None:
         """Reset transient round accumulators without changing shoe/sync settings."""
         if clear_pending:
             self._pending_auto_watch = None
+            self._clear_review_snapshot()
         self._reset_round_accumulators()
         self._last_banner_emitted = ""
         self._saw_clear_since_round_over = True
@@ -1284,6 +1324,7 @@ class CompanionStateMachine:
         if self.state in ("IDLE", "ROUND_OVER"):
             if events is not None:
                 self._flush_pending_auto_watch(events)
+            self._clear_review_snapshot()
             self._round_seq += 1
             self.round_id = f"r_{self._round_seq}"
             self.state = "DEALING"
@@ -1490,6 +1531,13 @@ class CompanionStateMachine:
             for db in self.p_debouncers.values()
             if db.committed_ranks
         ]
+        if not p_hands_ranks and self.sync_round_id == self.round_id and self.sync_draft_hands:
+            p_hands_ranks = [
+                ["10" if v == 0 else ("A" if v == 1 else str(v)) for v in h]
+                for h in self.sync_draft_hands
+                if h
+            ]
+        total_effective_p = max(self._emitted_p, sum(len(hr) for hr in p_hands_ranks))
         any_player_alive = any(not _eval_bj_ranks(hr)[2] for hr in p_hands_ranks) if p_hands_ranks else True
         all_players_natural_bj = bool(p_hands_ranks) and all(
             len(hr) == 2 and _eval_bj_ranks(hr)[0] == 21 for hr in p_hands_ranks
@@ -1502,7 +1550,7 @@ class CompanionStateMachine:
         if (
             self.cfg.enable_dealer_felt_fallback
             and self._pending_dealer_felt
-            and self._emitted_p >= 2
+            and (total_effective_p >= 2 or len(d_committed) >= 2)
             and any_player_alive
             and (len(d_committed) < 2 or d_total < 17)
         ):
@@ -1523,19 +1571,15 @@ class CompanionStateMachine:
                 d_total, _, _ = _eval_bj_ranks(d_committed)
         self._pending_dealer_felt.clear()
 
-        def _is_dealer_still_incomplete(include_ten_ace_back: bool = False) -> bool:
+        def _is_dealer_still_incomplete(include_ten_ace_back: bool = True) -> bool:
             d_comm = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
             d_tot, _, _ = _eval_bj_ranks(d_comm)
             has_back = "BACK" in self.d_debouncer.committed_ranks
-            back_incomplete = has_back and (
-                len(d_comm) >= 2
-                or (
-                    len(d_comm) == 1
-                    and (include_ten_ace_back or d_comm[0] not in ("10", "J", "Q", "K", "A"))
-                )
+            back_incomplete = has_back and len(d_comm) >= 1 and (
+                include_ten_ace_back or not all_players_natural_bj
             )
             return (
-                self._emitted_p >= 2
+                total_effective_p >= 2
                 and any_player_alive
                 and (
                     (len(d_comm) >= 2 and d_tot < 17)
@@ -1614,7 +1658,7 @@ class CompanionStateMachine:
         # Fallback E: multi-signal educated guess across all 10 ranks (A, 2..9, 10) so dealer reaches >= 17
         educated_guess_rank: str | None = None
         guess_count = 0
-        while _is_dealer_still_incomplete(include_ten_ace_back=False) and guess_count < 2:
+        while _is_dealer_still_incomplete(include_ten_ace_back=True) and guess_count < 6:
             d_comm_before = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
             if "BACK" in self.d_debouncer.committed_ranks:
                 slot_idx = self.d_debouncer.committed_ranks.index("BACK")
@@ -1654,7 +1698,7 @@ class CompanionStateMachine:
         if self._emitted_p < 2 or self._emitted_d < 1:
             flags.append("HUD_GLITCH")
 
-        dealer_incomplete = _is_dealer_still_incomplete(include_ten_ace_back=False) or (educated_guess_rank is not None)
+        dealer_incomplete = _is_dealer_still_incomplete(include_ten_ace_back=True) or (educated_guess_rank is not None)
         if dealer_incomplete and "HUD_GLITCH" not in flags and "DEALER_INCOMPLETE" not in flags:
             flags.append("DEALER_INCOMPLETE")
 
@@ -1676,6 +1720,18 @@ class CompanionStateMachine:
             and self._emitted_p >= 2
             and self._emitted_d >= 1
         )
+
+        # Save persistent review snapshot before resync_round() wipes transient debouncers
+        self._review_round_id = self.round_id
+        self._review_player_ranks = [list(hr) for hr in p_hands_ranks]
+        self._review_dealer_ranks = list(self.d_debouncer.committed_ranks)
+        self._review_sub_dealer_tail = {k: list(v) for k, v in self._best_sub_dealer_tail.items()}
+        self._review_badge_hint = dict(self._last_dealer_badge_hint) if self._last_dealer_badge_hint else None
+        self._review_felt_sightings = list(self._round_felt_sightings)
+        self._review_emitted_p = self._emitted_p
+        self._review_emitted_d = self._emitted_d
+        self._review_emitted_b = self._emitted_b
+        self._review_emitted_split_hands = self._emitted_split_hands
 
         if can_auto_watch:
             sum_p = (
@@ -1739,6 +1795,157 @@ class CompanionStateMachine:
         self.resync_round(clear_pending=not (can_auto_watch or auto_on_no_more_bets))
         return events
 
+    def _recheck_dealer_in_place_bets(
+        self,
+        obs: FrameObservation,
+        events: list[dict[str, Any]],
+        now: float,
+        stage: str,
+    ) -> None:
+        """Verify dealer hand completeness at PLACE_BETS start (0s) and +3s; complete via educated guess if needed."""
+        if self.sync_dealer_guess_removed:
+            return
+        target_round_id = self._review_round_id or (self.sync_round_id if self.sync_draft_count > 0 else "")
+        if not target_round_id:
+            return
+        if self.sync_round_id == target_round_id and self.sync_draft_count == 0 and self._pending_auto_watch is None:
+            return
+
+        # Reconcile player & dealer ranks with UI sync state if available
+        p_hands_ranks = list(self._review_player_ranks)
+        if (self.sync_round_id == target_round_id or not self.sync_round_id) and self.sync_draft_hands:
+            p_hands_ranks = [
+                ["10" if v == 0 else ("A" if v == 1 else str(v)) for v in h]
+                for h in self.sync_draft_hands
+                if h
+            ]
+        d_ranks = list(self._review_dealer_ranks)
+        if (self.sync_round_id == target_round_id or not self.sync_round_id) and self.sync_draft_dealer is not None:
+            ui_d = ["10" if v == 0 else ("A" if v == 1 else str(v)) for v in self.sync_draft_dealer]
+            if stage == "3s" or len(ui_d) >= len([r for r in d_ranks if r != "BACK"]):
+                d_ranks = ui_d
+
+        if not d_ranks and not p_hands_ranks:
+            return
+
+        any_player_alive = any(not _eval_bj_ranks(hr)[2] for hr in p_hands_ranks) if p_hands_ranks else True
+        all_players_natural_bj = bool(p_hands_ranks) and all(
+            len(hr) == 2 and _eval_bj_ranks(hr)[0] == 21 for hr in p_hands_ranks
+        )
+        total_p = sum(len(hr) for hr in p_hands_ranks)
+
+        def _rev_incomplete() -> bool:
+            d_comm = [r for r in d_ranks if r != "BACK"]
+            d_tot, _, _ = _eval_bj_ranks(d_comm)
+            has_back = "BACK" in d_ranks
+            return (
+                total_p >= 2
+                and any_player_alive
+                and (
+                    (len(d_comm) >= 2 and d_tot < 17)
+                    or (has_back and len(d_comm) >= 1)
+                    or (len(d_comm) == 1 and not has_back and not all_players_natural_bj)
+                )
+            )
+
+        if not _rev_incomplete():
+            return
+
+        # Check if late dealer cards appeared on the current frame during PLACE_BETS
+        if obs.dealer_cards:
+            real_obs = [d for d in obs.dealer_cards if d.rank != "BACK" and d.val is not None and d.conf >= 0.72]
+            while len(real_obs) > len([r for r in d_ranks if r != "BACK"]):
+                nxt_idx = len([r for r in d_ranks if r != "BACK"])
+                det = real_obs[nxt_idx]
+                if "BACK" in d_ranks:
+                    slot_idx = d_ranks.index("BACK")
+                    d_ranks[slot_idx] = det.rank
+                else:
+                    slot_idx = len(d_ranks)
+                    d_ranks.append(det.rank)
+                self._review_emitted_d += 1
+                evt_d: dict[str, Any] = {
+                    "type": "card",
+                    "target": "D",
+                    "val": det.val,
+                    "slot": slot_idx,
+                    "rankLabel": det.rank,
+                    "conf": round(det.conf, 3),
+                    "source": "hud",
+                    "roundId": target_round_id,
+                }
+                if det.suit:
+                    evt_d["suit"] = det.suit
+                events.append(evt_d)
+
+        guessed_ranks: list[str] = []
+        guess_count = 0
+        while _rev_incomplete() and guess_count < 6:
+            d_comm_before = [r for r in d_ranks if r != "BACK"]
+            slot_idx = d_ranks.index("BACK") if "BACK" in d_ranks else len(d_ranks)
+            guess = guess_missing_dealer_card(
+                d_comm_before,
+                {
+                    "slot_idx": slot_idx,
+                    "sub_candidates": self._review_sub_dealer_tail,
+                    "badge_hint": self._review_badge_hint,
+                    "felt_sightings": self._review_felt_sightings,
+                    "shoe_rem": self.sync_shoe_rem,
+                    "round_seed": (self._round_seq + guess_count * 7 + (13 if stage == "3s" else 0))
+                    if self.sync_shoe_rem is not None
+                    else None,
+                    "must_reach_17": True,
+                },
+            )
+            if not guess:
+                break
+            if "BACK" in d_ranks:
+                d_ranks[slot_idx] = guess["rank"]
+            else:
+                d_ranks.append(guess["rank"])
+            guessed_ranks.append(guess["rank"])
+            self._review_emitted_d += 1
+            events.append(
+                {
+                    "type": "card",
+                    "target": "D",
+                    "val": guess["val"],
+                    "slot": slot_idx,
+                    "rankLabel": guess["rank"],
+                    "conf": 0.5,
+                    "source": "educated_guess",
+                    "roundId": target_round_id,
+                }
+            )
+            guess_count += 1
+
+        self._review_dealer_ranks = list(d_ranks)
+        if not guessed_ranks:
+            return
+
+        d_comm_after = [r for r in d_ranks if r != "BACK"]
+        d_total_after, _, _ = _eval_bj_ranks(d_comm_after)
+        if self._pending_auto_watch is not None and self._pending_auto_watch.get("roundId") == target_round_id:
+            sum_p = (
+                f"{self._review_emitted_p}P({self._review_emitted_split_hands}H)"
+                if self._review_emitted_split_hands >= 2
+                else f"{self._review_emitted_p}P"
+            )
+            self._pending_auto_watch["summary"] = f"{sum_p}+{len(d_comm_after)}D+{self._review_emitted_b}B"
+        events.append(
+            {
+                "type": "prompt_confirm",
+                "roundId": target_round_id,
+                "reason": "DEALER_INCOMPLETE",
+                "unreadCommunity": 0,
+                "uncertainSlots": ["DEALER_INCOMPLETE"],
+                "suggestedFocus": "D",
+                "dealerTotal": d_total_after,
+                "educatedGuessRank": ",".join(guessed_ranks),
+                "feltSightings": list(self._review_felt_sightings),
+            }
+        )
+
     def _emit_banner_phase_if_changed(self, banner: str, conf: float, events: list[dict[str, Any]]) -> None:
         if banner and banner != self._last_banner_emitted:
             self._last_banner_emitted = banner
@@ -1789,6 +1996,7 @@ class CompanionStateMachine:
                 self._flush_pending_auto_watch(events)
                 has_pending_bet = (self.state not in ("IDLE", "BETTING")) and (self.sync_play_mode == "bet" or self._split_detected)
                 self.sync_track_felt = False
+                self._clear_review_snapshot()
                 self.resync_round()
                 self.state = "SHUFFLING"
                 self._shuffle_emitted = True
@@ -1820,6 +2028,7 @@ class CompanionStateMachine:
                 events.extend(self._finalize_cleared_round(obs.ts))
             if banner == "NO_MORE_BETS":
                 self._flush_pending_auto_watch(events)
+                self._clear_review_snapshot()
             was_empty_in_betting = self._saw_empty_hud_in_betting or (not has_obs_cards)
             self.state = "BETTING"
             self._saw_clear_since_round_over = True
@@ -1828,6 +2037,22 @@ class CompanionStateMachine:
             self.sync_track_felt = False
             self._last_bet_banner = banner
             self._saw_empty_hud_in_betting = was_empty_in_betting
+            if banner == "PLACE_BETS":
+                if self._place_bets_entered_ts is None:
+                    self._place_bets_entered_ts = obs.ts
+                    self._place_bets_recheck_0_done = False
+                    self._place_bets_recheck_3_done = False
+                if not self._place_bets_recheck_0_done:
+                    self._place_bets_recheck_0_done = True
+                    self._recheck_dealer_in_place_bets(obs, events, obs.ts, "0s")
+            if (
+                banner in ("PLACE_BETS", "LAST_BETS")
+                and self._place_bets_entered_ts is not None
+                and not self._place_bets_recheck_3_done
+                and (obs.ts - self._place_bets_entered_ts) >= 3.0
+            ):
+                self._place_bets_recheck_3_done = True
+                self._recheck_dealer_in_place_bets(obs, events, obs.ts, "3s")
             if banner == "NO_MORE_BETS" and was_empty_in_betting and has_obs_cards:
                 self._predeal_obs = obs
             return events

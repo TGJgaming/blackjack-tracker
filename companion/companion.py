@@ -320,6 +320,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 has_prompt=msg.get("hasPrompt"),
                 bet_rounds_count=msg.get("betRoundsCount"),
                 shoe_rem=msg.get("shoeRem"),
+                dealer_guess_removed=msg.get("dealerGuessRemoved"),
             )
             return None
 

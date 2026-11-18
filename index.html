@@ -544,6 +544,7 @@ function freshDraft(){
     autoFlow: prev.autoFlow !== undefined ? prev.autoFlow : true,
     playMode: 'watch', // 'watch' | 'bet'
     manualBetOverride: false,
+    dealerGuessRemoved: false,
     stake: prev.stake !== undefined ? prev.stake : cfg().unit,
     tookIns: false,
     insWon: false,
@@ -1879,7 +1880,8 @@ function deleteCardFromTargetBox(){
   if(box === 'D'){
     if(!draft.dCards.length) return;
     draft.dCards.pop();
-    if(draft.dMeta) draft.dMeta.pop();
+    const poppedMeta = draft.dMeta ? draft.dMeta.pop() : null;
+    if(poppedMeta && poppedMeta.source === 'educated_guess') draft.dealerGuessRemoved = true;
     _popLastLog(e => e.t === 'D');
     draft.targetBox = 'D';
     draft.lastMsg = '⌫ Removed last card in Dealer [D] box.';
@@ -1917,7 +1919,13 @@ function undoLastCard(){
   // Undo the most recently entered card, wherever it went (P / D / B / split hand)
   while(draft.log && draft.log.length){
     const e = draft.log.pop();
-    if(e.t === 'D' && draft.dCards.length){ draft.dCards.pop(); if(draft.dMeta) draft.dMeta.pop(); draft.targetBox = 'D'; return render(); }
+    if(e.t === 'D' && draft.dCards.length){
+      draft.dCards.pop();
+      const pm = draft.dMeta ? draft.dMeta.pop() : null;
+      if(pm && pm.source === 'educated_guess') draft.dealerGuessRemoved = true;
+      draft.targetBox = 'D';
+      return render();
+    }
     if(e.t === 'B' && draft.bCards.length){ draft.bCards.pop(); if(draft.bMeta) draft.bMeta.pop(); draft.targetBox = 'B'; return render(); }
     if(e.t === 'P' && draft.hands[e.h] && draft.hands[e.h].cards.length){
       const h = draft.hands[e.h];
@@ -1933,7 +1941,9 @@ function undoLastCard(){
   if(draft.bCards.length > 0 && (draft.targetBox === 'B' || (draft.hands.length === 1 && draft.autoFlow && draft.targetBox === 'B'))){
     draft.bCards.pop(); if(draft.bMeta) draft.bMeta.pop();
   } else if(draft.dCards.length > 0 && (draft.targetBox === 'D' || (draft.hands.length === 1 && draft.targetBox !== 'P' && draft.autoFlow))){
-    draft.dCards.pop(); if(draft.dMeta) draft.dMeta.pop();
+    draft.dCards.pop();
+    const pm = draft.dMeta ? draft.dMeta.pop() : null;
+    if(pm && pm.source === 'educated_guess') draft.dealerGuessRemoved = true;
     if(draft.autoFlow && draft.hands.length === 1 && draft.dCards.length === 0) draft.targetBox = 'D';
   } else if(curH && curH.cards.length > 0){
     curH.cards.pop();
@@ -1945,7 +1955,9 @@ function undoLastCard(){
     }
     if(draft.autoFlow && draft.hands.length === 1) draft.targetBox = 'P';
   } else if(draft.dCards.length > 0){
-    draft.dCards.pop(); if(draft.dMeta) draft.dMeta.pop();
+    draft.dCards.pop();
+    const pm = draft.dMeta ? draft.dMeta.pop() : null;
+    if(pm && pm.source === 'educated_guess') draft.dealerGuessRemoved = true;
   } else if(draft.bCards.length > 0){
     draft.bCards.pop(); if(draft.bMeta) draft.bMeta.pop();
   }
@@ -1962,6 +1974,7 @@ function restoreCleared(){
   render(); return true;
 }
 function clearDraftCards(){
+  if(typeof _clearPlaceBetsRecheckTimers === 'function') _clearPlaceBetsRecheckTimers();
   if(draft.hands.some(h => h.cards.length) || draft.dCards.length || draft.bCards.length){
     _lastCleared = JSON.parse(JSON.stringify({
       hands: draft.hands, dCards: draft.dCards, dMeta: draft.dMeta,
@@ -1979,6 +1992,7 @@ function clearDraftCards(){
   draft.targetBox = 'P';
   draft.trackCommunityFelt = false;
   draft.manualBetOverride = false;
+  draft.dealerGuessRemoved = false;
   draft.tookIns = false;
   draft.insWon = false;
   draft.sideBetManual = false;
@@ -2304,6 +2318,7 @@ function recordRound(outcomeType){
   const keepSync = draft.shoeSyncOpen;
   const keepMob = draft.mobDockMin;
   const keepView = draft.viewShoeId;
+  if(typeof _clearPlaceBetsRecheckTimers === 'function') _clearPlaceBetsRecheckTimers();
   draft = freshDraft();
   draft.autoFlow = keepAuto;
   draft.shoeSyncOpen = keepSync;
@@ -4001,7 +4016,7 @@ function syncCompanionState(force = false){
   const sAct = active();
   const betRoundsCount = sAct && Array.isArray(sAct.rounds) ? sAct.rounds.filter(r => r.outcome !== 'WATCH').length : 0;
   const shoeRem = sAct ? buildShoeState(sAct, true).rem : null;
-  const key = `${draft.playMode}|${handsList.length > 1 ? 1 : 0}|${cnt}|${trackFelt ? 1 : 0}|${compRoundId}|${hasPrompt ? 1 : 0}|${betRoundsCount}|${JSON.stringify(draftHands)}|${JSON.stringify(draftDealer)}|${shoeRem ? shoeRem.join(',') : ''}`;
+  const key = `${draft.playMode}|${handsList.length > 1 ? 1 : 0}|${cnt}|${trackFelt ? 1 : 0}|${compRoundId}|${hasPrompt ? 1 : 0}|${betRoundsCount}|${draft.dealerGuessRemoved ? 1 : 0}|${JSON.stringify(draftHands)}|${JSON.stringify(draftDealer)}|${shoeRem ? shoeRem.join(',') : ''}`;
   if(!force && key === _comp.lastSyncKey) return;
   _comp.lastSyncKey = key;
   try{
@@ -4018,9 +4033,63 @@ function syncCompanionState(force = false){
       draftDealer,
       draftHandsManual,
       draftDealerManual,
+      dealerGuessRemoved: !!draft.dealerGuessRemoved,
       shoeRem
     }));
   }catch(e){}
+}
+
+let _placeBetsRecheckTimers = [];
+function _clearPlaceBetsRecheckTimers(){
+  while(_placeBetsRecheckTimers.length){
+    clearTimeout(_placeBetsRecheckTimers.pop());
+  }
+}
+
+function _completeDealerIfIncompleteClient(stage = 'recheck'){
+  if(!draft || draft.dealerGuessRemoved) return false;
+  const hands = Array.isArray(draft.hands) ? draft.hands : [];
+  const totalP = hands.reduce((a, h) => a + (h.cards ? h.cards.length : 0), 0);
+  if(totalP < 2 || !Array.isArray(draft.dCards) || draft.dCards.length === 0) return false;
+  const isSplit = hands.length > 1;
+  const anyPlayerAlive = hands.some(h => h.cards && h.cards.length > 0 && !evalHand(h.cards, isSplit).isBust);
+  if(!anyPlayerAlive) return false;
+  const allPlayersNaturalBJ = hands.length > 0 && hands.every(h => h.cards && h.cards.length === 2 && evalHand(h.cards, isSplit).isBJ);
+  const sAct = active();
+  let guessCount = 0;
+  const addedLabels = [];
+  while(guessCount < 6){
+    const dLen = draft.dCards.length;
+    const dEval = evalHand(draft.dCards, false);
+    const needMore = (dLen === 1 && !allPlayersNaturalBJ) || (dLen >= 2 && dEval.sum < 17);
+    if(!needMore) break;
+    let chosenVal = 0;
+    const rem = sAct ? buildShoeState(sAct, true).rem : null;
+    if(Array.isArray(rem) && rem.length === 10){
+      const totRem = rem.reduce((a, b) => a + Math.max(0, b || 0), 0);
+      if(totRem > 0){
+        const seed = (sAct.rounds ? sAct.rounds.length : 0) * 17 + guessCount * 7 + (stage === '3s' ? 13 : 0) + dLen * 3;
+        let pick = (Math.abs(seed) % totRem);
+        for(let r = 0; r < 10; r++){
+          const c = Math.max(0, rem[r] || 0);
+          if(pick < c){ chosenVal = r; break; }
+          pick -= c;
+        }
+      }
+    }
+    const rankLabel = chosenVal === 0 ? '10' : (chosenVal === 1 ? 'A' : String(chosenVal));
+    draft.dCards.push(chosenVal);
+    if(!Array.isArray(draft.dMeta)) draft.dMeta = [];
+    draft.dMeta.push(_makeCardMeta(chosenVal, { rankLabel, source: 'educated_guess' }));
+    if(Array.isArray(draft.log)) draft.log.push({ t: 'D', v: chosenVal });
+    addedLabels.push(rankLabel);
+    guessCount++;
+  }
+  if(!addedLabels.length) return false;
+  draft.lastMsg = `🎯 Dealer incomplete at ${stage} — completed with [${addedLabels.join(', ')}] (educated guess).`;
+  render();
+  syncCompanionState(true);
+  return true;
 }
 
 function sendCompanionControl(action){
@@ -4194,6 +4263,18 @@ function handleCompanionMessage(msg){
         draft.lastMsg = '🕒 Reviewing recorded cards — auto-logs at No More Bets (or press Enter to log now).';
       }
     }
+    if(msg.phase === 'PLACE_BETS'){
+      _clearPlaceBetsRecheckTimers();
+      syncCompanionState(true);
+      _placeBetsRecheckTimers.push(setTimeout(() => {
+        if(draft && draft.phaseBanner === 'PLACE_BETS') _completeDealerIfIncompleteClient('0s');
+      }, 250));
+      _placeBetsRecheckTimers.push(setTimeout(() => {
+        if(draft && (draft.phaseBanner === 'PLACE_BETS' || draft.phaseBanner === 'LAST_BETS')) _completeDealerIfIncompleteClient('3s');
+      }, 3250));
+    } else if(msg.phase === 'NO_MORE_BETS' || msg.phase === 'WAIT' || msg.phase === 'DEALING'){
+      _clearPlaceBetsRecheckTimers();
+    }
     render();
     return;
   }
@@ -4330,11 +4411,13 @@ function handleCompanionMessage(msg){
     return;
   }
   if(msg.type === 'auto_watch'){
+    _clearPlaceBetsRecheckTimers();
     draft.compPrompt = null;
     draft.compRoundId = null;
     const prevPlayMode = draft.playMode;
     const keepManualBet = !!draft.manualBetOverride;
     if(prevPlayMode === 'watch' || msg.fromWatch){
+      _completeDealerIfIncompleteClient('auto_watch');
       recordRound('WATCH');
       if(prevPlayMode === 'bet' && keepManualBet){
         draft.playMode = 'bet';

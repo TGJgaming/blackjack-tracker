@@ -688,14 +688,14 @@ def test_wait_banner_trusts_felt_and_autologs_before_next_round() -> None:
         hud_refreshed=False,
     ))
 
-    # WAIT disappears before next round begins (2 clear frames) -> stages auto_watch with ZERO prompt_confirm, flushes on NO_MORE_BETS!
+    # WAIT disappears before next round begins (2 clear frames) -> completes [10, BACK] via educated guess, stages auto_watch, flushes on NO_MORE_BETS!
     assert sm.step(FrameObservation(ts=4.2, banner_state="", hud_refreshed=True)) == []
     evs_end = sm.step(FrameObservation(ts=4.4, banner_state="", hud_refreshed=True))
     assert ("B", 9) not in [(e["target"], e["val"]) for e in evs_end if e["type"] == "card"]
-    assert not any(e["type"] == "prompt_confirm" for e in evs_end)
+    assert any(e["type"] == "prompt_confirm" and e["reason"] == "DEALER_INCOMPLETE" for e in evs_end)
     assert not any(e["type"] == "auto_watch" for e in evs_end)
     evs_nmb = sm.step(FrameObservation(ts=5.0, banner_state="NO_MORE_BETS"))
-    assert any(e["type"] == "auto_watch" and e["summary"] == "2P+1D+0B" for e in evs_nmb)
+    assert any(e["type"] == "auto_watch" and e["summary"] == "2P+2D+0B" for e in evs_nmb)
 
     # Roundtrip preserves new flags cleanly while keeping defaults backward-compatible
     parsed = CompanionConfig.from_dict({"rois": cfg.rois})
@@ -2534,9 +2534,100 @@ def test_educated_guess_all_ranks_and_signals() -> None:
     assert guess_ev["val"] == 8
 
 
+def test_place_bets_strict_dealer_recheck_start_and_3s() -> None:
+    """PLACE_BETS rechecks dealer completeness at 0s and +3s, supports >2 guesses, and respects manual removal."""
+    from config import CompanionConfig
+    from detector import CardDetection, FrameObservation
+    from state_machine import CompanionStateMachine
 
+    def _bj_total(ranks: list[str]) -> int:
+        tot = 0
+        aces = 0
+        for r in ranks:
+            if r == "A":
+                tot += 11
+                aces += 1
+            elif r in ("10", "J", "Q", "K"):
+                tot += 10
+            else:
+                tot += int(r)
+        while tot > 21 and aces > 0:
+            tot -= 10
+            aces -= 1
+        return tot
 
+    # 1. Start of PLACE_BETS (0s) completes [10, BACK] when player has [10, 9]
+    cfg = CompanionConfig(confirm_frames=1, clear_frames=2)
+    sm = CompanionStateMachine(cfg)
+    sm.set_sync_state(play_mode="watch")
+    sm.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)],
+            dealer_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("BACK", None, 0.92, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)]},
+        )
+    )
+    evs_0s = sm.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    guesses_0s = [e for e in evs_0s if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"]
+    assert len(guesses_0s) >= 1
 
+    # 2. +3s recheck catches sync_state drift (e.g. dealer=["2"] -> completes >= 17 with >2 guesses if needed)
+    sm2 = CompanionStateMachine(cfg)
+    sm2.set_sync_state(play_mode="watch")
+    sm2.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm2.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)],
+            dealer_cards=[CardDetection("2", 2, 0.94, 10), CardDetection("3", 3, 0.94, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)]},
+        )
+    )
+    evs_pb0 = sm2.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    # 0s already completes [2, 3] to >= 17
+    guesses_pb0 = [e for e in evs_pb0 if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"]
+    assert len(guesses_pb0) >= 2
+    assert _bj_total(["2", "3"] + [g["rankLabel"] for g in guesses_pb0]) >= 17
 
+    # Simulate client drift during PLACE_BETS where draft only has ["2"] at +1s, then reaches +3s
+    sm2.set_sync_state(
+        play_mode="watch",
+        draft_count=3,
+        draft_hands=[["10", "9"]],
+        draft_dealer=["2"],
+        dealer_guess_removed=False,
+    )
+    evs_pb1 = sm2.step(FrameObservation(ts=4.5, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    assert not any(e.get("type") == "card" and e.get("source") == "educated_guess" for e in evs_pb1)
+    evs_pb3 = sm2.step(FrameObservation(ts=6.1, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    guesses_pb3 = [e for e in evs_pb3 if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"]
+    assert len(guesses_pb3) >= 2
+    assert _bj_total(["2"] + [g["rankLabel"] for g in guesses_pb3]) >= 17
 
-
+    # 3. dealer_guess_removed=True prevents +3s recheck from re-inserting guessed cards
+    sm3 = CompanionStateMachine(cfg)
+    sm3.set_sync_state(play_mode="watch")
+    sm3.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm3.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)],
+            dealer_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("6", 6, 0.94, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)]},
+        )
+    )
+    sm3.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm3.set_sync_state(
+        play_mode="watch",
+        draft_count=4,
+        draft_hands=[["10", "9"]],
+        draft_dealer=["10", "6"],
+        dealer_guess_removed=True,
+    )
+    evs_pb3_removed = sm3.step(FrameObservation(ts=6.2, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    assert not any(e.get("type") == "card" and e.get("source") == "educated_guess" for e in evs_pb3_removed)
