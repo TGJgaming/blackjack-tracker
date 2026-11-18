@@ -1591,7 +1591,7 @@ function _makeCardMeta(val, opts = {}){
     rankLabel: opts.rankLabel || RANK_LABEL[val] || String(val),
     suit: ['S','H','C','D'].includes(opts.suit) ? opts.suit : null,
     exactRank: (val !== 0) || !!opts.rankLabel,
-    source: opts.source === 'comp' ? 'comp' : 'manual'
+    source: opts.source === 'educated_guess' ? 'educated_guess' : ((opts.source && opts.source !== 'manual') ? 'comp' : 'manual')
   };
 }
 
@@ -2443,7 +2443,9 @@ function renderPlay(){
       SPLIT: '✂️ Split Guard — Companion held auto-log; verify split hands before logging.',
       MISSED_COMMUNITY_CARD: `👁️ Physical Felt Card Missed (${pr.unreadCommunity || 1}) — Tap rank into [B] before logging.`,
       HUD_GLITCH: '⚠️ HUD Read Incomplete (<2 cards) — Verify [P]/[D] cards before logging.',
-      DEALER_INCOMPLETE: `⚠️ Dealer Hand Incomplete (Tot ${pr.dealerTotal ?? dEvalPr.sum} < 17) — Digital HUD wiped early. Add missed dealer card to [D] before logging.`,
+      DEALER_INCOMPLETE: pr.educatedGuessRank
+        ? `🔮 Dealer Incomplete — Educated Guess [${pr.educatedGuessRank}] placed in [D] (saved unless removed manually).`
+        : `⚠️ Dealer Hand Incomplete (Tot ${pr.dealerTotal ?? dEvalPr.sum} < 17) — Digital HUD wiped early. Add missed dealer card to [D] before logging.`,
       UNCERTAIN_READ: `⚠️ Low-Confidence Read (${(pr.uncertainSlots || []).join(', ') || 'check cards'}) — Verify before logging.`
     };
     const isWarn = pr.reason !== 'BET_MODE';
@@ -2583,9 +2585,12 @@ function renderPlay(){
     if(!arr.length) return `<span class="cchip slot">Tap 0–9</span>`;
     return arr.map((c, idx) => {
       const m = Array.isArray(metaArr) ? metaArr[idx] : null;
+      const isGuess = !!(m && m.source === 'educated_guess');
       const cls = HILO_TAG[c] > 0 ? 'low' : (HILO_TAG[c] < 0 ? 'hi' : '');
       const upCls = (isDealer && idx === 0) ? 'up' : '';
-      return `<span class="cchip ${cls} ${upCls}" title="${isDealer && idx===0 ? 'Dealer Upcard' : ''}">${fmtCardLabel(c, m)}${isDealer && idx===0 ? '★' : ''}</span>`;
+      const guessStyle = isGuess ? 'border:1px dashed #f59e0b;background:rgba(245,158,11,.14);' : '';
+      const title = isGuess ? 'Educated Guess (saved unless removed manually)' : (isDealer && idx===0 ? 'Dealer Upcard' : '');
+      return `<span class="cchip ${cls} ${upCls}" style="${guessStyle}" title="${title}">${fmtCardLabel(c, m)}${isDealer && idx===0 ? '★' : ''}${isGuess ? '🔮' : ''}</span>`;
     }).join('');
   };
 
@@ -3980,7 +3985,7 @@ function syncCompanionState(force = false){
   const draftHands = handsList.map(h => (h.cards || []).slice());
   const draftHandsManual = handsList.map(h => !!(h.cardMeta && h.cardMeta.some(m => !m || m.source !== 'comp')));
   const draftDealer = Array.isArray(draft.dCards) ? draft.dCards.slice() : [];
-  const draftDealerManual = !!(draft.dMeta && draft.dMeta.some(m => !m || m.source !== 'comp'));
+  const draftDealerManual = !!(draft.dMeta && draft.dMeta.some(m => !m || (m.source !== 'comp' && m.source !== 'educated_guess')));
   const allP = handsList.reduce((a, h) => a + h.cards.length, 0);
   const cnt = allP + draftDealer.length + (draft.bCards ? draft.bCards.length : 0);
   const trackFelt = !!(draft.playMode === 'bet' && draft.trackCommunityFelt);
@@ -4189,7 +4194,7 @@ function handleCompanionMessage(msg){
       const prevP = draft.hands.reduce((a, h) => a + h.cards.length, 0);
       const prevTot = prevP + draft.dCards.length + draft.bCards.length;
       if(prevTot > 0){
-        if(draft.playMode === 'watch' && prevP >= 2 && draft.dCards.length >= 1 && !(draft.compPrompt && draft.compPrompt.reason === 'SPLIT')){
+        if(draft.playMode === 'watch' && prevP >= 2 && draft.dCards.length >= 1){
           recordRound('WATCH');
         } else {
           clearDraftCards();
@@ -4232,6 +4237,10 @@ function handleCompanionMessage(msg){
     const nextHands = rawHands.map((cardsArr, hIdx) => {
       const prevH = draft.hands && draft.hands[hIdx];
       const cs = Array.isArray(cardsArr) ? cardsArr : [];
+      const prevIsManual = !!(prevH && Array.isArray(prevH.cardMeta) && prevH.cardMeta.some(m => m && m.source === 'manual'));
+      if(prevIsManual && prevH.cards && cs.length <= prevH.cards.length){
+        return prevH;
+      }
       const vals = [];
       const metas = [];
       cs.forEach((c) => {
@@ -4257,18 +4266,21 @@ function handleCompanionMessage(msg){
       draft.activeHand = Math.max(0, Math.min(draft.activeHand || 0, nextHands.length - 1));
     }
     if(Array.isArray(msg.dealer)){
-      draft.dCards = [];
-      draft.dMeta = [];
-      msg.dealer.forEach((c) => {
-        if(!c || typeof c.val !== 'number') return;
-        draft.dCards.push(c.val);
-        draft.dMeta.push(_makeCardMeta(c.val, { rankLabel: c.rankLabel, suit: c.suit, source: 'comp' }));
-      });
+      const dealerManual = !!(Array.isArray(draft.dMeta) && draft.dMeta.some(m => m && m.source === 'manual'));
+      if(!(dealerManual && draft.dCards && msg.dealer.length <= draft.dCards.length)){
+        draft.dCards = [];
+        draft.dMeta = [];
+        msg.dealer.forEach((c) => {
+          if(!c || typeof c.val !== 'number') return;
+          draft.dCards.push(c.val);
+          draft.dMeta.push(_makeCardMeta(c.val, { rankLabel: c.rankLabel, suit: c.suit, source: 'comp' }));
+        });
+      }
     }
     if(draft.compPrompt && draft.compPrompt.reason === 'HUD_GLITCH'){
       draft.compPrompt = null;
     }
-    draft.lastMsg = '↻ Auto-resynced tracker cards to match live HUD.';
+    draft.lastMsg = '↻ Auto-synced tracker cards to live HUD.';
     render();
     syncCompanionState(true);
     return;
@@ -4291,6 +4303,14 @@ function handleCompanionMessage(msg){
         if(fIdx >= 0) draft.feltSightings.splice(fIdx, 1);
       }
       draft.lastMsg = `🛡️ Dealer Felt Fallback rescued [${rk}] into Dealer [D] (digital HUD wiped early).`;
+      render();
+    } else if(msg.source === 'badge_deduced'){
+      const rk = msg.rankLabel || RANK_LABEL[msg.val] || msg.val;
+      draft.lastMsg = `🔢 Dealer Score Badge deduced final card [${rk}] into Dealer [D].`;
+      render();
+    } else if(msg.source === 'educated_guess'){
+      const rk = msg.rankLabel || RANK_LABEL[msg.val] || msg.val;
+      draft.lastMsg = `🔮 Dealer incomplete — placed Educated Guess [${rk}] in [D] (saved unless removed manually).`;
       render();
     } else if(typeof msg.conf === 'number' && msg.conf < 0.74){
       const sSym = { S:'♠', H:'♥', C:'♣', D:'♦' };

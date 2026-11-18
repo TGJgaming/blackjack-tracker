@@ -269,8 +269,9 @@ def test_state_machine_split_hud_glitch_and_shuffle() -> None:
 
     _feed_hud(sm, [_det("8", 8, 10), _det("8", 8, 40)], [_det("6", 6, 10), _det("Q", 0, 40)], ts=40.0, frames=2, banner="WAIT")
     evs_end = _feed_hud(sm, [], [], ts=41.0, frames=2, banner="WAIT")
-    assert evs_end[0]["type"] == "prompt_confirm"
-    assert evs_end[0]["reason"] == "SPLIT"
+    prompts_split = [e for e in evs_end if e["type"] == "prompt_confirm"]
+    assert len(prompts_split) == 1
+    assert prompts_split[0]["reason"] == "SPLIT"
 
     # Reset split and test incomplete initial HUD (< 2 cards)
     sm.set_sync_state(play_mode="watch", is_split=False)
@@ -1406,17 +1407,22 @@ def test_dealer_partial_wipe_rescue_and_dealer_felt_fallback() -> None:
     assert len(fb_cards) == 1 and fb_cards[0]["rankLabel"] == "5"
     assert sm_b._pending_auto_watch is not None
 
-    # Case C: Digital HUD wipes at [6, 10] = 16 with NO dealer_felt_roi fallback -> emits DEALER_INCOMPLETE prompt
+    # Case C: Digital HUD wipes at [6, 10] = 16 with NO dealer_felt_roi fallback -> inserts educated guess & queues auto_watch for NO_MORE_BETS
     sm_c = CompanionStateMachine(cfg)
     sm_c.set_sync_state(play_mode="watch")
     _feed_hud(sm_c, [_det("10", 0, 10), _det("8", 8, 30)], [_det("6", 6, 10), _det("10", 0, 28)], ts=20.0, frames=2, banner="WAIT")
     evs_inc = sm_c.step(FrameObservation(ts=21.0, banner_state="PLACE_BETS"))
+    guess_cards = [e for e in evs_inc if e["type"] == "card" and e["target"] == "D" and e.get("source") == "educated_guess"]
+    assert len(guess_cards) == 1 and guess_cards[0]["rankLabel"] == "10"
     prompts = [e for e in evs_inc if e["type"] == "prompt_confirm"]
     assert len(prompts) == 1
     assert prompts[0]["reason"] == "DEALER_INCOMPLETE"
     assert prompts[0]["suggestedFocus"] == "D"
-    assert prompts[0]["dealerTotal"] == 16
-    assert sm_c._pending_auto_watch is None
+    assert prompts[0]["educatedGuessRank"] == "10"
+    assert prompts[0]["dealerTotal"] == 26
+    assert sm_c._pending_auto_watch is not None
+    evs_nmb_c = sm_c.step(FrameObservation(ts=22.0, banner_state="NO_MORE_BETS"))
+    assert any(e["type"] == "auto_watch" and e.get("fromWatch") is True for e in evs_nmb_c)
 
 
 def test_felt_burst_monitor_multicard_and_hud_fallback_bank(tmp_path) -> None:
@@ -2337,6 +2343,114 @@ def test_round_over_trigger_ext_bridge_and_escalation() -> None:
     assert method == "ext_reload"
     assert meta is not None and meta["tabId"] == 42 and meta["reason"] == "reloaded"
     assert any(m.get("type") == "browser_ext_hello" for m in ext_msgs)
+
+
+def test_ipados_parity_badge_deduction_educated_guess_split_watch_and_warn_recovery(tmp_path) -> None:
+    import cv2
+    import numpy as np
+    import random
+    from calibrate import save_template_crop
+    from config import CompanionConfig, KeepaliveConfig
+    from detector import PlaytechDetector, _has_red_back_signature, detect_dealer_badge_total
+    from state_machine import (
+        CompanionStateMachine,
+        WatchKeepaliveManager,
+        deduce_missing_dealer_card,
+        deduce_missing_dealer_pair,
+        guess_missing_dealer_card,
+    )
+
+    # 1. Pure rank deduction & educated guess helpers
+    assert deduce_missing_dealer_card(["7", "BACK"], 17) == {"rank": "10", "val": 0}
+    assert deduce_missing_dealer_card(["6", "BACK"], 17) == {"rank": "A", "val": 1}
+    assert deduce_missing_dealer_pair(["5"], 21) == [{"rank": "6", "val": 6}, {"rank": "10", "val": 0}]
+    assert deduce_missing_dealer_pair(["2"], 17) is not None
+    assert guess_missing_dealer_card(["7", "5"]) == {"rank": "10", "val": 0}
+    assert guess_missing_dealer_card(["6"]) == {"rank": "A", "val": 1}
+
+    # 2. Multi-step dealer badge history & 2-card pair deduction + badge detector sanity
+    cfg = CompanionConfig(confirm_frames=2, clear_frames=2)
+    sm = CompanionStateMachine(cfg)
+    sm.set_sync_state(play_mode="watch")
+    p_hand = [_det("10", 0, 10), _det("8", 8, 30)]
+    _feed_hud(sm, p_hand, [_det("5", 5, 10), _det("BACK", None, 35)], ts=1.0, frames=2, banner="WAIT")
+    # Badge steps: 11 (flashed '6' before visible) -> 21 (flashed '10' before visible), then table wipes
+    sm.step(FrameObservation(ts=2.0, banner_state="WAIT", player_cards=p_hand, dealer_cards=[_det("5", 5, 10)], dealer_badge_total=11, dealer_badge_conf=0.88))
+    sm.step(FrameObservation(ts=2.2, banner_state="WAIT", player_cards=p_hand, dealer_cards=[_det("5", 5, 10)], dealer_badge_total=21, dealer_badge_conf=0.86))
+    end_badge = sm.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS"))
+    ded_cards = [(e["slot"], e["rankLabel"], e.get("source")) for e in end_badge if e["type"] == "card" and e["target"] == "D"]
+    assert ded_cards == [(1, "6", "badge_deduced"), (2, "10", "badge_deduced")]
+    assert sm._pending_auto_watch is not None
+
+    # Empty dark badge area returns None
+    assert detect_dealer_badge_total(np.zeros((45, 100, 3), dtype=np.uint8)) == (None, 0.0)
+
+    # 3. Multi-card educated guess loop reaches >= 17 & auto-logs at NO_MORE_BETS
+    sm_g = CompanionStateMachine(CompanionConfig(confirm_frames=1, clear_frames=2))
+    sm_g.set_sync_state(play_mode="watch")
+    _feed_hud(sm_g, [_det("10", 0, 10), _det("9", 9, 30)], [_det("2", 2, 10), _det("3", 3, 28)], ts=10.0, frames=1, banner="WAIT")
+    end_g = sm_g.step(FrameObservation(ts=11.0, banner_state="PLACE_BETS"))
+    g_cards = [e for e in end_g if e["type"] == "card" and e["target"] == "D" and e.get("source") == "educated_guess"]
+    assert len(g_cards) == 2
+    p_g = [e for e in end_g if e["type"] == "prompt_confirm"]
+    assert len(p_g) == 1 and p_g[0]["dealerTotal"] >= 17
+    nmb_g = sm_g.step(FrameObservation(ts=12.0, banner_state="NO_MORE_BETS"))
+    assert any(e["type"] == "auto_watch" and e.get("fromWatch") is True for e in nmb_g)
+
+    # 4. Watch Split Guard auto-logs at NO_MORE_BETS
+    sm_sp = CompanionStateMachine(CompanionConfig(confirm_frames=2, clear_frames=2))
+    sm_sp.set_sync_state(play_mode="watch", is_split=True)
+    _feed_hud(sm_sp, [_det("8", 8, 10), _det("3", 3, 28)], [_det("10", 0, 10), _det("7", 7, 28)], ts=20.0, frames=2, banner="WAIT")
+    end_sp = sm_sp.step(FrameObservation(ts=21.0, banner_state="PLACE_BETS"))
+    assert any(e["type"] == "prompt_confirm" and e["reason"] == "SPLIT" for e in end_sp)
+    assert sm_sp._pending_auto_watch is not None
+    nmb_sp = sm_sp.step(FrameObservation(ts=22.0, banner_state="NO_MORE_BETS"))
+    assert any(e["type"] == "auto_watch" and e.get("fromWatch") is True for e in nmb_sp)
+
+    # 5. Red face-up card BACK rejection + false-positive '4' rejection
+    white_red_card = np.full((30, 24, 3), (245, 245, 245), dtype=np.uint8)
+    white_red_card[4:16, 4:14] = (30, 30, 220)  # ~28% red ink on mostly white card face
+    assert _has_red_back_signature(white_red_card) is False
+
+    tdir = tmp_path / "tpl_4"
+    im4 = np.full((45, 22, 3), 248, dtype=np.uint8)
+    cv2.putText(im4, "4", (2, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (20, 20, 20), 2, cv2.LINE_AA)
+    save_template_crop("hud", "4", im4, tdir, auto_trim=True)
+    im_s = np.full((18, 18, 3), 248, dtype=np.uint8)
+    cv2.circle(im_s, (9, 9), 5, (20, 20, 20), -1)
+    save_template_crop("suit", "S", im_s, tdir, auto_trim=True)
+    det4 = PlaytechDetector(CompanionConfig(min_hud_confidence=0.84), templates_root=tdir)
+    # Noisy low-contrast patch that vaguely looks like '4' (~0.75 < 0.82) must be rejected
+    noisy_strip = np.full((55, 60, 3), 24, dtype=np.uint8)
+    noisy_strip[5:50, 12:36] = 248
+    cv2.putText(noisy_strip, "4", (14, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (105, 105, 105), 1, cv2.LINE_AA)
+    cv2.circle(noisy_strip, (24, 38), 5, (20, 20, 20), -1)
+    p4, _, _ = det4._detect_hud_strip(noisy_strip, is_dealer=False)
+    assert all(d.rank != "4" or d.conf >= 0.82 for d in p4)
+
+    # 6. WatchKeepaliveManager WARN 90s cooldown + strips_visible_fallback recovery
+    ka_cfg = KeepaliveConfig(mode="auto", method="ext_then_os", min_watch_sec=10.0, max_watch_sec=10.0, reload_timeout_sec=12.0, round_over_delay_sec=0.5)
+    mgr = WatchKeepaliveManager(ka_cfg, rng=random.Random(9))
+    for t in (0.0, 5.0, 10.0):
+        mgr.tick(t, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr.tick(10.5, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    act_fire = mgr.tick(11.2, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    assert act_fire.trigger_refresh is True
+    mgr.mark_refresh_dispatched(11.2, True, "ext_reload")
+    mgr.notify_tab_event("loading", now=12.0)
+    # Timeout at +12.8s enters WARN with 90s cooldown
+    act_to = mgr.tick(24.0, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    assert act_to.emit_alert and act_to.emit_alert["event"] == "timeout_warn"
+    assert mgr.state == "WARN"
+    # Even when ROUND_OVER occurs 5s later while in WARN cooldown, must NOT re-trigger reload
+    act_no_re = mgr.tick(29.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    assert not act_no_re.trigger_refresh
+    # When cards return while in WARN with _pending_reload_recovery, recovers cleanly via strips_visible_fallback
+    act_rec_strips = mgr.tick(30.0, play_mode="watch", paused=False, window_found=True, sm_state="DEALING", banner_state="", obs_has_cards=True, has_unresolved_prompt=False)
+    assert act_rec_strips.emit_alert and act_rec_strips.emit_alert["event"] == "recovered"
+    assert act_rec_strips.emit_alert["reason"] == "strips_visible_fallback"
+    assert mgr.state == "WATCH_COUNTDOWN"
+
 
 
 

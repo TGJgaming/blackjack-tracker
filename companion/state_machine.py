@@ -39,6 +39,71 @@ def _eval_bj_ranks(ranks: list[str]) -> tuple[int, bool, bool]:
     return total, aces > 0, total > 21
 
 
+_DEDUCE_RANK_CANDIDATES: list[dict[str, Any]] = [
+    {"rank": "A", "val": 1},
+    {"rank": "2", "val": 2},
+    {"rank": "3", "val": 3},
+    {"rank": "4", "val": 4},
+    {"rank": "5", "val": 5},
+    {"rank": "6", "val": 6},
+    {"rank": "7", "val": 7},
+    {"rank": "8", "val": 8},
+    {"rank": "9", "val": 9},
+    {"rank": "10", "val": 0},
+]
+
+
+def deduce_missing_dealer_card(d_committed_ranks: list[str], badge_total: int | None) -> dict[str, Any] | None:
+    """Infer a single missing dealer card rank when score badge total uniquely determines it."""
+    if not d_committed_ranks or badge_total is None or not isinstance(badge_total, int) or badge_total < 4 or badge_total > 26:
+        return None
+    cur_total, _, _ = _eval_bj_ranks(d_committed_ranks)
+    if cur_total == badge_total:
+        return None
+    matches: list[dict[str, Any]] = []
+    for cand in _DEDUCE_RANK_CANDIDATES:
+        tot, _, _ = _eval_bj_ranks([*d_committed_ranks, cand["rank"]])
+        if tot == badge_total:
+            matches.append(dict(cand))
+    return matches[0] if len(matches) == 1 else None
+
+
+def deduce_missing_dealer_pair(d_committed_ranks: list[str], badge_total: int | None) -> list[dict[str, Any]] | None:
+    """Infer two missing dealer cards from score badge total when a 2-card draw/flip was missed."""
+    if not d_committed_ranks or badge_total is None or not isinstance(badge_total, int) or badge_total < 17 or badge_total > 26:
+        return None
+    cur_total, _, _ = _eval_bj_ranks(d_committed_ranks)
+    if cur_total >= 17 or cur_total == badge_total:
+        return None
+    if deduce_missing_dealer_card(d_committed_ranks, badge_total) is not None:
+        return None
+    best_pair: list[dict[str, Any]] | None = None
+    best_score = -1
+    for c1 in _DEDUCE_RANK_CANDIDATES:
+        mid_tot, _, _ = _eval_bj_ranks([*d_committed_ranks, c1["rank"]])
+        if mid_tot >= 17:
+            continue
+        for c2 in _DEDUCE_RANK_CANDIDATES:
+            end_tot, _, _ = _eval_bj_ranks([*d_committed_ranks, c1["rank"], c2["rank"]])
+            if end_tot != badge_total:
+                continue
+            score = (4 if c2["rank"] == "10" else 1) * (4 if c1["rank"] == "10" else 1)
+            if score > best_score:
+                best_score = score
+                best_pair = [dict(c1), dict(c2)]
+    return best_pair
+
+
+def guess_missing_dealer_card(d_committed_ranks: list[str]) -> dict[str, Any] | None:
+    """Return highest-frequency educated guess (10, or A when standing on hard 6 vs Ace) for incomplete dealer hand."""
+    if not d_committed_ranks:
+        return None
+    d_tot, d_soft, _ = _eval_bj_ranks(d_committed_ranks)
+    if d_tot == 6 and not d_soft:
+        return {"rank": "A", "val": 1}
+    return {"rank": "10", "val": 0}
+
+
 @dataclass
 class SequenceDebouncer:
     """Requires N identical non-empty rank sequences before committing, and M empty frames to clear."""
@@ -150,7 +215,9 @@ class SequenceDebouncer:
                 cnt = self._cand_count
             self._slot_cands[idx] = (det.rank, cnt, det)
             if self.fast_tail_confirm and self.committed_ranks:
-                self._pending_tail[idx] = (det, 0)
+                prev_pend = self._pending_tail.get(idx)
+                best_det = det if (prev_pend is None or det.conf >= prev_pend[0].conf) else prev_pend[0]
+                self._pending_tail[idx] = (best_det, 0)
 
         if not partial_wipe:
             for idx in list(self._slot_cands.keys()):
@@ -160,7 +227,7 @@ class SequenceDebouncer:
                 for idx in list(self._pending_tail.keys()):
                     if idx not in seen_slots:
                         det_p, missed = self._pending_tail[idx]
-                        if missed + 1 >= 4:
+                        if missed + 1 >= 30:
                             self._pending_tail.pop(idx, None)
                         else:
                             self._pending_tail[idx] = (det_p, missed + 1)
@@ -169,7 +236,7 @@ class SequenceDebouncer:
             for idx in list(self._pending_tail.keys()):
                 if idx not in seen_slots:
                     det_p, missed = self._pending_tail[idx]
-                    if missed + 1 >= 5:
+                    if missed + 1 >= 30:
                         self._pending_tail.pop(idx, None)
                     else:
                         self._pending_tail[idx] = (det_p, missed + 1)
@@ -182,7 +249,9 @@ class SequenceDebouncer:
             if self.committed_ranks[idx] == "BACK" and idx in self._slot_cands:
                 rk, cnt, det = self._slot_cands[idx]
                 fast_ok = self.fast_tail_confirm and (
-                    det.conf >= self.fast_tail_min_conf or (det.suit is not None and det.conf >= 0.78)
+                    det.conf >= min(0.82, self.fast_tail_min_conf)
+                    or (det.suit is not None and det.conf >= 0.78)
+                    or (det.has_pip_body and det.conf >= 0.78)
                 )
                 req = min(self.confirm_frames, 2) if fast_ok else self.confirm_frames
                 if cnt >= req:
@@ -202,7 +271,9 @@ class SequenceDebouncer:
             rk, cnt, det = self._slot_cands[idx]
             use_fast = (self.fast_tail_confirm and idx >= 1) or (self.fast_initial_deal and idx < 2)
             fast_ok = use_fast and (
-                det.conf >= self.fast_tail_min_conf or (det.suit is not None and det.conf >= 0.80)
+                det.conf >= (min(0.82, self.fast_tail_min_conf) if self.fast_tail_confirm else self.fast_tail_min_conf)
+                or (det.suit is not None and det.conf >= 0.80)
+                or (self.fast_tail_confirm and det.has_pip_body and det.conf >= 0.78)
             )
             req = min(self.confirm_frames, 2) if fast_ok else self.confirm_frames
             if cnt < req:
@@ -221,7 +292,7 @@ class SequenceDebouncer:
         if not self.committed_ranks:
             return []
         merged: dict[int, CardDetection] = {
-            idx: det for idx, (det, missed) in self._pending_tail.items() if missed <= 4
+            idx: det for idx, (det, missed) in self._pending_tail.items() if missed <= 30
         }
         fallback_seq = self._cand_dets if len(self._cand_dets) >= len(self.committed_ranks) else self._wipe_dets
         for idx, det in enumerate(fallback_seq):
@@ -295,6 +366,8 @@ class WatchKeepaliveManager:
         self._refresh_sent_ts: float | None = None
         self._ctrl_r_tried_for_reload: bool = False
         self._warn_retry_after_ts: float | None = None
+        self._pending_reload_recovery: bool = False
+        self._saw_strips_absent_in_warn: bool = False
         self.refresh_started_ts: float | None = None
         self.grace_until_ts: float | None = None
         self.saw_reload_interruption: bool = False
@@ -349,6 +422,8 @@ class WatchKeepaliveManager:
         self._refresh_sent_ts = None
         self._ctrl_r_tried_for_reload = False
         self._warn_retry_after_ts = None
+        self._pending_reload_recovery = False
+        self._saw_strips_absent_in_warn = False
         self.grace_until_ts = None
         self.refresh_started_ts = None
         self.saw_reload_interruption = False
@@ -394,6 +469,8 @@ class WatchKeepaliveManager:
         self.state = "ARMED_NEXT_BETS"
         self._scheduled_fire_ts = now
         self._warn_retry_after_ts = None
+        self._pending_reload_recovery = False
+        self._saw_strips_absent_in_warn = False
 
     def mark_refresh_dispatched(self, now: float, ok: bool, used_method: str, epoch_ts: float | None = None) -> dict[str, Any]:
         if not ok:
@@ -403,6 +480,8 @@ class WatchKeepaliveManager:
             self._appcommand_sent_ts = None
             self._refresh_sent_ts = None
             self._warn_retry_after_ts = now + 4.0
+            self._pending_reload_recovery = True
+            self._saw_strips_absent_in_warn = False
             if used_method == "appcommand_post_failed":
                 self._appcommand_verified = False
             return {
@@ -595,7 +674,9 @@ class WatchKeepaliveManager:
                 self.state = "WARN"
                 self.grace_until_ts = None
                 self._refresh_sent_ts = None
-                self._warn_retry_after_ts = now + 4.0
+                self._warn_retry_after_ts = now + 90.0
+                self._pending_reload_recovery = True
+                self._saw_strips_absent_in_warn = False
                 action.status_changed = True
                 action.emit_alert = {
                     "type": "keepalive_status",
@@ -606,6 +687,26 @@ class WatchKeepaliveManager:
                 return action
 
             return action
+
+        if self.state == "WARN" and window_found:
+            if not obs_has_cards:
+                self._saw_strips_absent_in_warn = True
+            elif obs_has_cards and (self._pending_reload_recovery or self._saw_strips_absent_in_warn):
+                started = self.refresh_started_ts if self.refresh_started_ts is not None else now
+                reload_dur = max(0.0, now - started)
+                self.refresh_count += 1
+                self.last_refresh_epoch = time.time()
+                self.reset_timer(reason="strips_visible_fallback", now=now)
+                self.state = "WATCH_COUNTDOWN" if play_mode == "watch" else "PAUSED_BET"
+                action.status_changed = True
+                action.emit_alert = {
+                    "type": "keepalive_status",
+                    "event": "recovered",
+                    "reason": "strips_visible_fallback",
+                    "reloadSec": round(reload_dur, 1),
+                    "keepalive": self.to_status(now),
+                }
+                return action
 
         # Never arm or refresh when paused or actively in BET mode
         if paused:
@@ -850,6 +951,10 @@ class CompanionStateMachine:
         self._reconcile_frames: int = 0
         self._reconcile_since: float = 0.0
         self._last_reconcile_ts: float = -999.0
+        self._best_dealer_tail: dict[int, CardDetection] = {}
+        self._last_dealer_badge_total: int | None = None
+        self._last_dealer_badge_conf: float = 0.0
+        self._dealer_badge_history: list[dict[str, Any]] = []
 
         self._last_banner_emitted: str = ""
         self._last_bet_banner: str = ""
@@ -894,6 +999,10 @@ class CompanionStateMachine:
         self._reconcile_sig = None
         self._reconcile_frames = 0
         self._reconcile_since = 0.0
+        self._best_dealer_tail.clear()
+        self._last_dealer_badge_total = None
+        self._last_dealer_badge_conf = 0.0
+        self._dealer_badge_history.clear()
         self._uncertainty_flags.clear()
         self._unread_community_pulses = 0
         self._recent_hud_p.clear()
@@ -1100,6 +1209,31 @@ class CompanionStateMachine:
         self._pending_felt = keep
         return events
 
+    def _record_dealer_obs(self, obs: FrameObservation | None) -> None:
+        if obs is None:
+            return
+        b_tot = obs.dealer_badge_total
+        b_conf = float(obs.dealer_badge_conf if obs.dealer_badge_conf > 0.0 else 0.85)
+        if b_tot is not None and 4 <= b_tot <= 26 and b_conf >= 0.56:
+            self._last_dealer_badge_total = int(b_tot)
+            self._last_dealer_badge_conf = b_conf
+            if not self._dealer_badge_history or self._dealer_badge_history[-1]["total"] != int(b_tot):
+                self._dealer_badge_history.append({"total": int(b_tot), "conf": b_conf})
+            elif b_conf > self._dealer_badge_history[-1]["conf"]:
+                self._dealer_badge_history[-1]["conf"] = b_conf
+        for idx, det in enumerate(obs.dealer_cards):
+            if det.rank == "BACK" or det.val is None or det.conf < 0.70:
+                continue
+            already_real = (
+                idx < len(self.d_debouncer.committed_ranks)
+                and self.d_debouncer.committed_ranks[idx] != "BACK"
+            )
+            if already_real:
+                continue
+            prev = self._best_dealer_tail.get(idx)
+            if prev is None or det.conf > prev.conf:
+                self._best_dealer_tail[idx] = det
+
     def _emit_dealer_cards(
         self,
         pairs: list[tuple[int, CardDetection]],
@@ -1117,7 +1251,7 @@ class CompanionStateMachine:
                 self._record_hud_d_for_dedup(ts, det.val)
             if slot_idx >= 1:
                 dealer_flipped_or_drew = True
-            if det.conf < self.cfg.min_auto_confidence:
+            if source != "educated_guess" and det.conf < self.cfg.min_auto_confidence:
                 self._uncertainty_flags.append(f"D{slot_idx + 1}:{det.rank}@{det.conf:.2f}")
             evt_d: dict[str, Any] = {
                 "type": "card",
@@ -1155,6 +1289,9 @@ class CompanionStateMachine:
             if db.committed_ranks
         ]
         any_player_alive = any(not _eval_bj_ranks(hr)[2] for hr in p_hands_ranks) if p_hands_ranks else True
+        all_players_natural_bj = bool(p_hands_ranks) and all(
+            len(hr) == 2 and _eval_bj_ranks(hr)[0] == 21 for hr in p_hands_ranks
+        )
         d_committed = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
         d_total, _, _ = _eval_bj_ranks(d_committed)
 
@@ -1184,6 +1321,115 @@ class CompanionStateMachine:
                 d_total, _, _ = _eval_bj_ranks(d_committed)
         self._pending_dealer_felt.clear()
 
+        def _is_dealer_still_incomplete(include_ten_ace_back: bool = False) -> bool:
+            d_comm = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
+            d_tot, _, _ = _eval_bj_ranks(d_comm)
+            has_back = "BACK" in self.d_debouncer.committed_ranks
+            back_incomplete = has_back and (
+                len(d_comm) >= 2
+                or (
+                    len(d_comm) == 1
+                    and (include_ten_ace_back or d_comm[0] not in ("10", "J", "Q", "K", "A"))
+                )
+            )
+            return (
+                self._emitted_p >= 2
+                and any_player_alive
+                and (
+                    (len(d_comm) >= 2 and d_tot < 17)
+                    or back_incomplete
+                    or (len(d_comm) == 1 and not has_back and not all_players_natural_bj)
+                )
+            )
+
+        # Fallback B2: lower-confidence wipe rescue if dealer hand is still incomplete
+        if _is_dealer_still_incomplete(include_ten_ace_back=True):
+            rescued_low = self.d_debouncer.flush_pending_on_wipe(min_conf=0.72)
+            if rescued_low:
+                self._emit_dealer_cards(rescued_low, events, ts=now)
+
+        # Fallback C: transient best-seen dealer card buffer across the round
+        if _is_dealer_still_incomplete(include_ten_ace_back=True) and self._best_dealer_tail:
+            tail_recovered: list[tuple[int, CardDetection]] = []
+            for idx in range(len(self.d_debouncer.committed_ranks)):
+                if self.d_debouncer.committed_ranks[idx] == "BACK" and idx in self._best_dealer_tail:
+                    det = self._best_dealer_tail[idx]
+                    if det.conf >= 0.72:
+                        self.d_debouncer.committed_ranks[idx] = det.rank
+                        tail_recovered.append((idx, det))
+            if "BACK" not in self.d_debouncer.committed_ranks:
+                while True:
+                    idx = len(self.d_debouncer.committed_ranks)
+                    det = self._best_dealer_tail.get(idx)
+                    if det is None or det.conf < 0.72:
+                        break
+                    self.d_debouncer.committed_ranks.append(det.rank)
+                    tail_recovered.append((idx, det))
+            if tail_recovered:
+                self._emit_dealer_cards(tail_recovered, events, ts=now)
+
+        # Fallback D: deduce missing dealer card(s) from Dealer Score Badge history or 2-card pair sum
+        if _is_dealer_still_incomplete(include_ten_ace_back=True):
+            def _commit_deduced_card(card: dict[str, Any], conf_val: float) -> None:
+                if "BACK" in self.d_debouncer.committed_ranks:
+                    slot_idx = self.d_debouncer.committed_ranks.index("BACK")
+                    self.d_debouncer.committed_ranks[slot_idx] = card["rank"]
+                else:
+                    slot_idx = len(self.d_debouncer.committed_ranks)
+                    self.d_debouncer.committed_ranks.append(card["rank"])
+                deduced_det = CardDetection(
+                    rank=card["rank"],
+                    val=card["val"],
+                    conf=max(0.78, conf_val or 0.85),
+                    x=0,
+                )
+                self._emit_dealer_cards([(slot_idx, deduced_det)], events, ts=now, source="badge_deduced")
+
+            badge_steps = (
+                list(self._dealer_badge_history)
+                if self._dealer_badge_history
+                else (
+                    [{"total": self._last_dealer_badge_total, "conf": self._last_dealer_badge_conf}]
+                    if self._last_dealer_badge_total is not None
+                    else []
+                )
+            )
+            for step in badge_steps:
+                if not _is_dealer_still_incomplete(include_ten_ace_back=True):
+                    break
+                d_comm_before = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
+                deduced = deduce_missing_dealer_card(d_comm_before, step["total"])
+                if deduced:
+                    _commit_deduced_card(deduced, float(step.get("conf", 0.85)))
+
+            if _is_dealer_still_incomplete(include_ten_ace_back=True) and self._last_dealer_badge_total is not None:
+                d_comm_before = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
+                pair = deduce_missing_dealer_pair(d_comm_before, self._last_dealer_badge_total)
+                if pair and len(pair) == 2:
+                    _commit_deduced_card(pair[0], self._last_dealer_badge_conf)
+                    _commit_deduced_card(pair[1], self._last_dealer_badge_conf)
+
+        # Fallback E: educated guess for missing final dealer card(s) so dealer reaches >= 17
+        educated_guess_rank: str | None = None
+        guess_count = 0
+        while _is_dealer_still_incomplete(include_ten_ace_back=False) and guess_count < 2:
+            d_comm_before = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
+            guess = guess_missing_dealer_card(d_comm_before)
+            if not guess:
+                break
+            if "BACK" in self.d_debouncer.committed_ranks:
+                slot_idx = self.d_debouncer.committed_ranks.index("BACK")
+                self.d_debouncer.committed_ranks[slot_idx] = guess["rank"]
+            else:
+                slot_idx = len(self.d_debouncer.committed_ranks)
+                self.d_debouncer.committed_ranks.append(guess["rank"])
+            educated_guess_rank = f"{educated_guess_rank},{guess['rank']}" if educated_guess_rank else guess["rank"]
+            guess_det = CardDetection(rank=guess["rank"], val=guess["val"], conf=0.50, x=0)
+            self._emit_dealer_cards([(slot_idx, guess_det)], events, ts=now, source="educated_guess")
+            guess_count += 1
+
+        d_committed = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
+        d_total, _, _ = _eval_bj_ranks(d_committed)
         flags = list(self._uncertainty_flags)
         split_clean_multi = (
             self._emitted_split_hands >= 2
@@ -1193,14 +1439,7 @@ class CompanionStateMachine:
         if self._emitted_p < 2 or self._emitted_d < 1:
             flags.append("HUD_GLITCH")
 
-        dealer_incomplete = (
-            self._emitted_p >= 2
-            and any_player_alive
-            and (
-                (len(d_committed) >= 2 and d_total < 17)
-                or (len(d_committed) == 1 and "BACK" not in self.d_debouncer.committed_ranks)
-            )
-        )
+        dealer_incomplete = _is_dealer_still_incomplete(include_ten_ace_back=False) or (educated_guess_rank is not None)
         if dealer_incomplete and "HUD_GLITCH" not in flags and "DEALER_INCOMPLETE" not in flags:
             flags.append("DEALER_INCOMPLETE")
 
@@ -1210,6 +1449,16 @@ class CompanionStateMachine:
             and not split_blocks_auto
             and self._unread_community_pulses == 0
             and not flags
+            and self._emitted_d >= 1
+        )
+        non_dealer_inc_flags = [f for f in flags if f != "DEALER_INCOMPLETE"]
+        auto_on_no_more_bets = (
+            not can_auto_watch
+            and self.sync_play_mode == "watch"
+            and self._unread_community_pulses == 0
+            and not non_dealer_inc_flags
+            and (split_blocks_auto or educated_guess_rank is not None)
+            and self._emitted_p >= 2
             and self._emitted_d >= 1
         )
 
@@ -1229,6 +1478,20 @@ class CompanionStateMachine:
                 "fromWatch": True,
             }
         else:
+            if auto_on_no_more_bets:
+                sum_p = (
+                    f"{self._emitted_p}P({self._emitted_split_hands}H)"
+                    if self._emitted_split_hands >= 2
+                    else f"{self._emitted_p}P"
+                )
+                self._flush_pending_auto_watch(events)
+                self._pending_auto_watch = {
+                    "type": "auto_watch",
+                    "roundId": self.round_id,
+                    "handCount": self._emitted_split_hands,
+                    "summary": f"{sum_p}+{self._emitted_d}D+{self._emitted_b}B",
+                    "fromWatch": True,
+                }
             if split_blocks_auto or (self.sync_play_mode == "bet" and (self._split_detected or self.sync_is_split)):
                 reason = "SPLIT"
             elif self.sync_play_mode == "bet":
@@ -1252,12 +1515,13 @@ class CompanionStateMachine:
                     "uncertainSlots": flags,
                     "suggestedFocus": focus,
                     "dealerTotal": d_total,
+                    "educatedGuessRank": educated_guess_rank,
                     "feltSightings": list(self._round_felt_sightings),
                 }
             )
 
         self.sync_track_felt = False
-        self.resync_round(clear_pending=not can_auto_watch)
+        self.resync_round(clear_pending=not (can_auto_watch or auto_on_no_more_bets))
         return events
 
     def _emit_banner_phase_if_changed(self, banner: str, conf: float, events: list[dict[str, Any]]) -> None:
@@ -1289,6 +1553,7 @@ class CompanionStateMachine:
                     elif self.felt_tracking_armed:
                         self._handle_felt_event(fe)
                     self._maybe_emit_felt_sighting(fe, events)
+            self._record_dealer_obs(obs)
             new_d, _ = self.d_debouncer.update(obs.dealer_cards)
             dealer_flipped_or_drew = self._emit_dealer_cards(new_d, events, ts=obs.ts)
             if self.state == "DEALING" and len(self.d_debouncer.committed_ranks) >= 1 and self._emitted_p >= 1:
@@ -1332,6 +1597,11 @@ class CompanionStateMachine:
 
         if banner in ("PLACE_BETS", "LAST_BETS", "NO_MORE_BETS"):
             if active_round and has_cards:
+                self._record_dealer_obs(obs)
+                if obs.dealer_cards:
+                    new_d_pre, _ = self.d_debouncer.update(obs.dealer_cards)
+                    if new_d_pre:
+                        self._emit_dealer_cards(new_d_pre, events, ts=obs.ts)
                 events.extend(self._finalize_cleared_round(obs.ts))
             if banner == "NO_MORE_BETS":
                 self._flush_pending_auto_watch(events)
@@ -1649,6 +1919,7 @@ class CompanionStateMachine:
             if not self.p_debouncers:
                 p_cleared = True
 
+        self._record_dealer_obs(obs)
         new_d, d_cleared = self.d_debouncer.update(obs.dealer_cards)
         dealer_flipped_or_drew = self._emit_dealer_cards(new_d, events, ts=obs.ts)
 
@@ -1722,13 +1993,33 @@ class CompanionStateMachine:
         ):
             return
 
+        # Monotonic guard: never shrink or delete already-committed cards in player or dealer debouncers
+        if len(sorted_keys) < sum(1 for db in self.p_debouncers.values() if db.committed_ranks):
+            return
+        for h in sorted_keys:
+            comm_p = [r for r in self.p_debouncers[h].committed_ranks if r != "BACK"] if h in self.p_debouncers else []
+            hud_p = hands_input[h]
+            if len(hud_p) < len(comm_p):
+                return
+            if len(hud_p) == len(comm_p):
+                for j in range(len(comm_p)):
+                    if not _same_bj_value(hud_p[j].rank, comm_p[j]) and hud_p[j].conf < 0.90:
+                        return
+        comm_d = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
+        if len(d_real) < len(comm_d):
+            return
+        if len(d_real) == len(comm_d):
+            for j in range(len(comm_d)):
+                if not _same_bj_value(d_real[j].rank, comm_d[j]) and d_real[j].conf < 0.90:
+                    return
+
         deb_hands = {
             h: [r for r in db.committed_ranks if r != "BACK"]
             for h, db in sorted(self.p_debouncers.items())
             if db.committed_ranks
         }
         hud_hands_ranks = {h: [d.rank for d in hands_input[h]] for h in sorted_keys}
-        deb_dealer = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
+        deb_dealer = comm_d
         hud_dealer_real_ranks = [d.rank for d in d_real]
         deb_mismatch = (deb_hands != hud_hands_ranks) or (deb_dealer != hud_dealer_real_ranks)
 
@@ -1741,17 +2032,17 @@ class CompanionStateMachine:
             if len(self.sync_draft_hands) != len(hud_hands_vals):
                 total_ui = sum(len(x) for x in self.sync_draft_hands)
                 total_hud = sum(len(x) for x in hud_hands_vals)
-                if not (any(self.sync_draft_hands_manual) and total_hud < total_ui):
+                if not (any(self.sync_draft_hands_manual) and total_hud <= total_ui):
                     p_ui_mismatch = True
             else:
                 for idx, (ui_h, hud_h) in enumerate(zip(self.sync_draft_hands, hud_hands_vals)):
                     if ui_h != hud_h:
                         is_man = idx < len(self.sync_draft_hands_manual) and self.sync_draft_hands_manual[idx]
-                        if not (is_man and len(hud_h) < len(ui_h)):
+                        if not (is_man and len(hud_h) <= len(ui_h)):
                             p_ui_mismatch = True
                             break
             if self.sync_draft_dealer is not None and self.sync_draft_dealer != hud_dealer_vals:
-                if not (self.sync_draft_dealer_manual and len(hud_dealer_vals) < len(self.sync_draft_dealer)):
+                if not (self.sync_draft_dealer_manual and len(hud_dealer_vals) <= len(self.sync_draft_dealer)):
                     d_ui_mismatch = True
 
         if not (deb_mismatch or p_ui_mismatch or d_ui_mismatch):

@@ -28,6 +28,7 @@ class CardDetection:
     h: int = 0
     suit: str | None = None
     hand_index: int = 0
+    has_pip_body: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,8 @@ class FrameObservation:
     dealer_only: bool = False
     place_bets_conf: float = 0.0
     banner_source: str = ""
+    dealer_badge_total: int | None = None
+    dealer_badge_conf: float = 0.0
 
 
 @dataclass
@@ -791,58 +794,70 @@ class FeltBurstMonitor:
         return None
 
 
-def _find_white_card_clusters(roi_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+def _find_white_card_clusters(roi_bgr: np.ndarray, is_dealer: bool = False) -> list[tuple[int, int, int, int]]:
     """Locate connected white Playtech card clusters inside an ROI, filtering non-card table text."""
     if roi_bgr.size == 0:
         return []
     mb = _to_min_gray(roi_bgr)
-    mask = (mb > 155).astype(np.uint8)
-    num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
-    raw: list[tuple[int, int, int, int]] = []
-    caps: list[tuple[int, int, int, int]] = []
-    for i in range(1, num):
-        x, y, w, h, area = [int(v) for v in stats[i]]
-        fill = area / float(max(1, w * h))
-        patch_mb = mb[y : y + h, x : x + w]
-        if h < 13 or area < 105:
-            if 8 <= h <= 24 and w >= 5 and area >= 36 and fill >= 0.25 and float(np.mean(patch_mb > 160)) >= 0.25:
-                caps.append((x, y, w, h))
-            continue
-        if (w / max(1.0, float(h)) > 4.0 and fill < 0.45) or fill < 0.19:
-            continue
-        if float(np.mean(patch_mb > 165)) < 0.25:
-            continue
-        raw.append((x, y, w, h))
-    if not raw:
-        return []
-    raw.sort(key=lambda b: b[0])
-    merged: list[tuple[int, int, int, int]] = [raw[0]]
-    for x, y, w, h in raw[1:]:
-        px, py, pw, ph = merged[-1]
-        gap = x - (px + pw)
-        v_ov = min(py + ph, y + h) - max(py, y)
-        if gap <= 2 and v_ov >= int(round(0.55 * min(ph, h))):
-            nx = min(px, x)
-            ny = min(py, y)
-            nr = max(px + pw, x + w)
-            nb = max(py + ph, y + h)
-            merged[-1] = (nx, ny, nr - nx, nb - ny)
-        else:
-            merged.append((x, y, w, h))
 
-    # Merge any top-left white corner cap (where score badge severed the bottom of Card 0) into its right neighbor
-    if caps:
-        for cx, cy, cw, ch in caps:
-            for idx, (px, py, pw, ph) in enumerate(merged):
-                gap = px - (cx + cw)
-                if -2 <= gap <= 4 and abs(cy - py) <= 5 and ch < ph:
-                    nx = min(cx, px)
-                    ny = min(cy, py)
-                    nr = max(cx + cw, px + pw)
-                    nb = max(cy + ch, py + ph)
-                    merged[idx] = (nx, ny, nr - nx, nb - ny)
-                    break
-    return merged
+    def _run_pass(mask_thr: int, gt1: int, gt2: int) -> list[tuple[int, int, int, int]]:
+        mask = (mb > mask_thr).astype(np.uint8)
+        num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        raw: list[tuple[int, int, int, int]] = []
+        caps: list[tuple[int, int, int, int]] = []
+        for i in range(1, num):
+            x, y, w, h, area = [int(v) for v in stats[i]]
+            fill = area / float(max(1, w * h))
+            patch_mb = mb[y : y + h, x : x + w]
+            if h < 13 or area < 105:
+                if 8 <= h <= 24 and w >= 5 and area >= 36 and fill >= 0.25 and float(np.mean(patch_mb > gt1)) >= 0.25:
+                    caps.append((x, y, w, h))
+                continue
+            if (w / max(1.0, float(h)) > 4.0 and fill < 0.45) or fill < 0.19:
+                continue
+            if float(np.mean(patch_mb > gt2)) < 0.25:
+                continue
+            raw.append((x, y, w, h))
+        if not raw:
+            return []
+        raw.sort(key=lambda b: b[0])
+        merged: list[tuple[int, int, int, int]] = [raw[0]]
+        for x, y, w, h in raw[1:]:
+            px, py, pw, ph = merged[-1]
+            gap = x - (px + pw)
+            v_ov = min(py + ph, y + h) - max(py, y)
+            if gap <= 2 and v_ov >= int(round(0.55 * min(ph, h))):
+                nx = min(px, x)
+                ny = min(py, y)
+                nr = max(px + pw, x + w)
+                nb = max(py + ph, y + h)
+                merged[-1] = (nx, ny, nr - nx, nb - ny)
+            else:
+                merged.append((x, y, w, h))
+
+        # Merge any top-left white corner cap (where score badge severed the bottom of Card 0) into its right neighbor
+        if caps:
+            for cx, cy, cw, ch in caps:
+                for idx, (px, py, pw, ph) in enumerate(merged):
+                    gap = px - (cx + cw)
+                    if -2 <= gap <= 4 and abs(cy - py) <= 5 and ch < ph:
+                        nx = min(cx, px)
+                        ny = min(cy, py)
+                        nr = max(cx + cw, px + pw)
+                        nb = max(cy + ch, py + ph)
+                        merged[idx] = (nx, ny, nr - nx, nb - ny)
+                        break
+        return merged
+
+    primary = _run_pass(155, 160, 165)
+    if not is_dealer:
+        return primary
+    total_w = sum(c[2] for c in primary)
+    if not primary or total_w < roi_bgr.shape[1] * 0.28:
+        relaxed = _run_pass(142, 145, 148)
+        if sum(c[2] for c in relaxed) > total_w:
+            return relaxed
+    return primary
 
 
 def _has_red_back_signature(bgr_patch: np.ndarray) -> bool:
@@ -853,8 +868,10 @@ def _has_red_back_signature(bgr_patch: np.ndarray) -> bool:
     g = bgr_patch[:, :, 1].astype(np.int16)
     r = bgr_patch[:, :, 2].astype(np.int16)
     red_ratio = float(np.mean((r - np.maximum(b, g)) > 32))
-    dot_ratio = float(np.mean(bgr_patch.min(axis=2) > 150))
-    return red_ratio >= 0.24 and dot_ratio >= 0.10
+    mn = bgr_patch.min(axis=2)
+    dot_ratio = float(np.mean(mn > 150))
+    white_ratio = float(np.mean(mn >= 225))
+    return red_ratio >= 0.24 and dot_ratio >= 0.10 and white_ratio <= 0.42
 
 
 def _classify_suit(
@@ -940,7 +957,8 @@ def _detect_cluster_cards(
 
     # Trim outer dark border rows before vertical normalization without cropping badge-occluded lower rows
     cl_mb = _to_min_gray(cluster_bgr)
-    white_rows = np.where(np.mean(cl_mb > 155, axis=1) >= 0.12)[0]
+    row_wh_thr = 142 if is_dealer else 155
+    white_rows = np.where(np.mean(cl_mb > row_wh_thr, axis=1) >= 0.12)[0]
     if len(white_rows) >= 13 and (int(white_rows[-1]) + 1 - int(white_rows[0])) >= int(round(ch * 0.82)):
         y_off = int(white_rows[0])
         y_end = int(white_rows[-1]) + 1
@@ -994,7 +1012,7 @@ def _detect_cluster_cards(
         white_r = float(np.mean(mid_chk.min(axis=2) > 165))
         return red_r > 0.22 and white_r < 0.55
 
-    min_tail = 14 if (not cluster_has_back and not edge_clipped) else 12
+    min_tail = 11 if is_dealer else (14 if (not cluster_has_back and not edge_clipped) else 12)
     peaks: list[tuple[float, CardDetection]] = []
     roi_h, roi_w = norm_top.shape[:2]
     for tpl in rank_templates:
@@ -1018,10 +1036,14 @@ def _detect_cluster_cards(
                     continue
                 # Reject dark/red score badges, fade frames, and dark borders lacking crisp paper+ink contrast
                 patch = norm_top[y_pos : y_pos + sh, x_pos : x_pos + sw]
+                is_dealer_tail = is_dealer and x_pos >= (cw_norm - 24)
+                min_bright_frac = 0.20 if is_dealer_tail else 0.26
+                min_ptp = 58 if is_dealer_tail else 70
+                min_dark_frac = 0.06 if is_dealer_tail else 0.07
                 if (
-                    float(np.mean(patch > 158)) < 0.26
-                    or (int(patch.max()) - int(patch.min())) < 70
-                    or float(np.mean(patch < 120)) < 0.07
+                    float(np.mean(patch > 158)) < min_bright_frac
+                    or (int(patch.max()) - int(patch.min())) < min_ptp
+                    or float(np.mean(patch < 120)) < min_dark_frac
                 ):
                     continue
                 if _is_back_column(x_pos, sw):
@@ -1111,6 +1133,7 @@ def _detect_cluster_cards(
     out: list[CardDetection] = []
     for d in kept:
         suit, suit_conf = _classify_suit(norm_bgr, d.x, d.w, cw_norm, suit_templates)
+        has_pip_body = False
         if suit_templates:
             sx0 = max(0, d.x - 2)
             sx1 = min(cw_norm, d.x + max(d.w, 14) + 2)
@@ -1131,17 +1154,22 @@ def _detect_cluster_cards(
             if (not cluster_has_back and not edge_clipped) and not has_badge_occlusion:
                 rem_right = eff_right - d.x
                 if rem_right < 15:
-                    if d.conf < max(0.84, min_hud_conf) or (suit is None and not has_pip_body):
+                    min_r15 = max(0.74 if is_dealer else 0.84, (min_hud_conf - 0.10) if is_dealer else min_hud_conf)
+                    if d.conf < min_r15 or (suit is None and not has_pip_body):
                         continue
                 elif rem_right < 22:
-                    if d.conf < max(0.78, min_hud_conf - 0.06):
+                    min_r22 = max(0.72 if is_dealer else 0.75, min_hud_conf - (0.12 if is_dealer else 0.09))
+                    if d.conf < min_r22:
                         continue
                     if suit is None and (not has_pip_body or d.conf < max(0.82, min_hud_conf - 0.02)):
                         continue
-            if suit is None and not has_badge_occlusion:
+            high_conf_pip_ok = has_pip_body and d.conf >= max(0.75 if is_dealer else 0.86, 0.75 if is_dealer else min_hud_conf)
+            if suit is None and not has_badge_occlusion and not high_conf_pip_ok:
                 if not has_pip_body or suit_conf < 0.42 or d.conf < max(0.82, min_hud_conf - 0.02):
                     continue
             elif suit is not None and d.conf < max(0.78, min_hud_conf - 0.06) and suit_conf < 0.60:
+                continue
+            if d.rank == "4" and not has_badge_occlusion and d.conf < max(0.82, min_hud_conf - 0.02):
                 continue
         out.append(
             CardDetection(
@@ -1154,6 +1182,7 @@ def _detect_cluster_cards(
                 h=max(4, int(round(d.h / sc))),
                 suit=suit,
                 hand_index=0,
+                has_pip_body=bool(has_pip_body),
             )
         )
     return out, cluster_has_back
@@ -1241,6 +1270,299 @@ _PLACE_BETS_SCALES = (
 )
 
 
+_BADGE_DIGIT_GLYPHS: dict[str, list[str]] = {
+    "0": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+    ],
+    "1": [
+        "..........",
+        "....###...",
+        "...####...",
+        "..##.##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        ".....##...",
+        "..#######.",
+        "..........",
+    ],
+    "2": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".......##.",
+        "......##..",
+        ".....##...",
+        "....##....",
+        "...##.....",
+        "..##......",
+        ".##.......",
+        ".##.......",
+        ".########.",
+        "..........",
+    ],
+    "3": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".......##.",
+        ".......##.",
+        "......##..",
+        "...#####..",
+        "......##..",
+        ".......##.",
+        ".......##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+    ],
+    "4": [
+        "..........",
+        ".....###..",
+        "....####..",
+        "...##.##..",
+        "..##..##..",
+        ".##...##..",
+        ".##...##..",
+        ".########.",
+        "......##..",
+        "......##..",
+        "......##..",
+        "......##..",
+        "......##..",
+        "..........",
+    ],
+    "5": [
+        "..........",
+        ".########.",
+        ".##.......",
+        ".##.......",
+        ".##.......",
+        ".#######..",
+        ".......##.",
+        ".......##.",
+        ".......##.",
+        ".......##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+    ],
+    "6": [
+        "..........",
+        "...#####..",
+        "..##...##.",
+        ".##.......",
+        ".##.......",
+        ".#######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+    ],
+    "7": [
+        "..........",
+        ".########.",
+        ".##....##.",
+        ".......##.",
+        "......##..",
+        ".....##...",
+        ".....##...",
+        "....##....",
+        "....##....",
+        "...##.....",
+        "...##.....",
+        "...##.....",
+        "...##.....",
+        "..........",
+    ],
+    "8": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..######..",
+        "..........",
+    ],
+    "9": [
+        "..........",
+        "..######..",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        ".##....##.",
+        "..#######.",
+        ".......##.",
+        ".......##.",
+        "......##..",
+        ".##...##..",
+        "..#####...",
+        "..........",
+    ],
+}
+_BADGE_DIGIT_TPLS: list[tuple[str, np.ndarray, float]] | None = None
+
+
+def _get_badge_digit_templates() -> list[tuple[str, np.ndarray, float]]:
+    """Build cached 10x14 zero-mean digit vectors for Dealer Score Badge OCR."""
+    global _BADGE_DIGIT_TPLS
+    if _BADGE_DIGIT_TPLS is not None:
+        return _BADGE_DIGIT_TPLS
+    out: list[tuple[str, np.ndarray, float]] = []
+    for digit, rows in _BADGE_DIGIT_GLYPHS.items():
+        vec = np.array([255.0 if ch == "#" else 0.0 for row in rows for ch in row], dtype=np.float32)
+        vec -= float(vec.mean())
+        out.append((digit, vec, float(np.linalg.norm(vec))))
+    _BADGE_DIGIT_TPLS = out
+    return out
+
+
+def _match_badge_digit_patch(gray_img: np.ndarray, x: int, y: int, w: int, h: int) -> tuple[str | None, float]:
+    """Match a white digit glyph inside a dark dealer score badge against 10x14 digit vectors."""
+    if gray_img.size == 0 or w < 2 or h < 5:
+        return None, 0.0
+    target_h = 12
+    target_w = max(2, min(8, int(round(w * (target_h / float(h))))))
+    cropped = gray_img[y : y + h, x : x + w]
+    if cropped.size == 0:
+        return None, 0.0
+    resized = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    base_ox = (10 - target_w) // 2
+    oy = 1
+    tpls = _get_badge_digit_templates()
+    best_d: str | None = None
+    best_conf = -1.0
+    tried_ox = sorted({max(0, min(10 - target_w, base_ox + d)) for d in (-1, 0, 1)})
+    for ox in tried_ox:
+        canvas = np.zeros((14, 10), dtype=np.float32)
+        canvas[oy : oy + target_h, ox : ox + target_w] = resized
+        vec = canvas.reshape(-1)
+        vec = vec - float(vec.mean())
+        c_norm = float(np.linalg.norm(vec))
+        if c_norm < 1e-4:
+            continue
+        for digit, tpl_vec, tpl_norm in tpls:
+            conf = float(np.dot(vec, tpl_vec) / (c_norm * tpl_norm))
+            if conf > best_conf:
+                best_conf = conf
+                best_d = digit
+    return best_d, best_conf
+
+
+def detect_dealer_badge_total(
+    dealer_img: np.ndarray, clusters: list[tuple[int, int, int, int]] | None = None
+) -> tuple[int | None, float]:
+    """Read the white-on-dark circular Dealer Score Badge total ([4..26]) beside/below dealer cards."""
+    if dealer_img.size == 0 or dealer_img.ndim < 2 or dealer_img.shape[0] < 16 or dealer_img.shape[1] < 16:
+        return None, 0.0
+    dh, dw = dealer_img.shape[:2]
+    if clusters:
+        cx, cy, _, ch = clusters[0]
+        bx0 = max(0, int(round(cx - ch * 1.40)))
+        bx1 = min(dw, int(round(cx + ch * 0.35)))
+        by0 = max(0, int(round(cy - ch * 0.08)))
+        by1 = min(dh, int(round(cy + ch * 1.35)))
+        min_digit_h = max(6, int(round(ch * 0.16)))
+        max_digit_h = max(min_digit_h + 4, int(round(ch * 0.65)))
+    else:
+        bx0 = 0
+        by0 = int(round(dh * 0.20))
+        bx1 = int(round(dw * 0.55))
+        by1 = dh
+        min_digit_h = 7
+        max_digit_h = int(round(dh * 0.65))
+
+    bw = bx1 - bx0
+    bh = by1 - by0
+    if bw < 10 or bh < 10:
+        return None, 0.0
+
+    sub_gray = _to_gray(dealer_img[by0:by1, bx0:bx1])
+    mask = (sub_gray >= 165).astype(np.uint8)
+    num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    digit_cands: list[tuple[int, int, int, int, str, float]] = []
+    for lbl in range(1, num):
+        x, y, w, h, area = [int(v) for v in stats[lbl]]
+        if h < min_digit_h or h > max_digit_h:
+            continue
+        if w < 2 or w > int(round(h * 1.05)) or area < 8:
+            continue
+        if (x + w) >= (bw - 1) and h >= max_digit_h * 0.9:
+            continue
+
+        mx0 = max(0, x - 3)
+        my0 = max(0, y - 3)
+        mx1 = min(bw, x + w + 3)
+        my1 = min(bh, y + h + 3)
+        patch = sub_gray[my0:my1, mx0:mx1]
+        ring_mask = np.ones(patch.shape, dtype=bool)
+        ring_mask[y - my0 : y + h - my0, x - mx0 : x + w - mx0] = False
+        ring_px = patch[ring_mask]
+        if ring_px.size > 0 and float(np.mean(ring_px < 135)) < 0.45:
+            continue
+
+        digit, conf = _match_badge_digit_patch(sub_gray, x, y, w, h)
+        if digit is not None and conf >= 0.72:
+            digit_cands.append((x, y, w, h, digit, conf))
+
+    if not digit_cands:
+        return None, 0.0
+    digit_cands.sort(key=lambda c: c[0])
+
+    groups: list[list[tuple[int, int, int, int, str, float]]] = []
+    for cand in digit_cands:
+        x, y, w, h, _, _ = cand
+        if groups:
+            last_g = groups[-1]
+            px, py, pw, ph, _, _ = last_g[-1]
+            same_row = abs(y - py) <= max(3, int(round(ph * 0.25)))
+            same_h = (ph * 0.70) <= h <= (ph * 1.40)
+            gap = x - (px + pw)
+            if same_row and same_h and -2 <= gap <= max(4, int(round(ph * 0.55))) and len(last_g) < 2:
+                last_g.append(cand)
+                continue
+        groups.append([cand])
+
+    for g in reversed(groups):
+        total = int("".join(c[4] for c in g))
+        min_conf = min(c[5] for c in g)
+        if 4 <= total <= 26 and min_conf >= 0.56:
+            return total, float(min_conf)
+    return None, 0.0
+
+
 class PlaytechDetector:
     """Combines normalized HUD rank/suit detection with felt burst tracking and banner detection."""
 
@@ -1265,6 +1587,8 @@ class PlaytechDetector:
         self._banner_tpl_hints: dict[str, tuple[str, float]] = {}
         self._cached_p: tuple[list[CardDetection], dict[int, list[CardDetection]], bool] = ([], {}, False)
         self._cached_d: list[CardDetection] = []
+        self._cached_d_badge: tuple[int | None, float] = (None, 0.0)
+        self._last_d_clusters: list[tuple[int, int, int, int]] = []
         self._cached_top_banner: tuple[str, float] = ("", 0.0)
         self._cached_pb: tuple[float, bool] = (0.0, False)
         self._cached_shuf: tuple[bool, float, str, float] = (False, 0.0, "", 0.0)
@@ -1303,6 +1627,8 @@ class PlaytechDetector:
         self._last_center_scan_ts = -999.0
         self._cached_p = ([], {}, False)
         self._cached_d = []
+        self._cached_d_badge = (None, 0.0)
+        self._last_d_clusters = []
         self._cached_top_banner = ("", 0.0)
         self._cached_pb = (0.0, False)
         self._cached_shuf = (False, 0.0, "", 0.0)
@@ -1377,7 +1703,9 @@ class PlaytechDetector:
         floor_conf = max(0.68, self.cfg.min_hud_confidence - 0.10)
         rank_tpls = [t for t in self.hud_bank.card_templates if t.rank != "BACK"]
         med_tpl_h = float(np.median([t.gray.shape[0] for t in rank_tpls])) if rank_tpls else 20.0
-        clusters = _find_white_card_clusters(roi_img) if med_tpl_h <= 23.0 else []
+        clusters = _find_white_card_clusters(roi_img, is_dealer=is_dealer) if med_tpl_h <= 23.0 else []
+        if is_dealer:
+            self._last_d_clusters = clusters
 
         if clusters:
             cluster_hits: list[tuple[tuple[int, int, int, int], list[CardDetection]]] = []
@@ -1428,7 +1756,7 @@ class PlaytechDetector:
                 # Player horizontal multi-cluster split grouping
                 avg_ch = float(np.mean([cl[3] for cl, _ in cluster_hits]))
                 cl_sep_thr = max(4, int(round(avg_ch * 0.30)))
-                card_sep_thr = max(10, int(round(avg_ch * 0.60)))
+                card_sep_thr = max(12, int(round(avg_ch * 0.78)))
                 hands: dict[int, list[CardDetection]] = {}
                 all_p: list[CardDetection] = []
                 cur_hand = 0
@@ -1453,6 +1781,7 @@ class PlaytechDetector:
                             h=det.h,
                             suit=det.suit,
                             hand_index=cur_hand,
+                            has_pip_body=det.has_pip_body,
                         )
                         hands.setdefault(cur_hand, []).append(tagged)
                         all_p.append(tagged)
@@ -1492,6 +1821,7 @@ class PlaytechDetector:
         dealer_only: bool = False,
         dealer_felt_img: np.ndarray | None = None,
         place_bets_img: np.ndarray | None = None,
+        force_dealer_scan: bool = False,
     ) -> FrameObservation:
         """Analyze cropped ROIs and return detections for a single tick."""
         now = ts if ts is not None else time.monotonic()
@@ -1517,14 +1847,18 @@ class PlaytechDetector:
                 if dealer_img.size
                 else b""
             )
-            if d_sig == self._last_d_sig:
+            if not force_dealer_scan and d_sig == self._last_d_sig:
                 d_cards = self._cached_d
+                d_badge_total, d_badge_conf = self._cached_d_badge
             else:
                 self._last_d_sig = d_sig
                 d_cards, _, _ = self._detect_hud_strip(dealer_img, is_dealer=True)
+                d_badge_total, d_badge_conf = detect_dealer_badge_total(dealer_img, self._last_d_clusters)
                 self._cached_d = d_cards
+                self._cached_d_badge = (d_badge_total, d_badge_conf)
         else:
             d_cards = self._cached_d
+            d_badge_total, d_badge_conf = self._cached_d_badge
 
         cards_present = bool(p_cards or d_cards)
 
@@ -1741,4 +2075,6 @@ class PlaytechDetector:
             dealer_only=dealer_only,
             place_bets_conf=pb_conf,
             banner_source=banner_source,
+            dealer_badge_total=d_badge_total,
+            dealer_badge_conf=d_badge_conf,
         )

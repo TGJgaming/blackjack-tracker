@@ -797,6 +797,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 continue
 
             if hud_due or dealer_only_tick or comm_img.size or dealer_felt_img.size:
+                force_dealer_scan = sm.state == "DEALER_TURN" or ("BACK" in sm.d_debouncer.committed_ranks)
                 obs = detector.process_crops(
                     player_img=last_player_img,
                     dealer_img=last_dealer_img,
@@ -812,6 +813,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                     banner_refreshed=hud_due,
                     dealer_only=dealer_only_tick,
                     dealer_felt_img=dealer_felt_img,
+                    force_dealer_scan=force_dealer_scan,
                 )
                 in_ka_reload = keepalive.state in ("REFRESHING", "RECOVERING")
                 if not in_ka_reload:

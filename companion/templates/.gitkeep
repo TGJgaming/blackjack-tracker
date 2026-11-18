@@ -1,0 +1,3 @@
+# Calibration templates live here after running calibrate.py:
+#   templates/hud/    -> crisp corner/rank crops from player_strip / dealer_strip (A,2..9,10,J,Q,K,BACK,SHUFFLE)
+#   templates/felt/   -> physical card corner/face crops from community_roi / burn_roi
