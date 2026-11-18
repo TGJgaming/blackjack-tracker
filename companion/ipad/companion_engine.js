@@ -3950,6 +3950,7 @@
         if (reloadDur >= (this.cfg.keepalive_reload_grace_sec || 14.0)) {
           this.state = "WARN";
           this._graceUntilTs = 0.0;
+          this._lastCooldownEndTs = now + 90.0;
           this._pendingReloadRecovery = true;
           events.push({
             type: "keepalive_status",
@@ -4010,6 +4011,10 @@
           elapsedSec: Math.round(this._watchElapsedSec),
           keepalive: this.getStatus(now),
         });
+      }
+
+      if (this._pendingReloadRecovery && !this._manualArmed) {
+        return events;
       }
 
       const isDue = this._manualArmed || (this._watchElapsedSec >= targetSec && now >= this._lastCooldownEndTs);

@@ -1318,6 +1318,21 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   assert(evTimeout.some((e) => e.event === "timeout_warn"), "Slow reload should emit timeout_warn");
   assert.strictEqual(ka22.state, "WARN");
 
+  // While still in WARN after timeout_warn, keepalive must NOT trigger a second reload
+  let secondReloadCalled = false;
+  ka22.step({
+    now: 116.5,
+    windowFound: true,
+    obs: { banner_state: "PLACE_BETS", place_bets_conf: 0.9, player_cards: [], dealer_cards: [] },
+    smState: "BETTING",
+    playMode: "watch",
+    draftCount: 0,
+    hasPrompt: false,
+    betRoundsCount: 0,
+    triggerRefreshCb: () => { secondReloadCalled = true; return [true, "ext"]; },
+  });
+  assert.strictEqual(secondReloadCalled, false, "Keepalive must NOT reload a second time while waiting in WARN");
+
   // Only player strip visible -> stays WARN; once BOTH player & dealer strips are visible -> resets to WATCH_COUNTDOWN
   ka22.step({
     now: 117,
