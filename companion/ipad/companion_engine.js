@@ -3163,10 +3163,24 @@
       this.sync_draft_dealer = null;
       this.sync_draft_dealer_manual = false;
       this.sync_shoe_rem = null;
+      this.sync_dealer_guess_removed = false;
       this.state = "IDLE";
       this._roundSeq = 0;
       this.round_id = "r_0";
       this._pendingAutoWatch = null;
+      this._reviewRoundId = "";
+      this._reviewPlayerRanks = [];
+      this._reviewDealerRanks = [];
+      this._reviewSubDealerTail = new Map();
+      this._reviewBadgeHint = null;
+      this._reviewFeltSightings = [];
+      this._reviewEmittedP = 0;
+      this._reviewEmittedD = 0;
+      this._reviewEmittedB = 0;
+      this._reviewEmittedSplitHands = 1;
+      this._placeBetsEnteredTs = null;
+      this._placeBetsRecheck0Done = false;
+      this._placeBetsRecheck3Done = false;
       this._lastBannerEmitted = "";
       this._sawClearSinceRoundOver = true;
       this._shuffleSince = null;
@@ -3209,11 +3223,30 @@
       if (typeof this._lastReconcileTs !== "number") this._lastReconcileTs = -999.0;
     }
 
+    _clearReviewSnapshot() {
+      this._reviewRoundId = "";
+      this._reviewPlayerRanks = [];
+      this._reviewDealerRanks = [];
+      this._reviewSubDealerTail = new Map();
+      this._reviewBadgeHint = null;
+      this._reviewFeltSightings = [];
+      this._reviewEmittedP = 0;
+      this._reviewEmittedD = 0;
+      this._reviewEmittedB = 0;
+      this._reviewEmittedSplitHands = 1;
+    }
+
     resyncRound(clearPending = true) {
-      if (clearPending) this._pendingAutoWatch = null;
+      if (clearPending) {
+        this._pendingAutoWatch = null;
+        this._clearReviewSnapshot();
+      }
       this._resetRoundAccumulators();
       this._lastBannerEmitted = "";
       this._sawClearSinceRoundOver = true;
+      this._placeBetsEnteredTs = null;
+      this._placeBetsRecheck0Done = false;
+      this._placeBetsRecheck3Done = false;
       this.state = "IDLE";
     }
 
@@ -3241,7 +3274,10 @@
       }
       if (msg.draftCount !== undefined) {
         const nc = Math.max(0, Number(msg.draftCount) || 0);
-        if (nc === 0 && this._pendingAutoWatch) this._pendingAutoWatch = null;
+        if (nc === 0) {
+          if (this._pendingAutoWatch) this._pendingAutoWatch = null;
+          this._clearReviewSnapshot();
+        }
         this.sync_draft_count = nc;
       }
       if (msg.trackFelt !== undefined) this.sync_track_felt = !!msg.trackFelt;
@@ -3260,6 +3296,9 @@
       if (msg.draftDealerManual !== undefined) {
         this.sync_draft_dealer_manual = !!msg.draftDealerManual;
       }
+      if (msg.dealerGuessRemoved !== undefined) {
+        this.sync_dealer_guess_removed = !!msg.dealerGuessRemoved;
+      }
       if (Array.isArray(msg.shoeRem) && msg.shoeRem.length === 10) {
         this.sync_shoe_rem = msg.shoeRem.map((n) => Math.max(0, Number(n) || 0));
       }
@@ -3275,6 +3314,11 @@
     _startNewRound() {
       this._roundSeq++;
       this.round_id = `r_${this._roundSeq}`;
+      this.sync_dealer_guess_removed = false;
+      this._placeBetsEnteredTs = null;
+      this._placeBetsRecheck0Done = false;
+      this._placeBetsRecheck3Done = false;
+      this._clearReviewSnapshot();
       this._resetRoundAccumulators();
       this.state = "DEALING";
     }
@@ -3284,6 +3328,11 @@
         if (events) this._flushPendingAutoWatch(events);
         this._roundSeq++;
         this.round_id = `r_${this._roundSeq}`;
+        this.sync_dealer_guess_removed = false;
+        this._placeBetsEnteredTs = null;
+        this._placeBetsRecheck0Done = false;
+        this._placeBetsRecheck3Done = false;
+        this._clearReviewSnapshot();
         this.state = "DEALING";
       }
     }
@@ -3405,9 +3454,18 @@
         return events;
       }
 
-      const pHandsRanks = Object.values(this.pDebouncers)
+      let pHandsRanks = Object.values(this.pDebouncers)
         .map((db) => db.committedRanks.filter((r) => r !== "BACK"))
         .filter((hr) => hr.length > 0);
+      if (this._emittedP < 2 && Array.isArray(this.sync_draft_hands) && this.sync_draft_hands.length) {
+        const uiHands = this.sync_draft_hands
+          .filter((h) => Array.isArray(h) && h.length > 0)
+          .map((h) => h.map((v) => (v === 0 ? "10" : v === 1 ? "A" : String(v))));
+        if (uiHands.reduce((a, h) => a + h.length, 0) >= 2) {
+          pHandsRanks = uiHands;
+        }
+      }
+      const totalEffectiveP = Math.max(this._emittedP, pHandsRanks.reduce((a, h) => a + h.length, 0));
       const anyPlayerAlive = pHandsRanks.length ? pHandsRanks.some((hr) => !evalBjRanks(hr)[2]) : true;
       const allPlayersNaturalBJ =
         pHandsRanks.length > 0 &&
@@ -3418,7 +3476,7 @@
         const [dTot] = evalBjRanks(dComm);
         const hasBack = this.dDebouncer.committedRanks.includes("BACK");
         return (
-          this._emittedP >= 2 &&
+          totalEffectiveP >= 2 &&
           anyPlayerAlive &&
           (
             (dComm.length >= 2 && dTot < 17) ||
@@ -3507,7 +3565,7 @@
       // Fallback E: multi-signal educated guess across all 10 ranks (A, 2..9, 10) so dealer reaches >= 17
       let educatedGuessRank = null;
       let guessCount = 0;
-      while (isDealerStillIncomplete() && guessCount < 2) {
+      while (isDealerStillIncomplete() && guessCount < 6) {
         const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
         const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
         const slotIdx = backIdx >= 0 ? backIdx : this.dDebouncer.committedRanks.length;
@@ -3614,8 +3672,152 @@
           feltSightings: [],
         });
       }
+      // Save persistent review snapshot before resyncRound() wipes transient debouncers
+      this._reviewRoundId = this.round_id;
+      this._reviewPlayerRanks = pHandsRanks.map((hr) => hr.slice());
+      this._reviewDealerRanks = this.dDebouncer.committedRanks.slice();
+      this._reviewSubDealerTail = new Map(
+        Array.from(this._bestSubDealerTail.entries()).map(([k, arr]) => [k, arr.slice()])
+      );
+      this._reviewBadgeHint = this._lastDealerBadgeHint ? Object.assign({}, this._lastDealerBadgeHint) : null;
+      this._reviewFeltSightings = this._feltSightings.slice();
+      this._reviewEmittedP = this._emittedP;
+      this._reviewEmittedD = this._emittedD;
+      this._reviewEmittedB = this._emittedB;
+      this._reviewEmittedSplitHands = this._emittedSplitHands;
+
       this.resyncRound(!(canAutoWatch || autoOnNoMoreBets));
       return events;
+    }
+
+    _recheckDealerInPlaceBets(obs, events, now, stage) {
+      if (this.sync_dealer_guess_removed) return;
+      const targetRoundId = this._reviewRoundId || (this.sync_draft_count > 0 ? this.sync_round_id : "");
+      if (!targetRoundId) return;
+      if (this.sync_round_id === targetRoundId && this.sync_draft_count === 0 && !this._pendingAutoWatch) {
+        return;
+      }
+
+      let pHandsRanks = this._reviewPlayerRanks.map((hr) => hr.slice());
+      if ((this.sync_round_id === targetRoundId || !this.sync_round_id) && Array.isArray(this.sync_draft_hands) && this.sync_draft_hands.length) {
+        pHandsRanks = this.sync_draft_hands
+          .filter((h) => Array.isArray(h) && h.length > 0)
+          .map((h) => h.map((v) => (v === 0 ? "10" : v === 1 ? "A" : String(v))));
+      }
+      let dRanks = this._reviewDealerRanks.slice();
+      if ((this.sync_round_id === targetRoundId || !this.sync_round_id) && Array.isArray(this.sync_draft_dealer)) {
+        const uiD = this.sync_draft_dealer.map((v) => (v === 0 ? "10" : v === 1 ? "A" : String(v)));
+        if (stage === "3s" || uiD.length >= dRanks.filter((r) => r !== "BACK").length) {
+          dRanks = uiD;
+        }
+      }
+
+      if (!dRanks.length && !pHandsRanks.length) return;
+
+      const anyPlayerAlive = pHandsRanks.length ? pHandsRanks.some((hr) => !evalBjRanks(hr)[2]) : true;
+      const allPlayersNaturalBJ =
+        pHandsRanks.length > 0 &&
+        pHandsRanks.every((hr) => hr.length === 2 && evalBjRanks(hr)[0] === 21);
+      const totalP = pHandsRanks.reduce((a, hr) => a + hr.length, 0);
+
+      const revIncomplete = () => {
+        const dComm = dRanks.filter((r) => r !== "BACK");
+        const [dTot] = evalBjRanks(dComm);
+        const hasBack = dRanks.includes("BACK");
+        return (
+          totalP >= 2 &&
+          anyPlayerAlive &&
+          (
+            (dComm.length >= 2 && dTot < 17) ||
+            (hasBack && dComm.length >= 1) ||
+            (dComm.length === 1 && !hasBack && !allPlayersNaturalBJ)
+          )
+        );
+      };
+
+      if (!revIncomplete()) return;
+
+      // Check if late dealer cards appeared on the current frame during PLACE_BETS
+      if (obs && Array.isArray(obs.dealer_cards) && obs.dealer_cards.length) {
+        const realObs = obs.dealer_cards.filter((d) => d.rank !== "BACK" && d.val !== null && d.val !== undefined && d.conf >= 0.72);
+        while (realObs.length > dRanks.filter((r) => r !== "BACK").length) {
+          const nxtIdx = dRanks.filter((r) => r !== "BACK").length;
+          const det = realObs[nxtIdx];
+          const backIdx = dRanks.indexOf("BACK");
+          const slotIdx = backIdx >= 0 ? backIdx : dRanks.length;
+          if (backIdx >= 0) dRanks[backIdx] = det.rank;
+          else dRanks.push(det.rank);
+          this._reviewEmittedD++;
+          const evtD = {
+            type: "card",
+            target: "D",
+            val: det.val,
+            slot: slotIdx,
+            rankLabel: det.rank,
+            conf: Number(det.conf.toFixed(3)),
+            source: "hud",
+            roundId: targetRoundId,
+          };
+          if (det.suit) evtD.suit = det.suit;
+          events.push(evtD);
+        }
+      }
+
+      const guessedRanks = [];
+      let guessCount = 0;
+      while (revIncomplete() && guessCount < 6) {
+        const dCommBefore = dRanks.filter((r) => r !== "BACK");
+        const backIdx = dRanks.indexOf("BACK");
+        const slotIdx = backIdx >= 0 ? backIdx : dRanks.length;
+        const guess = guessMissingDealerCard(dCommBefore, {
+          slotIdx,
+          subCandidates: this._reviewSubDealerTail,
+          badgeHint: this._reviewBadgeHint,
+          feltSightings: this._reviewFeltSightings,
+          shoeRem: this.sync_shoe_rem,
+          roundSeed: this.sync_shoe_rem ? this._roundSeq + guessCount * 7 + (stage === "3s" ? 13 : 0) : null,
+          mustReach17: true,
+        });
+        if (!guess) break;
+        if (backIdx >= 0) dRanks[backIdx] = guess.rank;
+        else dRanks.push(guess.rank);
+        guessedRanks.push(guess.rank);
+        this._reviewEmittedD++;
+        events.push({
+          type: "card",
+          target: "D",
+          val: guess.val,
+          slot: slotIdx,
+          rankLabel: guess.rank,
+          conf: 0.50,
+          source: "educated_guess",
+          roundId: targetRoundId,
+        });
+        guessCount++;
+      }
+
+      this._reviewDealerRanks = dRanks.slice();
+      if (!guessedRanks.length) return;
+
+      const dCommAfter = dRanks.filter((r) => r !== "BACK");
+      const [dTotalAfter] = evalBjRanks(dCommAfter);
+      if (this._pendingAutoWatch && this._pendingAutoWatch.roundId === targetRoundId) {
+        const sumP = this._reviewEmittedSplitHands >= 2
+          ? `${this._reviewEmittedP}P(${this._reviewEmittedSplitHands}H)`
+          : `${this._reviewEmittedP}P`;
+        this._pendingAutoWatch.summary = `${sumP}+${dCommAfter.length}D+${this._reviewEmittedB}B`;
+      }
+      events.push({
+        type: "prompt_confirm",
+        roundId: targetRoundId,
+        reason: "DEALER_INCOMPLETE",
+        unreadCommunity: 0,
+        uncertainSlots: ["DEALER_INCOMPLETE"],
+        suggestedFocus: "D",
+        dealerTotal: dTotalAfter,
+        educatedGuessRank: guessedRanks.join(","),
+        feltSightings: this._reviewFeltSightings.slice(),
+      });
     }
 
     step(obs) {
@@ -3631,6 +3833,7 @@
           this._flushPendingAutoWatch(events);
           const hasPendingBet = !["IDLE", "BETTING"].includes(this.state) && (this.sync_play_mode === "bet" || this._splitDetected);
           this.sync_track_felt = false;
+          this._clearReviewSnapshot();
           this.resyncRound();
           this.state = "SHUFFLING";
           this._shuffleEmitted = true;
@@ -3658,6 +3861,7 @@
         }
         if (banner === "NO_MORE_BETS") {
           this._flushPendingAutoWatch(events);
+          this._clearReviewSnapshot();
         }
         const wasEmptyInBetting = this._sawEmptyHudInBetting || !hasObsCards;
         this.state = "BETTING";
@@ -3666,6 +3870,26 @@
         this._resetRoundAccumulators();
         this._lastBetBanner = banner;
         this._sawEmptyHudInBetting = wasEmptyInBetting;
+        if (banner === "PLACE_BETS") {
+          if (this._placeBetsEnteredTs === null) {
+            this._placeBetsEnteredTs = now;
+            this._placeBetsRecheck0Done = false;
+            this._placeBetsRecheck3Done = false;
+          }
+          if (!this._placeBetsRecheck0Done) {
+            this._placeBetsRecheck0Done = true;
+            this._recheckDealerInPlaceBets(obs, events, now, "0s");
+          }
+        }
+        if (
+          (banner === "PLACE_BETS" || banner === "LAST_BETS") &&
+          this._placeBetsEnteredTs !== null &&
+          !this._placeBetsRecheck3Done &&
+          (now - this._placeBetsEnteredTs) >= 3.0
+        ) {
+          this._placeBetsRecheck3Done = true;
+          this._recheckDealerInPlaceBets(obs, events, now, "3s");
+        }
         if (banner === "NO_MORE_BETS" && wasEmptyInBetting && hasObsCards) {
           this._predealObs = obs;
         }

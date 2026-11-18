@@ -1793,7 +1793,102 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   assert.strictEqual(guess28.val, 7);
   console.log("   Test 28 PASSED");
 }
-console.log("\nALL 28 ENGINE TESTS PASSED SUCCESSFULLY!");
+
+console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks...");
+{
+  const cfg29 = Engine.defaultConfig({
+    anchor_mode: "ipad_split_left",
+    confirm_frames: 1,
+    clear_frames: 2,
+    require_wait_banner: false,
+  });
+  const mkC = (rank, val, conf = 0.92) => ({ rank, val, conf, suit: "S", hasPipBody: true, x: 10, y: 10, w: 12, h: 16, hand_index: 0 });
+  const _bjTotal = (ranks) => {
+    let tot = 0, aces = 0;
+    for (const r of ranks) {
+      if (r === "A") { tot += 11; aces++; }
+      else if (["10", "J", "Q", "K"].includes(r)) tot += 10;
+      else tot += Number(r);
+    }
+    while (tot > 21 && aces > 0) { tot -= 10; aces--; }
+    return tot;
+  };
+
+  // 1. 0s PLACE_BETS completion
+  const sm1 = new Engine.CompanionStateMachine(cfg29);
+  sm1.setSyncState({ playMode: "watch" });
+  sm1.step({ ts: 1, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm1.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mkC("10", 0), mkC("9", 9)],
+    dealer_cards: [mkC("10", 0), { rank: "BACK", val: null, conf: 0.92, suit: null, x: 25, y: 10, w: 12, h: 16, hand_index: 0 }],
+    player_hands: { 0: [mkC("10", 0), mkC("9", 9)] },
+    hud_refreshed: true,
+  });
+  const evs0s = sm1.step({ ts: 3, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  assert(evs0s.some((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess"), "0s PLACE_BETS must complete [10, BACK]");
+
+  // 2. >2 guesses for low dealer total & +3s recheck on sync_draft_dealer drift
+  const sm2 = new Engine.CompanionStateMachine(cfg29);
+  sm2.setSyncState({ playMode: "watch" });
+  sm2.step({ ts: 1, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm2.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mkC("10", 0), mkC("9", 9)],
+    dealer_cards: [mkC("2", 2), mkC("3", 3)],
+    player_hands: { 0: [mkC("10", 0), mkC("9", 9)] },
+    hud_refreshed: true,
+  });
+  const evsLow = sm2.step({ ts: 3, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  const lowGuesses = evsLow.filter((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess");
+  assert(lowGuesses.length >= 2, "Dealer [2, 3] must receive >= 2 guesses to reach >= 17");
+  const lowTot = _bjTotal(["2", "3", ...lowGuesses.map((g) => g.rankLabel)]);
+  assert(lowTot >= 17, `Completed dealer total must be >= 17, got ${lowTot}`);
+
+  // Simulate UI drift where client only has [2] during PLACE_BETS
+  sm2.setSyncState({
+    playMode: "watch",
+    draftCount: 3,
+    draftHands: [[0, 9]],
+    draftDealer: [2],
+    dealerGuessRemoved: false,
+  });
+  const evs15 = sm2.step({ ts: 4.5, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  assert(!evs15.some((e) => e.type === "card" && e.source === "educated_guess"), "Should not run 3s recheck before +3.0s");
+  const evs31 = sm2.step({ ts: 6.1, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  const g3s = evs31.filter((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess");
+  assert(g3s.length >= 2, "+3s PLACE_BETS recheck must complete drifted dealer [2] to >= 17");
+  const tot3s = _bjTotal(["2", ...g3s.map((g) => g.rankLabel)]);
+  assert(tot3s >= 17, `+3s completed dealer total must be >= 17, got ${tot3s}`);
+
+  // 3. dealerGuessRemoved guard
+  const sm3 = new Engine.CompanionStateMachine(cfg29);
+  sm3.setSyncState({ playMode: "watch" });
+  sm3.step({ ts: 1, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm3.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mkC("10", 0), mkC("9", 9)],
+    dealer_cards: [mkC("10", 0), mkC("6", 6)],
+    player_hands: { 0: [mkC("10", 0), mkC("9", 9)] },
+    hud_refreshed: true,
+  });
+  sm3.step({ ts: 3, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm3.setSyncState({
+    playMode: "watch",
+    draftCount: 4,
+    draftHands: [[0, 9]],
+    draftDealer: [0, 6],
+    dealerGuessRemoved: true,
+  });
+  const evsRemoved = sm3.step({ ts: 6.2, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  assert(!evsRemoved.some((e) => e.type === "card" && e.source === "educated_guess"), "dealerGuessRemoved=true must block +3s re-insertion");
+
+  console.log("   Test 29 PASSED");
+}
+console.log("\nALL 29 ENGINE TESTS PASSED SUCCESSFULLY!");
 
 
 
