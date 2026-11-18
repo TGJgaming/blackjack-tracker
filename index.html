@@ -4358,7 +4358,8 @@ function syncCompanionState(force = false){
   const hasPrompt = !!draft.compPrompt;
   const sAct = active();
   const betRoundsCount = sAct && Array.isArray(sAct.rounds) ? sAct.rounds.filter(r => r.outcome !== 'WATCH').length : 0;
-  const key = `${draft.playMode}|${handsList.length > 1 ? 1 : 0}|${cnt}|${trackFelt ? 1 : 0}|${compRoundId}|${hasPrompt ? 1 : 0}|${betRoundsCount}|${JSON.stringify(draftHands)}|${JSON.stringify(draftDealer)}`;
+  const shoeRem = sAct ? buildShoeState(sAct, true).rem : null;
+  const key = `${draft.playMode}|${handsList.length > 1 ? 1 : 0}|${cnt}|${trackFelt ? 1 : 0}|${compRoundId}|${hasPrompt ? 1 : 0}|${betRoundsCount}|${JSON.stringify(draftHands)}|${JSON.stringify(draftDealer)}|${shoeRem ? shoeRem.join(',') : ''}`;
   if(!force && key === _comp.lastSyncKey) return;
   _comp.lastSyncKey = key;
   try{
@@ -4374,7 +4375,8 @@ function syncCompanionState(force = false){
       draftHands,
       draftDealer,
       draftHandsManual,
-      draftDealerManual
+      draftDealerManual,
+      shoeRem
     }));
   }catch(e){}
 }

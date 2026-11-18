@@ -1621,6 +1621,8 @@
     const topPrep = prepareSourceForMatch(normTop, false);
     const minTail = isDealer ? 11 : (!clusterHasBack && !edgeClipped ? 14 : 12);
     const peaks = [];
+    const subPeaks = [];
+    const subFloor = isDealer ? 0.42 : floorConf;
     for (const tpl of rankTemplates) {
       for (const tsc of [0.90, 0.96, 1.0, 1.05, 1.10]) {
         const entry = getScaledTplGray(tpl, tsc, true);
@@ -1635,7 +1637,7 @@
         for (let yPos = 0; yPos < yLim; yPos++) {
           for (let xPos = 0; xPos <= xLim; xPos++) {
             const conf = m.data[yPos * m.w + xPos];
-            if (conf < floorConf || !Number.isFinite(conf)) continue;
+            if (conf < subFloor || !Number.isFinite(conf)) continue;
             let pMin = 255, pMax = 0, gt158 = 0, lt120 = 0;
             const pData = normTop.data;
             const ntW = normTop.w;
@@ -1650,14 +1652,22 @@
               }
             }
             const isDealerTail = isDealer && xPos >= cwNorm - 24;
-            if (pMax - pMin < (isDealerTail ? 58 : 70)) continue;
+            const contrastSpan = pMax - pMin;
             const nPatch = sw * sh;
-            if (gt158 / nPatch < (isDealerTail ? 0.20 : 0.26) || lt120 / nPatch < (isDealerTail ? 0.06 : 0.07)) continue;
-            const prio = conf + (tpl.rank === "10" ? 0.015 : 0.0);
-            peaks.push([
-              prio,
-              { rank: tpl.rank, val: tpl.val, conf, x: xPos, y: yPos, w: sw, h: sh, suit: null, hand_index: 0 },
-            ]);
+            if (conf >= floorConf) {
+              if (contrastSpan < (isDealerTail ? 58 : 70)) continue;
+              if (gt158 / nPatch < (isDealerTail ? 0.20 : 0.26) || lt120 / nPatch < (isDealerTail ? 0.06 : 0.07)) continue;
+              const prio = conf + (tpl.rank === "10" ? 0.015 : 0.0);
+              peaks.push([
+                prio,
+                { rank: tpl.rank, val: tpl.val, conf, x: xPos, y: yPos, w: sw, h: sh, suit: null, hand_index: 0, cwNorm },
+              ]);
+            } else if (isDealer && contrastSpan >= 36 && gt158 / nPatch >= 0.14 && lt120 / nPatch >= 0.04) {
+              subPeaks.push([
+                conf,
+                { rank: tpl.rank, val: tpl.val, conf, x: xPos, y: yPos, w: sw, h: sh, suit: null, hand_index: 0, cwNorm },
+              ]);
+            }
           }
         }
       }
@@ -1670,9 +1680,9 @@
       kept.push(cand);
     }
     kept.sort((a, b) => a.x - b.x);
-    if (!kept.length) return [[], clusterHasBack];
 
     const out = [];
+    const rejectedCands = [];
     for (const d of kept) {
       const [suit, suitConf] = classifySuit(normBgr, d.x, d.w, cwNorm, suitTemplates);
       let hasPipBody = false;
@@ -1690,14 +1700,22 @@
         const hasBadgeOcclusion = !isDealer && d.x <= 9 && sz.data.length > 0 && lt140 / sz.data.length >= 0.25 && d.conf >= Math.max(0.75, floorConf);
         if (!clusterHasBack && !edgeClipped && !hasBadgeOcclusion) {
           const remRight = effRight - d.x;
-          if (remRight < 15 && (d.conf < Math.max(isDealer ? 0.74 : 0.84, isDealer ? minHudConf - 0.10 : minHudConf) || (!suit && !hasPipBody))) continue;
-          if (remRight < 22 && d.conf < Math.max(isDealer ? 0.72 : 0.75, minHudConf - (isDealer ? 0.12 : 0.09))) continue;
+          if (remRight < 15 && (d.conf < Math.max(isDealer ? 0.74 : 0.84, isDealer ? minHudConf - 0.10 : minHudConf) || (!suit && !hasPipBody))) {
+            if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
+            continue;
+          }
+          if (remRight < 22 && d.conf < Math.max(isDealer ? 0.72 : 0.75, minHudConf - (isDealer ? 0.12 : 0.09))) {
+            if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
+            continue;
+          }
         }
         const highConfPipOk = hasPipBody && d.conf >= Math.max(isDealer ? 0.75 : 0.86, isDealer ? 0.75 : minHudConf);
         if (!suit && !hasBadgeOcclusion && !highConfPipOk && (!hasPipBody || suitConf < 0.42 || d.conf < Math.max(0.82, minHudConf - 0.02))) {
+          if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
           continue;
         }
         if (d.rank === "4" && !hasBadgeOcclusion && d.conf < Math.max(0.82, minHudConf - 0.02)) {
+          if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
           continue;
         }
       }
@@ -1711,10 +1729,44 @@
         h: Math.max(4, Math.round(d.h / sc)),
         suit,
         hasPipBody: !!hasPipBody,
+        cwNorm,
         hand_index: 0,
       });
     }
-    return [out, clusterHasBack];
+
+    let subOut = [];
+    if (isDealer) {
+      const combinedSub = [
+        ...rejectedCands.map((c) => [c.conf, c]),
+        ...subPeaks,
+      ];
+      combinedSub.sort((a, b) => b[0] - a[0]);
+      const keptSub = [];
+      for (const [, cand] of combinedSub) {
+        if (kept.some((k) => Math.abs(cand.x - k.x) < 11 && out.some((o) => Math.abs(o.x - (cx + Math.round(k.x / sc))) <= 2))) continue;
+        if (keptSub.some((k) => Math.abs(cand.x - k.x) < 11)) continue;
+        const remRight = effRight - cand.x;
+        keptSub.push({
+          rank: cand.rank,
+          val: cand.val,
+          conf: cand.conf,
+          x: cx + Math.round(cand.x / sc),
+          y: cy + Math.round(cand.y / sc),
+          w: Math.max(4, Math.round(cand.w / sc)),
+          h: Math.max(4, Math.round(cand.h / sc)),
+          normX: cand.x,
+          remRight,
+          cwNorm,
+          suit: cand.suit || null,
+          hasPipBody: !!cand.hasPipBody,
+          hand_index: 0,
+        });
+      }
+      keptSub.sort((a, b) => a.x - b.x);
+      subOut = keptSub;
+    }
+
+    return [out, clusterHasBack, subOut];
   }
 
   function computeRoiSignature(img, gridW, gridH, useMinGray = false) {
@@ -2157,6 +2209,7 @@
 
     let bestTotal = null;
     let bestConf = 0.0;
+    let softHint = null;
     // Prefer rightmost valid 2-digit (or 1-digit) blackjack total in [4..26]
     for (let gi = groups.length - 1; gi >= 0; gi--) {
       const g = groups[gi];
@@ -2165,13 +2218,36 @@
       const minConf = Math.min(...g.map((c) => c.conf));
       const allStrongDark = g.every((c) => (c.darkRatio || 0) >= 0.80);
       const reqConf = allStrongDark ? 0.56 : 0.70;
-      if (Number.isInteger(total) && total >= 4 && total <= 26 && minConf >= reqConf) {
-        bestTotal = total;
-        bestConf = minConf;
-        break;
+      if (Number.isInteger(total) && total >= 4 && total <= 26) {
+        if (minConf >= reqConf && bestTotal === null) {
+          bestTotal = total;
+          bestConf = minConf;
+        }
+        if (!softHint || minConf > softHint.conf) {
+          softHint = {
+            total,
+            conf: minConf,
+            tensDigit: g.length === 2 ? Number(g[0].digit) : null,
+            tensConf: g.length === 2 ? g[0].conf : 0,
+            onesDigit: Number(g[g.length - 1].digit),
+            onesConf: g[g.length - 1].conf,
+          };
+        }
+      } else if (g.length === 1 && !softHint) {
+        const d0 = Number(g[0].digit);
+        if ((d0 === 1 || d0 === 2) && g[0].conf >= 0.48) {
+          softHint = {
+            total: null,
+            conf: g[0].conf,
+            tensDigit: d0,
+            tensConf: g[0].conf,
+            onesDigit: null,
+            onesConf: 0,
+          };
+        }
       }
     }
-    return [bestTotal, bestConf];
+    return [bestTotal, bestConf, softHint];
   }
 
   function deduceMissingDealerCard(dCommittedRanks, badgeTotal) {
@@ -2238,13 +2314,168 @@
     return bestPair;
   }
 
-  function guessMissingDealerCard(dCommittedRanks) {
+  function guessMissingDealerCard(dCommittedRanks, context = null) {
     if (!Array.isArray(dCommittedRanks) || !dCommittedRanks.length) return null;
     const [dTot, dSoft] = evalBjRanks(dCommittedRanks);
+    const ALL_RANKS = [
+      { rank: "10", val: 0 },
+      { rank: "A", val: 1 },
+      { rank: "2", val: 2 },
+      { rank: "3", val: 3 },
+      { rank: "4", val: 4 },
+      { rank: "5", val: 5 },
+      { rank: "6", val: 6 },
+      { rank: "7", val: 7 },
+      { rank: "8", val: 8 },
+      { rank: "9", val: 9 },
+    ];
+
+    // Legacy zero-context call compatibility: preserve exact deterministic fallback when no context object is passed
+    if (!context || typeof context !== "object") {
+      if (dTot === 6 && !dSoft) {
+        return { rank: "A", val: 1 };
+      }
+      return { rank: "10", val: 0 };
+    }
+
+    const slotIdx = Number.isInteger(context.slotIdx) ? context.slotIdx : dCommittedRanks.length;
+    const mustReach17 = context.mustReach17 !== false;
+
+    // 1. Sub-threshold runner-up template peak (0.42..0.72) + rightmost card width prior
+    const subCands = [];
+    if (context.subCandidates instanceof Map && context.subCandidates.has(slotIdx)) {
+      const entry = context.subCandidates.get(slotIdx);
+      if (Array.isArray(entry)) subCands.push(...entry);
+      else if (entry) subCands.push(entry);
+    } else if (Array.isArray(context.subCandidates)) {
+      subCands.push(...context.subCandidates);
+    }
+    if (subCands.length > 0) {
+      let bestSub = null;
+      let bestScore = -1;
+      for (const sc of subCands) {
+        if (!sc || !sc.rank || sc.rank === "BACK") continue;
+        const val = RANK_TO_VAL[sc.rank];
+        if (val === undefined || val === null) continue;
+        const [newTot] = evalBjRanks([...dCommittedRanks, sc.rank]);
+        if (mustReach17 && dTot >= 7 && newTot < 17) continue;
+        let score = Number(sc.conf) || 0.45;
+        // Width prior: a single-digit rank has narrower remRight (11..15 px) while "10" requires wider card tail (>= 16 px)
+        if (typeof sc.remRight === "number") {
+          if (sc.rank === "10" && sc.remRight < 15) score -= 0.14;
+          else if (sc.rank !== "10" && sc.remRight >= 11 && sc.remRight <= 16) score += 0.05;
+        }
+        if (sc.suit) score += 0.04;
+        if (sc.hasPipBody) score += 0.03;
+        if (score > bestScore) {
+          bestScore = score;
+          bestSub = { rank: sc.rank, val };
+        }
+      }
+      if (bestSub && bestScore >= 0.42) {
+        return bestSub;
+      }
+    }
+
+    // 2. Partial / soft Dealer Score Badge hint (e.g., tens digit 1 vs 2 or low-conf total)
+    const badgeHint = context.badgeHint || null;
+    if (badgeHint && typeof badgeHint === "object") {
+      if (Number.isInteger(badgeHint.total) && badgeHint.total >= 17 && badgeHint.total <= 26) {
+        const direct = deduceMissingDealerCard(dCommittedRanks, badgeHint.total);
+        if (direct) return direct;
+      }
+      if (badgeHint.tensDigit === 1 || badgeHint.tensDigit === 2) {
+        const tensMatches = ALL_RANKS.filter((c) => {
+          const [tot] = evalBjRanks([...dCommittedRanks, c.rank]);
+          return tot >= 17 && Math.floor(tot / 10) === badgeHint.tensDigit;
+        });
+        if (tensMatches.length === 1) return tensMatches[0];
+        if (tensMatches.length > 1) {
+          if (Number.isInteger(badgeHint.onesDigit)) {
+            const exactOne = tensMatches.find((c) => {
+              const [tot] = evalBjRanks([...dCommittedRanks, c.rank]);
+              return (tot % 10) === badgeHint.onesDigit;
+            });
+            if (exactOne) return exactOne;
+          }
+          // Pick middle/most probable rank in that tens bracket
+          const tenCand = tensMatches.find((c) => c.rank === "10");
+          if (tenCand && badgeHint.tensDigit === 2) return tenCand;
+          return tensMatches[Math.floor(tensMatches.length / 2)];
+        }
+      }
+    }
+
+    // 3. Physical Felt Sightings recorded during the round
+    if (Array.isArray(context.feltSightings) && context.feltSightings.length > 0) {
+      for (const fs of context.feltSightings) {
+        const rk = fs && (fs.rank || fs.rankLabel);
+        const val = rk && Object.prototype.hasOwnProperty.call(RANK_TO_VAL, rk) ? RANK_TO_VAL[rk] : (fs ? fs.val : null);
+        if (val !== null && val !== undefined) {
+          const canonRank = val === 0 ? "10" : val === 1 ? "A" : String(val);
+          const [newTot] = evalBjRanks([...dCommittedRanks, canonRank]);
+          if (!mustReach17 || dTot < 7 || newTot >= 17) {
+            return { rank: canonRank, val };
+          }
+        }
+      }
+    }
+
+    // 4. Live Shoe Depletion & Stopping-Rule Bayesian Stratified Selection across all 10 ranks (A, 2..9, 10)
+    // shoeRem is indexed by blackjack value 0..9: [10s (128), A (32), 2 (32), ..., 9 (32)]
+    const defaultRem = [128, 32, 32, 32, 32, 32, 32, 32, 32, 32];
+    const shoeRem = Array.isArray(context.shoeRem) && context.shoeRem.length === 10
+      ? context.shoeRem.map((n, i) => (Number.isFinite(Number(n)) ? Math.max(0, Number(n)) : defaultRem[i]))
+      : defaultRem;
+
+    // Filter candidate ranks that satisfy dealer progression rules
+    let validPool = ALL_RANKS.filter((c) => {
+      const [tot] = evalBjRanks([...dCommittedRanks, c.rank]);
+      if (mustReach17 && dTot >= 7) {
+        return tot >= 17;
+      }
+      return true;
+    });
+    if (!validPool.length) validPool = ALL_RANKS;
+
+    // If narrow rightmost cluster width was observed (e.g. < 15 normalized px), exclude "10" from the pool
+    if (typeof context.tailRemRight === "number" && context.tailRemRight > 0 && context.tailRemRight < 15) {
+      const nonTen = validPool.filter((c) => c.rank !== "10");
+      if (nonTen.length) validPool = nonTen;
+    }
+
+    // Filter out completely depleted ranks if at least one valid rank still has cards remaining in the shoe
+    const nonDepleted = validPool.filter((c) => shoeRem[c.val] > 0);
+    if (nonDepleted.length > 0) {
+      validPool = nonDepleted;
+    }
+
+    // If roundSeed is provided, perform deterministic stratified sampling weighted by live remaining shoe counts
+    // so all valid ranks (A, 2..9, 10) are guessed in proportion to their true mathematical probability in the shoe!
+    let totalWeight = 0;
+    const weights = validPool.map((c) => {
+      const w = shoeRem[c.val] > 0 ? shoeRem[c.val] : 1;
+      totalWeight += w;
+      return w;
+    });
+
+    if (typeof context.roundSeed === "number" && Number.isFinite(context.roundSeed) && totalWeight > 0) {
+      // Golden-ratio quasi-random sequence (low-discrepancy stratified sampling) so consecutive guesses cover the full distribution
+      const frac = ((context.roundSeed * 0.618033988749895) % 1 + 1) % 1;
+      let target = frac * totalWeight;
+      for (let i = 0; i < validPool.length; i++) {
+        target -= weights[i];
+        if (target <= 0) {
+          return validPool[i];
+        }
+      }
+      return validPool[validPool.length - 1];
+    }
+
     if (dTot === 6 && !dSoft) {
       return { rank: "A", val: 1 };
     }
-    return { rank: "10", val: 0 };
+    return validPool[0] || { rank: "10", val: 0 };
   }
 
   class PlaytechDetector {
@@ -2262,7 +2493,7 @@
       this._cachedP = [[], {}, false];
       this._pSigAge = 0;
       this._lastDSig = null;
-      this._cachedD = [[], null, 0.0];
+      this._cachedD = [[], null, 0.0, [], null];
       this._dSigAge = 0;
       this._lastBannerSig = null;
       this._cachedTopBanner = ["", 0.0];
@@ -2397,17 +2628,18 @@
     detectHudStrip(roiImg, isDealer) {
       const hudTpls = (this.banks.hud || []).filter((t) => t.rank !== "BACK" && t.rank !== "SHUFFLE");
       if (!roiImg || roiImg.w === 0 || roiImg.h === 0 || !hudTpls.length) {
-        return [[], {}, false, []];
+        return [[], {}, false, [], []];
       }
       const floorConf = Math.max(0.68, this.cfg.min_hud_confidence - 0.10);
       const clusters = findWhiteCardClusters(roiImg, isDealer);
-      if (!clusters.length) return [[], {}, false, []];
+      if (!clusters.length) return [[], {}, false, [], []];
 
       const clusterHits = [];
+      const subClusterHits = [];
       let backSeen = false;
       const refCh = clusters.length >= 2 ? Math.max(...clusters.map((c) => c[3])) : null;
       for (const cl of clusters) {
-        const [dets, clBack] = detectClusterCards(
+        const [dets, clBack, subDets] = detectClusterCards(
           roiImg,
           cl,
           hudTpls,
@@ -2419,8 +2651,9 @@
         );
         backSeen = backSeen || clBack;
         if (dets.length) clusterHits.push([cl, dets]);
+        if (subDets && subDets.length) subClusterHits.push(...subDets);
       }
-      if (!clusterHits.length) return [[], {}, false, clusters];
+      if (!clusterHits.length) return [[], {}, false, clusters, subClusterHits];
 
       if (isDealer) {
         const flatD = clusterHits.flatMap(([, ds]) => ds).sort((a, b) => a.x - b.x);
@@ -2448,7 +2681,7 @@
             });
           }
         }
-        return [flatD, { 0: flatD }, false, clusters];
+        return [flatD, { 0: flatD }, false, clusters, subClusterHits];
       }
 
       const avgCh = clusterHits.reduce((acc, [cl]) => acc + cl[3], 0) / clusterHits.length;
@@ -2476,7 +2709,7 @@
         }
         prevCl = cl;
       }
-      return [allP, hands, Object.keys(hands).length >= 2, clusters];
+      return [allP, hands, Object.keys(hands).length >= 2, clusters, []];
     }
 
     processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, ts = null, forceDealerScan = false }) {
@@ -2502,17 +2735,17 @@
       const dSig = computeRoiSignature(dealerImg, 80, 36, true);
       const dChanged = hudRoiSigChanged(dSig, this._lastDSig, 1);
       const dDiff = roiSigDiff(dSig, this._lastDSig);
-      let dCards, dBadgeTotal, dBadgeConf;
+      let dCards, dBadgeTotal, dBadgeConf, dSubCards, dBadgeHint;
       // Dealer strip is small/cheap and holds the few cards that matter: only reuse the cache when pixels are identical and not force-scanning.
       if (!forceDealerScan && this._lastDSig && !dChanged && dDiff === 0) {
-        [dCards, dBadgeTotal, dBadgeConf] = this._cachedD;
+        [dCards, dBadgeTotal, dBadgeConf, dSubCards, dBadgeHint] = this._cachedD;
       } else {
         this._lastDSig = dSig;
         this._dSigAge = 0;
         let dClusters = [];
-        [dCards, , , dClusters] = this.detectHudStrip(dealerImg, true);
-        [dBadgeTotal, dBadgeConf] = detectDealerBadgeTotal(dealerImg, dClusters);
-        this._cachedD = [dCards, dBadgeTotal, dBadgeConf];
+        [dCards, , , dClusters, dSubCards] = this.detectHudStrip(dealerImg, true);
+        [dBadgeTotal, dBadgeConf, dBadgeHint] = detectDealerBadgeTotal(dealerImg, dClusters);
+        this._cachedD = [dCards, dBadgeTotal, dBadgeConf, dSubCards || [], dBadgeHint || null];
       }
 
       const cardsPresent = pCards.length > 0 || dCards.length > 0;
@@ -2637,6 +2870,7 @@
         ts: now,
         player_cards: pCards,
         dealer_cards: dCards,
+        dealer_sub_cards: dSubCards || [],
         player_hands: pHands,
         felt_events: [],
         banner_state: bannerState,
@@ -2650,6 +2884,7 @@
         banner_source: bannerSource,
         dealer_badge_total: dBadgeTotal,
         dealer_badge_conf: dBadgeConf,
+        dealer_badge_hint: dBadgeHint || null,
       };
     }
   }
@@ -2927,6 +3162,7 @@
       this.sync_draft_hands_manual = [];
       this.sync_draft_dealer = null;
       this.sync_draft_dealer_manual = false;
+      this.sync_shoe_rem = null;
       this.state = "IDLE";
       this._roundSeq = 0;
       this.round_id = "r_0";
@@ -2961,9 +3197,12 @@
       this._sawEmptyHudInBetting = false;
       this._predealObs = null;
       this._bestDealerTail = new Map();
+      this._bestSubDealerTail = new Map();
       this._lastDealerBadgeTotal = null;
       this._lastDealerBadgeConf = 0.0;
+      this._lastDealerBadgeHint = null;
       this._dealerBadgeHistory = [];
+      this._feltSightings = [];
       this._reconcileSig = null;
       this._reconcileFrames = 0;
       this._reconcileSince = 0.0;
@@ -3021,6 +3260,9 @@
       if (msg.draftDealerManual !== undefined) {
         this.sync_draft_dealer_manual = !!msg.draftDealerManual;
       }
+      if (Array.isArray(msg.shoeRem) && msg.shoeRem.length === 10) {
+        this.sync_shoe_rem = msg.shoeRem.map((n) => Math.max(0, Number(n) || 0));
+      }
     }
 
     _flushPendingAutoWatch(events) {
@@ -3073,18 +3315,50 @@
           lastH.conf = bConf;
         }
       }
+      if (obs.dealer_badge_hint && typeof obs.dealer_badge_hint === "object") {
+        if (!this._lastDealerBadgeHint || (obs.dealer_badge_hint.conf || 0) >= (this._lastDealerBadgeHint.conf || 0)) {
+          this._lastDealerBadgeHint = obs.dealer_badge_hint;
+        }
+      }
+      if (Array.isArray(obs.felt_events) && obs.felt_events.length) {
+        for (const fe of obs.felt_events) {
+          if (fe && fe.rank && fe.rank !== "BACK") {
+            this._feltSightings.push(fe);
+          }
+        }
+      }
       const dList = obs.dealer_cards || [];
       for (let idx = 0; idx < dList.length; idx++) {
         const det = dList[idx];
         if (!det || det.rank === "BACK" || det.val === null || det.val === undefined) continue;
-        if ((det.conf || 0) < 0.70) continue;
         const alreadyReal =
           idx < this.dDebouncer.committedRanks.length &&
           this.dDebouncer.committedRanks[idx] !== "BACK";
         if (alreadyReal) continue;
-        const prev = this._bestDealerTail.get(idx);
-        if (!prev || det.conf > prev.conf) {
-          this._bestDealerTail.set(idx, det);
+        if ((det.conf || 0) >= 0.70) {
+          const prev = this._bestDealerTail.get(idx);
+          if (!prev || det.conf > prev.conf) {
+            this._bestDealerTail.set(idx, det);
+          }
+        } else if ((det.conf || 0) >= 0.42) {
+          const list = this._bestSubDealerTail.get(idx) || [];
+          list.push(det);
+          this._bestSubDealerTail.set(idx, list);
+        }
+      }
+      const dSubList = obs.dealer_sub_cards || [];
+      if (dSubList.length) {
+        const baseSlot = Math.max(
+          dList.filter((d) => d && d.rank !== "BACK").length,
+          this.dDebouncer.committedRanks.filter((r) => r !== "BACK").length
+        );
+        for (let i = 0; i < dSubList.length; i++) {
+          const sdet = dSubList[i];
+          if (!sdet || !sdet.rank || sdet.rank === "BACK") continue;
+          const slotIdx = baseSlot + i;
+          const list = this._bestSubDealerTail.get(slotIdx) || [];
+          list.push(sdet);
+          this._bestSubDealerTail.set(slotIdx, list);
         }
       }
     }
@@ -3230,15 +3504,23 @@
         }
       }
 
-      // Fallback E: educated guess for missing final dealer card(s) so dealer reaches >= 17
+      // Fallback E: multi-signal educated guess across all 10 ranks (A, 2..9, 10) so dealer reaches >= 17
       let educatedGuessRank = null;
       let guessCount = 0;
       while (isDealerStillIncomplete() && guessCount < 2) {
         const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
-        const guess = guessMissingDealerCard(dCommBefore);
-        if (!guess) break;
         const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
         const slotIdx = backIdx >= 0 ? backIdx : this.dDebouncer.committedRanks.length;
+        const guess = guessMissingDealerCard(dCommBefore, {
+          slotIdx,
+          subCandidates: this._bestSubDealerTail,
+          badgeHint: this._lastDealerBadgeHint,
+          feltSightings: this._feltSightings,
+          shoeRem: this.sync_shoe_rem,
+          roundSeed: this.sync_shoe_rem ? this._roundSeq + guessCount * 7 : null,
+          mustReach17: true,
+        });
+        if (!guess) break;
         if (backIdx >= 0) {
           this.dDebouncer.committedRanks[backIdx] = guess.rank;
         } else {

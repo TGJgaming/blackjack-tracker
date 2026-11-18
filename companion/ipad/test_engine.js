@@ -1717,6 +1717,85 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 27 PASSED");
 }
 
+// 28. Multi-signal All-Rank Educated Guess Fallback (Sub-threshold peaks, Width prior, Soft Badge digits, Felt Sightings & Live Shoe Stratified Sampling)
+{
+  console.log("28. Testing multi-signal all-rank educated guess fallback across all 10 ranks...");
+
+  // 28a. Signal 1: Sub-threshold template runner-up peak + narrow card width (remRight=13) guesses single-digit rank ('8', '4', '3', etc.)
+  const g28a = Engine.guessMissingDealerCard(["10"], {
+    subCandidates: [
+      { rank: "10", val: 0, conf: 0.56, slotIdx: 1, remRight: 13, hasPipBody: true },
+      { rank: "8", val: 8, conf: 0.55, slotIdx: 1, remRight: 13, hasPipBody: true },
+    ],
+  });
+  assert(g28a && g28a.rank === "8" && g28a.val === 8, "Narrow width (remRight=13) must penalize '10' and select sub-threshold '8'");
+
+  // 28b. Signal 2: Partial/soft dealer score badge hints (tensDigit / onesDigit) narrow and pick exact single-digit rank
+  const g28b = Engine.guessMissingDealerCard(["10", "2"], {
+    badgeHint: { total: null, conf: 0.62, tensDigit: 1, tensConf: 0.72, onesDigit: 8, onesConf: 0.65 },
+  });
+  assert(g28b && g28b.rank === "6" && g28b.val === 6, "Soft badge hint (tens=1, ones=8) on dealer 12 must guess '6' (12 + 6 = 18)");
+
+  // 28c. Signal 3: Physical felt sightings pick a spotted non-10 card that satisfies stopping rules
+  const g28c = Engine.guessMissingDealerCard(["10", "3"], {
+    feltSightings: [{ rank: "5", val: 5, conf: 0.74 }],
+  });
+  assert(g28c && g28c.rank === "5" && g28c.val === 5, "Felt sighting of '5' on dealer 13 must guess '5' (13 + 5 = 18)");
+
+  // 28d. Signal 4 & 5: Live shoe depletion + stratified roundSeed samples across all valid ranks (2..9, A, 10)
+  // On dealer ['10', '6'] (hard 16), any rank A, 2..9, 10 reaches >= 17 (17..26).
+  // Across 40 roundSeeds with a balanced 8-deck shoe, verify that multiple distinct single-digit ranks AND 'A' AND '10' are guessed.
+  const fullShoe = [128, 32, 32, 32, 32, 32, 32, 32, 32, 32];
+  const seenRanks = new Set();
+  for (let seed = 1; seed <= 60; seed++) {
+    const g = Engine.guessMissingDealerCard(["10", "6"], {
+      shoeRem: fullShoe,
+      roundSeed: seed,
+    });
+    assert(g, "Must return a valid guess for every roundSeed");
+    seenRanks.add(g.rank);
+  }
+  for (const r of ["10", "A", "2", "3", "4", "5", "6", "7", "8", "9"]) {
+    assert(seenRanks.has(r), `Stratified shoe sampling on hard 16 must be able to guess rank '${r}' (seen: ${Array.from(seenRanks).join(",")})`);
+  }
+
+  // Also verify shoe depletion: if all 10-value cards are depleted (shoeRem[0] = 0) and only '4' remains in shoe, it deterministically guesses '4'
+  const onlyFoursShoe = [0, 0, 0, 0, 12, 0, 0, 0, 0, 0];
+  const gDepleted = Engine.guessMissingDealerCard(["10", "3"], {
+    shoeRem: onlyFoursShoe,
+    roundSeed: 1,
+  });
+  assert(gDepleted && gDepleted.rank === "4" && gDepleted.val === 4, "Depleted shoe with only 4s left must guess '4'");
+
+  // 28e. End-to-end CompanionStateMachine Fallback E with sub-threshold '7' on dealer ['10', 'BACK']
+  const cfg28 = Engine.defaultConfig({
+    anchor_mode: "ipad_split_left",
+    confirm_frames: 1,
+    clear_frames: 2,
+    require_wait_banner: false,
+  });
+  const sm28 = new Engine.CompanionStateMachine(cfg28);
+  const mkC = (rank, val, conf = 0.92) => ({ rank, val, conf, suit: "S", hasPipBody: true, x: 10, y: 10, w: 12, h: 16, hand_index: 0 });
+  sm28.step({ ts: 1, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm28.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mkC("10", 0), mkC("9", 9)],
+    dealer_cards: [mkC("10", 0), { rank: "BACK", val: null, conf: 0.92, suit: null, x: 25, y: 10, w: 12, h: 16, hand_index: 0 }],
+    dealer_sub_cards: [{ rank: "7", val: 7, conf: 0.59, suit: "H", hasPipBody: true, slotIdx: 1, remRight: 13 }],
+    player_hands: { 0: [mkC("10", 0), mkC("9", 9)] },
+    hud_refreshed: true,
+  });
+  const end28 = sm28.step({ ts: 3, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  const guess28 = end28.find((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess");
+  assert(guess28, "CompanionStateMachine must emit educated_guess on incomplete dealer hand");
+  assert.strictEqual(guess28.rankLabel, "7", "CompanionStateMachine must guess '7' from sub-threshold dealer_sub_cards");
+  assert.strictEqual(guess28.val, 7);
+  console.log("   Test 28 PASSED");
+}
+console.log("\nALL 28 ENGINE TESTS PASSED SUCCESSFULLY!");
+
+
 
 
 
