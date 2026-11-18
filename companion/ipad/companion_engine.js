@@ -1433,67 +1433,80 @@
     return [null, bestConf, null];
   }
 
-  function findWhiteCardClusters(roiBgr) {
+  function findWhiteCardClusters(roiBgr, isDealer = false) {
     if (!roiBgr || roiBgr.w === 0 || roiBgr.h === 0) return [];
     const mb = toMinGray(roiBgr);
-    const mask = new Uint8Array(mb.data.length);
-    for (let i = 0; i < mb.data.length; i++) mask[i] = mb.data[i] > 155 ? 1 : 0;
-    const cc = connectedComponentsWithStats(mask, mb.w, mb.h);
-    const raw = [];
-    const caps = [];
 
-    for (let i = 1; i < cc.count; i++) {
-      const [x, y, w, h, area] = cc.stats[i];
-      const fill = area / Math.max(1, w * h);
-      const patch = cropImage(mb, x, y, w, h);
-      let gt160 = 0, gt165 = 0;
-      for (let k = 0; k < patch.data.length; k++) {
-        if (patch.data[k] > 160) gt160++;
-        if (patch.data[k] > 165) gt165++;
-      }
-      if (h < 13 || area < 105) {
-        if (h >= 8 && h <= 24 && w >= 5 && area >= 36 && fill >= 0.25 && gt160 / patch.data.length >= 0.25) {
-          caps.push([x, y, w, h]);
+    const runPass = (maskThr, gt1, gt2) => {
+      const mask = new Uint8Array(mb.data.length);
+      for (let i = 0; i < mb.data.length; i++) mask[i] = mb.data[i] > maskThr ? 1 : 0;
+      const cc = connectedComponentsWithStats(mask, mb.w, mb.h);
+      const raw = [];
+      const caps = [];
+
+      for (let i = 1; i < cc.count; i++) {
+        const [x, y, w, h, area] = cc.stats[i];
+        const fill = area / Math.max(1, w * h);
+        const patch = cropImage(mb, x, y, w, h);
+        let c1 = 0, c2 = 0;
+        for (let k = 0; k < patch.data.length; k++) {
+          if (patch.data[k] > gt1) c1++;
+          if (patch.data[k] > gt2) c2++;
         }
-        continue;
+        if (h < 13 || area < 105) {
+          if (h >= 8 && h <= 24 && w >= 5 && area >= 36 && fill >= 0.25 && c1 / patch.data.length >= 0.25) {
+            caps.push([x, y, w, h]);
+          }
+          continue;
+        }
+        if ((w / Math.max(1, h) > 4.0 && fill < 0.45) || fill < 0.19) continue;
+        if (c2 / patch.data.length < 0.25) continue;
+        raw.push([x, y, w, h]);
       }
-      if ((w / Math.max(1, h) > 4.0 && fill < 0.45) || fill < 0.19) continue;
-      if (gt165 / patch.data.length < 0.25) continue;
-      raw.push([x, y, w, h]);
-    }
-    if (!raw.length) return [];
-    raw.sort((a, b) => a[0] - b[0]);
-    const merged = [raw[0]];
-    for (let i = 1; i < raw.length; i++) {
-      const [x, y, w, h] = raw[i];
-      const [px, py, pw, ph] = merged[merged.length - 1];
-      const gap = x - (px + pw);
-      const vOv = Math.min(py + ph, y + h) - Math.max(py, y);
-      if (gap <= 2 && vOv >= Math.round(0.55 * Math.min(ph, h))) {
-        const nx = Math.min(px, x);
-        const ny = Math.min(py, y);
-        const nr = Math.max(px + pw, x + w);
-        const nb = Math.max(py + ph, y + h);
-        merged[merged.length - 1] = [nx, ny, nr - nx, nb - ny];
-      } else {
-        merged.push([x, y, w, h]);
-      }
-    }
-    for (const [cx, cy, cw, ch] of caps) {
-      for (let idx = 0; idx < merged.length; idx++) {
-        const [px, py, pw, ph] = merged[idx];
-        const gap = px - (cx + cw);
-        if (gap >= -2 && gap <= 4 && Math.abs(cy - py) <= 5 && ch < ph) {
-          const nx = Math.min(cx, px);
-          const ny = Math.min(cy, py);
-          const nr = Math.max(cx + cw, px + pw);
-          const nb = Math.max(cy + ch, py + ph);
-          merged[idx] = [nx, ny, nr - nx, nb - ny];
-          break;
+      if (!raw.length) return [];
+      raw.sort((a, b) => a[0] - b[0]);
+      const merged = [raw[0]];
+      for (let i = 1; i < raw.length; i++) {
+        const [x, y, w, h] = raw[i];
+        const [px, py, pw, ph] = merged[merged.length - 1];
+        const gap = x - (px + pw);
+        const vOv = Math.min(py + ph, y + h) - Math.max(py, y);
+        if (gap <= 2 && vOv >= Math.round(0.55 * Math.min(ph, h))) {
+          const nx = Math.min(px, x);
+          const ny = Math.min(py, y);
+          const nr = Math.max(px + pw, x + w);
+          const nb = Math.max(py + ph, y + h);
+          merged[merged.length - 1] = [nx, ny, nr - nx, nb - ny];
+        } else {
+          merged.push([x, y, w, h]);
         }
       }
+      for (const [cx, cy, cw, ch] of caps) {
+        for (let idx = 0; idx < merged.length; idx++) {
+          const [px, py, pw, ph] = merged[idx];
+          const gap = px - (cx + cw);
+          if (gap >= -2 && gap <= 4 && Math.abs(cy - py) <= 5 && ch < ph) {
+            const nx = Math.min(cx, px);
+            const ny = Math.min(cy, py);
+            const nr = Math.max(cx + cw, px + pw);
+            const nb = Math.max(cy + ch, py + ph);
+            merged[idx] = [nx, ny, nr - nx, nb - ny];
+            break;
+          }
+        }
+      }
+      return merged;
+    };
+
+    const primary = runPass(155, 160, 165);
+    if (!isDealer) return primary;
+    const totalW = primary.reduce((s, c) => s + c[2], 0);
+    if (!primary.length || totalW < roiBgr.w * 0.28) {
+      const relaxed = runPass(142, 145, 148);
+      const relW = relaxed.reduce((s, c) => s + c[2], 0);
+      if (relW > totalW) return relaxed;
     }
-    return merged;
+    return primary;
   }
 
   function hasRedBackSignature(bgrPatch) {
@@ -1568,12 +1581,13 @@
     let clusterBgr = cropImage(roiBgr, cx, cy, cw, ch);
     if (clusterBgr.w === 0 || clusterBgr.h === 0 || !rankTemplates.length) return [[], false];
 
+    const rowWhThr = isDealer ? 142 : 155;
     const clMb = toMinGray(clusterBgr);
     const whiteRows = [];
     for (let y = 0; y < clMb.h; y++) {
       let wCnt = 0;
       for (let x = 0; x < clMb.w; x++) {
-        if (clMb.data[y * clMb.w + x] > 155) wCnt++;
+        if (clMb.data[y * clMb.w + x] > rowWhThr) wCnt++;
       }
       if (wCnt / clMb.w >= 0.12) whiteRows.push(y);
     }
@@ -1605,7 +1619,7 @@
     if (effRight < 14) return [[], clusterHasBack];
 
     const topPrep = prepareSourceForMatch(normTop, false);
-    const minTail = !clusterHasBack && !edgeClipped ? 14 : 12;
+    const minTail = isDealer ? 11 : (!clusterHasBack && !edgeClipped ? 14 : 12);
     const peaks = [];
     for (const tpl of rankTemplates) {
       for (const tsc of [0.90, 0.96, 1.0, 1.05, 1.10]) {
@@ -1635,9 +1649,10 @@
                 if (v < 120) lt120++;
               }
             }
-            if (pMax - pMin < 70) continue;
+            const isDealerTail = isDealer && xPos >= cwNorm - 24;
+            if (pMax - pMin < (isDealerTail ? 58 : 70)) continue;
             const nPatch = sw * sh;
-            if (gt158 / nPatch < 0.26 || lt120 / nPatch < 0.07) continue;
+            if (gt158 / nPatch < (isDealerTail ? 0.20 : 0.26) || lt120 / nPatch < (isDealerTail ? 0.06 : 0.07)) continue;
             const prio = conf + (tpl.rank === "10" ? 0.015 : 0.0);
             peaks.push([
               prio,
@@ -1660,6 +1675,7 @@
     const out = [];
     for (const d of kept) {
       const [suit, suitConf] = classifySuit(normBgr, d.x, d.w, cwNorm, suitTemplates);
+      let hasPipBody = false;
       if (suitTemplates && suitTemplates.length) {
         const sx0 = Math.max(0, d.x - 2);
         const sx1 = Math.min(cwNorm, d.x + Math.max(d.w, 14) + 2);
@@ -1670,12 +1686,12 @@
           if (sz.data[k] < 145) lt145++;
           if (sz.data[k] < 140) lt140++;
         }
-        const hasPipBody = sz.data.length > 0 && gt155 / sz.data.length >= 0.30 && lt145 >= 5;
+        hasPipBody = sz.data.length > 0 && gt155 / sz.data.length >= 0.30 && lt145 >= 5;
         const hasBadgeOcclusion = !isDealer && d.x <= 9 && sz.data.length > 0 && lt140 / sz.data.length >= 0.25 && d.conf >= Math.max(0.75, floorConf);
         if (!clusterHasBack && !edgeClipped && !hasBadgeOcclusion) {
           const remRight = effRight - d.x;
-          if (remRight < 15 && (d.conf < Math.max(isDealer ? 0.78 : 0.84, isDealer ? 0.78 : minHudConf) || (!suit && !hasPipBody))) continue;
-          if (remRight < 22 && d.conf < Math.max(0.75, minHudConf - 0.09)) continue;
+          if (remRight < 15 && (d.conf < Math.max(isDealer ? 0.74 : 0.84, isDealer ? minHudConf - 0.10 : minHudConf) || (!suit && !hasPipBody))) continue;
+          if (remRight < 22 && d.conf < Math.max(isDealer ? 0.72 : 0.75, minHudConf - (isDealer ? 0.12 : 0.09))) continue;
         }
         const highConfPipOk = hasPipBody && d.conf >= Math.max(isDealer ? 0.75 : 0.86, isDealer ? 0.75 : minHudConf);
         if (!suit && !hasBadgeOcclusion && !highConfPipOk && (!hasPipBody || suitConf < 0.42 || d.conf < Math.max(0.82, minHudConf - 0.02))) {
@@ -1694,6 +1710,7 @@
         w: Math.max(4, Math.round(d.w / sc)),
         h: Math.max(4, Math.round(d.h / sc)),
         suit,
+        hasPipBody: !!hasPipBody,
         hand_index: 0,
       });
     }
@@ -2182,6 +2199,45 @@
     return matches.length === 1 ? matches[0] : null;
   }
 
+  function deduceMissingDealerPair(dCommittedRanks, badgeTotal) {
+    if (!Array.isArray(dCommittedRanks) || !dCommittedRanks.length) return null;
+    if (!Number.isInteger(badgeTotal) || badgeTotal < 17 || badgeTotal > 26) return null;
+    const [curTotal] = evalBjRanks(dCommittedRanks);
+    if (curTotal >= 17 || curTotal === badgeTotal) return null;
+    // If a single card can reach badgeTotal, defer to single-card deduction
+    if (deduceMissingDealerCard(dCommittedRanks, badgeTotal)) return null;
+    const candidates = [
+      { rank: "10", val: 0 },
+      { rank: "A", val: 1 },
+      { rank: "2", val: 2 },
+      { rank: "3", val: 3 },
+      { rank: "4", val: 4 },
+      { rank: "5", val: 5 },
+      { rank: "6", val: 6 },
+      { rank: "7", val: 7 },
+      { rank: "8", val: 8 },
+      { rank: "9", val: 9 },
+    ];
+    let bestPair = null;
+    let bestScore = -1;
+    for (const c1 of candidates) {
+      const [midTot] = evalBjRanks([...dCommittedRanks, c1.rank]);
+      // Dealer must still be < 17 after drawing c1 in order to draw c2
+      if (midTot >= 17) continue;
+      for (const c2 of candidates) {
+        const [endTot] = evalBjRanks([...dCommittedRanks, c1.rank, c2.rank]);
+        if (endTot !== badgeTotal) continue;
+        // 10-value cards make up 4/13 (30.8%) of the shoe; prefer pairs where the final bust/pat card is 10
+        const score = (c2.rank === "10" ? 4 : 1) * (c1.rank === "10" ? 4 : 1);
+        if (score > bestScore) {
+          bestScore = score;
+          bestPair = [c1, c2];
+        }
+      }
+    }
+    return bestPair;
+  }
+
   function guessMissingDealerCard(dCommittedRanks) {
     if (!Array.isArray(dCommittedRanks) || !dCommittedRanks.length) return null;
     const [dTot, dSoft] = evalBjRanks(dCommittedRanks);
@@ -2344,7 +2400,7 @@
         return [[], {}, false, []];
       }
       const floorConf = Math.max(0.68, this.cfg.min_hud_confidence - 0.10);
-      const clusters = findWhiteCardClusters(roiImg);
+      const clusters = findWhiteCardClusters(roiImg, isDealer);
       if (!clusters.length) return [[], {}, false, []];
 
       const clusterHits = [];
@@ -2423,7 +2479,7 @@
       return [allP, hands, Object.keys(hands).length >= 2, clusters];
     }
 
-    processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, ts = null }) {
+    processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, ts = null, forceDealerScan = false }) {
       const now = ts !== null ? ts : performance.now() / 1000;
       const REFRESH_PERIOD = 8;
       const HUD_REFRESH_PERIOD = 4;
@@ -2447,8 +2503,8 @@
       const dChanged = hudRoiSigChanged(dSig, this._lastDSig, 1);
       const dDiff = roiSigDiff(dSig, this._lastDSig);
       let dCards, dBadgeTotal, dBadgeConf;
-      // Dealer strip is small/cheap and holds the few cards that matter: only reuse the cache when pixels are identical.
-      if (this._lastDSig && !dChanged && dDiff === 0) {
+      // Dealer strip is small/cheap and holds the few cards that matter: only reuse the cache when pixels are identical and not force-scanning.
+      if (!forceDealerScan && this._lastDSig && !dChanged && dDiff === 0) {
         [dCards, dBadgeTotal, dBadgeConf] = this._cachedD;
       } else {
         this._lastDSig = dSig;
@@ -2738,7 +2794,9 @@
         if (rKey === this._candRanks && this._candCount > cnt) cnt = this._candCount;
         this._slotCands.set(idx, { rank: det.rank, cnt, det });
         if (this.fastTailConfirm && this.committedRanks.length) {
-          this._pendingTail.set(idx, { det, missed: 0 });
+          const prevPend = this._pendingTail.get(idx);
+          const bestDet = !prevPend || (det.conf || 0) >= (prevPend.det.conf || 0) ? det : prevPend.det;
+          this._pendingTail.set(idx, { det: bestDet, missed: 0 });
         }
       }
 
@@ -2749,7 +2807,7 @@
         if (this.fastTailConfirm && this.committedRanks.length) {
           for (const [idx, entry] of Array.from(this._pendingTail.entries())) {
             if (!seenSlots.has(idx)) {
-              if (entry.missed + 1 >= 4) this._pendingTail.delete(idx);
+              if (entry.missed + 1 >= 30) this._pendingTail.delete(idx);
               else this._pendingTail.set(idx, { det: entry.det, missed: entry.missed + 1 });
             }
           }
@@ -2758,7 +2816,7 @@
         // Trailing uncommitted card faded early before committed prefix: keep in _pendingTail for wipe rescue
         for (const [idx, entry] of Array.from(this._pendingTail.entries())) {
           if (!seenSlots.has(idx)) {
-            if (entry.missed + 1 >= 5) this._pendingTail.delete(idx);
+            if (entry.missed + 1 >= 30) this._pendingTail.delete(idx);
             else this._pendingTail.set(idx, { det: entry.det, missed: entry.missed + 1 });
           }
         }
@@ -2769,7 +2827,10 @@
       for (let idx = 0; idx < Math.min(this.committedRanks.length, detections.length); idx++) {
         if (this.committedRanks[idx] === "BACK" && this._slotCands.has(idx)) {
           const { rank, cnt, det } = this._slotCands.get(idx);
-          const crispTail = this.fastTailConfirm && this.committedRanks.length >= 1 && (det.conf >= Math.max(0.84, this.fastTailMinConf) || (det.suit && det.conf >= 0.80));
+          const crispTail =
+            this.fastTailConfirm &&
+            this.committedRanks.length >= 1 &&
+            (det.conf >= 0.80 || (det.suit && det.conf >= 0.76) || (det.hasPipBody && det.conf >= 0.78));
           const fastOk = this.fastTailConfirm && (det.conf >= Math.min(0.82, this.fastTailMinConf) || (det.suit && det.conf >= 0.78));
           const req = crispTail ? 1 : (fastOk ? Math.min(this.confirmFrames, 2) : this.confirmFrames);
           if (cnt >= req) {
@@ -2788,7 +2849,11 @@
         }
         if (!this._slotCands.has(idx)) break;
         const { rank, cnt, det } = this._slotCands.get(idx);
-        const crispTail = this.fastTailConfirm && idx >= 1 && this.committedRanks.length >= 1 && (det.conf >= Math.max(0.84, this.fastTailMinConf) || (det.suit && det.conf >= 0.80));
+        const crispTail =
+          this.fastTailConfirm &&
+          idx >= 1 &&
+          this.committedRanks.length >= 1 &&
+          (det.conf >= 0.80 || (det.suit && det.conf >= 0.76) || (det.hasPipBody && det.conf >= 0.78));
         const useFast = (this.fastTailConfirm && idx >= 1) || (this.fastInitialDeal && idx < 2);
         const fastOk = useFast && (det.conf >= (this.fastTailConfirm ? Math.min(0.82, this.fastTailMinConf) : this.fastTailMinConf) || (det.suit && det.conf >= 0.80));
         const req = crispTail ? 1 : (fastOk ? Math.min(this.confirmFrames, 2) : this.confirmFrames);
@@ -2806,7 +2871,7 @@
       if (!this.committedRanks.length) return [];
       const merged = new Map();
       for (const [idx, entry] of this._pendingTail.entries()) {
-        if (entry.missed <= 4) merged.set(idx, entry.det);
+        if (entry.missed <= 30) merged.set(idx, entry.det);
       }
       const fallbackSeq = this._candDets.length >= this.committedRanks.length ? this._candDets : this._wipeDets;
       for (let idx = 0; idx < fallbackSeq.length; idx++) {
@@ -2898,6 +2963,7 @@
       this._bestDealerTail = new Map();
       this._lastDealerBadgeTotal = null;
       this._lastDealerBadgeConf = 0.0;
+      this._dealerBadgeHistory = [];
       this._reconcileSig = null;
       this._reconcileFrames = 0;
       this._reconcileSince = 0.0;
@@ -2999,6 +3065,13 @@
       if (Number.isInteger(bTot) && bTot >= 4 && bTot <= 26 && bConf >= 0.56) {
         this._lastDealerBadgeTotal = bTot;
         this._lastDealerBadgeConf = bConf;
+        if (!this._dealerBadgeHistory) this._dealerBadgeHistory = [];
+        const lastH = this._dealerBadgeHistory[this._dealerBadgeHistory.length - 1];
+        if (!lastH || lastH.total !== bTot) {
+          this._dealerBadgeHistory.push({ total: bTot, conf: bConf });
+        } else if (bConf > lastH.conf) {
+          lastH.conf = bConf;
+        }
       }
       const dList = obs.dealer_cards || [];
       for (let idx = 0; idx < dList.length; idx++) {
@@ -3115,25 +3188,45 @@
         }
       }
 
-      // Fallback D: deduce missing final dealer card rank from Dealer Score Badge total
-      if (isDealerStillIncomplete() && this._lastDealerBadgeTotal !== null) {
-        const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
-        const deduced = deduceMissingDealerCard(dCommBefore, this._lastDealerBadgeTotal);
-        if (deduced) {
+      // Fallback D: deduce missing dealer card(s) from Dealer Score Badge history or 2-card pair sum
+      if (isDealerStillIncomplete()) {
+        const commitDeducedCard = (card, confVal) => {
           const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
           const slotIdx = backIdx >= 0 ? backIdx : this.dDebouncer.committedRanks.length;
           if (backIdx >= 0) {
-            this.dDebouncer.committedRanks[backIdx] = deduced.rank;
+            this.dDebouncer.committedRanks[backIdx] = card.rank;
           } else {
-            this.dDebouncer.committedRanks.push(deduced.rank);
+            this.dDebouncer.committedRanks.push(card.rank);
           }
           const deducedDet = {
-            rank: deduced.rank,
-            val: deduced.val,
-            conf: Math.max(0.78, this._lastDealerBadgeConf || 0.85),
+            rank: card.rank,
+            val: card.val,
+            conf: Math.max(0.78, confVal || 0.85),
             suit: null,
           };
           this._emitDealerCards([[slotIdx, deducedDet]], events, "badge_deduced");
+        };
+
+        const badgeSteps = Array.isArray(this._dealerBadgeHistory) && this._dealerBadgeHistory.length
+          ? this._dealerBadgeHistory
+          : (this._lastDealerBadgeTotal !== null ? [{ total: this._lastDealerBadgeTotal, conf: this._lastDealerBadgeConf }] : []);
+
+        for (const step of badgeSteps) {
+          if (!isDealerStillIncomplete()) break;
+          const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
+          const deduced = deduceMissingDealerCard(dCommBefore, step.total);
+          if (deduced) {
+            commitDeducedCard(deduced, step.conf);
+          }
+        }
+
+        if (isDealerStillIncomplete() && this._lastDealerBadgeTotal !== null) {
+          const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
+          const pair = deduceMissingDealerPair(dCommBefore, this._lastDealerBadgeTotal);
+          if (pair && pair.length === 2) {
+            commitDeducedCard(pair[0], this._lastDealerBadgeConf);
+            commitDeducedCard(pair[1], this._lastDealerBadgeConf);
+          }
         }
       }
 
@@ -4331,9 +4424,9 @@
         }
       };
 
-      const effFps = Math.max(15, Number(this.cfg.fps) || 15);
+      const effFps = Math.max(24, Number(this.cfg.burst_fps) || Number(this.cfg.fps) || 24);
       const intervalMs = Math.max(33, Math.round(1000 / effFps));
-      this._loopTimer = setInterval(() => {
+      const pollOnce = () => {
         if (this._busy || this.clients.size === 0) return;
         this._busy = true;
         const xhr = new XMLHttpRequest();
@@ -4345,6 +4438,7 @@
           this._busy = false;
         };
         xhr.onload = () => {
+          let scheduleFollowUp = false;
           try {
             if (xhr.status === 0) {
               noteXhrError();
@@ -4410,6 +4504,10 @@
               }
             }
 
+            if (decodedNewFrame && ["DEALING", "PLAYER_TURN", "DEALER_TURN"].includes(this.sm.state)) {
+              scheduleFollowUp = true;
+            }
+
             if (!decodedNewFrame) {
               const frameFresh = this.latestRawFrame !== null && (now - this.latestFrameTs) < 4.5;
               if (hdrTransport === "loopback_waiting" || (hdrTransport === "loopback" && hdrActive === "1")) {
@@ -4442,6 +4540,9 @@
             // Silently ignore malformed or stale packet
           } finally {
             done();
+            if (scheduleFollowUp && this._loopTimer) {
+              setTimeout(pollOnce, 4);
+            }
           }
         };
         xhr.onerror = () => {
@@ -4456,7 +4557,8 @@
           noteXhrError();
           done();
         }
-      }, intervalMs);
+      };
+      this._loopTimer = setInterval(pollOnce, intervalMs);
     }
 
     stopNativePolling() {
@@ -4564,6 +4666,10 @@
       const placeBetsImg = cropNorm(anchorImg, this.cfg.place_bets_roi);
       const shuffleImg = cropNorm(anchorImg, this.cfg.shuffle_roi);
 
+      const forceDealerScan =
+        this.sm.state === "DEALER_TURN" ||
+        (this.sm.dDebouncer && this.sm.dDebouncer.committedRanks.includes("BACK"));
+
       const obs = this.detector.processCrops({
         playerImg,
         dealerImg,
@@ -4571,6 +4677,7 @@
         bannerImg,
         placeBetsImg,
         ts: now,
+        forceDealerScan,
       });
 
       const events = this.sm.step(obs);
@@ -5390,6 +5497,7 @@
     detectClusterCards,
     detectDealerBadgeTotal,
     deduceMissingDealerCard,
+    deduceMissingDealerPair,
     guessMissingDealerCard,
     computeRoiSignature,
     roiSigDiff,

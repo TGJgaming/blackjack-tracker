@@ -252,7 +252,7 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
     private var seq: UInt32 = 0
     private var frameCount: UInt64 = 0
     private var lastFrameTs: CFTimeInterval = 0
-    private let minFrameInterval: CFTimeInterval = 1.0 / 12.0
+    private let minFrameInterval: CFTimeInterval = 1.0 / 20.0
     private let duplicateHeartbeatInterval: CFTimeInterval = 0.45
     private var hasSentFrame = false
     private var lastSentFrameHash: UInt64 = 0
@@ -280,11 +280,34 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
         }
     }
 
-    private static func computeStridedPixelHash(_ raw: UnsafeRawPointer, byteCount: Int) -> UInt64 {
+    private static func computeStridedPixelHash(_ raw: UnsafeRawPointer, width: Int, height: Int, byteCount: Int) -> UInt64 {
         let pixelCount = byteCount / 4
-        guard pixelCount > 0 else { return 0 }
-        let stride = max(1, pixelCount / 8192)
+        guard pixelCount > 0, width > 0, height > 0 else { return 0 }
         var h: UInt64 = 14695981039346656037
+        // 1. Dense sample over the left Split View game viewport (x < 68% width, y in 12%..88% height)
+        // so a small 13x15 dealer rank glyph or 5x7 badge digit change never falls between sample points.
+        let xLim = max(1, min(width, Int(Double(width) * 0.68)))
+        let y0 = max(0, min(height - 1, Int(Double(height) * 0.12)))
+        let y1 = max(y0 + 1, min(height, Int(Double(height) * 0.88)))
+        let yStep = max(1, (y1 - y0) / 96)
+        let xStep = max(1, xLim / 96)
+        var y = y0
+        while y < y1 {
+            let rowBase = y * width
+            var x = 0
+            while x < xLim {
+                let idx = rowBase + x
+                if idx < pixelCount {
+                    let word = raw.loadUnaligned(fromByteOffset: idx * 4, as: UInt32.self)
+                    h ^= UInt64(word)
+                    h &*= 1099511628211
+                }
+                x += xStep
+            }
+            y += yStep
+        }
+        // 2. Coarse full-frame sweep for overall screen changes
+        let stride = max(1, pixelCount / 4096)
         var i = 0
         while i < pixelCount {
             let word = raw.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)
@@ -451,7 +474,7 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
                     colorSpace: srgbColorSpace
                 )
 
-                let frameHash = Self.computeStridedPixelHash(pixelPtr, byteCount: rgbaCount)
+                let frameHash = Self.computeStridedPixelHash(pixelPtr, width: dstW, height: dstH, byteCount: rgbaCount)
                 if hasSentFrame && !metaChanged && (dstW, dstH) == lastSentDims && frameHash == lastSentFrameHash && (now - lastSentFrameTs) < duplicateHeartbeatInterval {
                     skippedDuplicate = true
                     return

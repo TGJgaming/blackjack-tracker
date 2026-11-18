@@ -1629,6 +1629,95 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   console.log("   Test 26 PASSED");
 }
 
+// 27. Single-frame dealer card flash capture, 30-frame _pendingTail retention, multi-step badge history & 2-card badge deduction
+{
+  console.log("27. Testing single-frame dealer card flash capture, 30-frame _pendingTail retention & multi-step/pair badge deduction...");
+  // 27a. 1-frame dealer flash with conf=0.79 and hasPipBody=true commits immediately in 1 frame
+  const db27 = new Engine.SequenceDebouncer(2, 4, true, 0.84);
+  const mkD = (rank, val, conf, suit = null, hasPipBody = false) => ({
+    rank,
+    val,
+    conf,
+    suit,
+    hasPipBody,
+    x: 10,
+    y: 10,
+    w: 12,
+    h: 16,
+    hand_index: 0,
+  });
+  db27.update([mkD("7", 7, 0.92, "S", true), { rank: "BACK", val: null, conf: 0.92, suit: null, x: 25, y: 10, w: 12, h: 16, hand_index: 0 }]);
+  db27.update([mkD("7", 7, 0.92, "S", true), { rank: "BACK", val: null, conf: 0.92, suit: null, x: 25, y: 10, w: 12, h: 16, hand_index: 0 }]);
+  assert.deepStrictEqual(db27.committedRanks, ["7", "BACK"]);
+  // 1-frame hole flip at conf=0.79 (below 0.84, no suit, but hasPipBody=true) -> must commit on that single frame
+  const [em27a] = db27.update([mkD("7", 7, 0.92, "S", true), mkD("8", 8, 0.79, null, true)]);
+  assert.strictEqual(em27a.length, 1, "1-frame dealer flash with conf=0.79 & hasPipBody=true must commit immediately");
+  assert.strictEqual(em27a[0][1].rank, "8");
+  assert.deepStrictEqual(db27.committedRanks, ["7", "8"]);
+
+  // 27b. Sub-0.78 1-frame flash (conf=0.785, no suit/pip) followed by 15 frames where the 3rd card faded early must be retained in _pendingTail and rescued on wipe
+  db27.update([mkD("7", 7, 0.92, "S", true), mkD("8", 8, 0.91, "H", true), mkD("10", 0, 0.785, null, false)]);
+  assert.strictEqual(db27.committedRanks.length, 2, "Sub-crisp 1-frame detection waits in _pendingTail");
+  for (let i = 0; i < 15; i++) {
+    db27.update([mkD("7", 7, 0.92, "S", true), mkD("8", 8, 0.91, "H", true)]);
+  }
+  const rescued27b = db27.flushPendingOnWipe(0.78);
+  assert.strictEqual(rescued27b.length, 1, "_pendingTail must survive 15 pause frames (up to 30) and rescue on wipe");
+  assert.strictEqual(rescued27b[0][1].rank, "10");
+
+  // 27c. Multi-step badge history ([7] -> badge 15 -> badge 25) deduces both missed dealer cards ["8", "10"]
+  const cfg27 = Engine.defaultConfig({
+    anchor_mode: "ipad_split_left",
+    confirm_frames: 1,
+    clear_frames: 2,
+    require_wait_banner: false,
+  });
+  const sm27c = new Engine.CompanionStateMachine(cfg27);
+  sm27c.step({ ts: 1, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm27c.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mkD("10", 0, 0.94, "S", true), mkD("9", 9, 0.94, "H", true)],
+    dealer_cards: [mkD("7", 7, 0.94, "C", true)],
+    player_hands: { 0: [mkD("10", 0, 0.94, "S", true), mkD("9", 9, 0.94, "H", true)] },
+    dealer_badge_total: 7,
+    dealer_badge_conf: 0.88,
+    hud_refreshed: true,
+  });
+  // Intermediate frame: badge reads 15 (7 + 8), card flash missed
+  sm27c.step({
+    ts: 3,
+    banner_state: "",
+    player_cards: [mkD("10", 0, 0.94, "S", true), mkD("9", 9, 0.94, "H", true)],
+    dealer_cards: [mkD("7", 7, 0.94, "C", true)],
+    player_hands: { 0: [mkD("10", 0, 0.94, "S", true), mkD("9", 9, 0.94, "H", true)] },
+    dealer_badge_total: 15,
+    dealer_badge_conf: 0.86,
+    hud_refreshed: true,
+  });
+  // Final frame before wipe: badge reads 25 (15 + 10), card flash missed
+  sm27c.step({
+    ts: 4,
+    banner_state: "",
+    player_cards: [mkD("10", 0, 0.94, "S", true), mkD("9", 9, 0.94, "H", true)],
+    dealer_cards: [mkD("7", 7, 0.94, "C", true)],
+    player_hands: { 0: [mkD("10", 0, 0.94, "S", true), mkD("9", 9, 0.94, "H", true)] },
+    dealer_badge_total: 25,
+    dealer_badge_conf: 0.87,
+    hud_refreshed: true,
+  });
+  const end27c = sm27c.step({ ts: 5, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  const ded27c = end27c.filter((e) => e.type === "card" && e.target === "D" && e.source === "badge_deduced");
+  assert.deepStrictEqual(ded27c.map((e) => e.rankLabel), ["8", "10"], "Multi-step badge history [7, 15, 25] must deduce both '8' and '10'");
+
+  // 27d. Direct 2-card badge pair deduction when only upcard ['7'] and final bust badge 22 are seen
+  const pair27d = Engine.deduceMissingDealerPair(["7"], 22);
+  assert(pair27d && pair27d.length === 2, "deduceMissingDealerPair(['7'], 22) must return a 2-card pair");
+  assert.deepStrictEqual(pair27d.map((c) => c.rank), ["5", "10"], "Most probable 2-card sequence from 7 to 22 is ['5', '10']");
+  console.log("   Test 27 PASSED");
+}
+
+
 
 
 
