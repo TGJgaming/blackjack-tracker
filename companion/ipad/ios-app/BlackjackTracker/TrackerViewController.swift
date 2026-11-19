@@ -21,6 +21,7 @@ final class LoopbackFrameReceiver {
     private let stateLock = NSLock()
 
     private var listener: NWListener?
+    private var listenerIsWaiting = false
     private var activeSession: Session?
     private var latestPacket: Data?
     private var latestFrameMeta: (rawW: Int, rawH: Int, rawOrientation: UInt32, dstW: Int, dstH: Int)?
@@ -35,7 +36,17 @@ final class LoopbackFrameReceiver {
     }
 
     private func _startOnQueue(port: UInt16) {
-        guard listener == nil, let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+        if let existing = listener {
+            if listenerIsWaiting {
+                logger.notice("Loopback frame receiver stuck in .waiting; restarting listener")
+                existing.cancel()
+                listener = nil
+                listenerIsWaiting = false
+            } else {
+                return
+            }
+        }
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         let tcpOpts = NWProtocolTCP.Options()
         tcpOpts.noDelay = true
         let params = NWParameters(tls: nil, tcp: tcpOpts)
@@ -49,12 +60,21 @@ final class LoopbackFrameReceiver {
                 guard let self = self, let newListener = newListener else { return }
                 switch state {
                 case .ready:
+                    if self.listener === newListener {
+                        self.listenerIsWaiting = false
+                    }
                     self.logger.info("Loopback frame receiver listening on 127.0.0.1:\(port)")
+                case .waiting(let err):
+                    if self.listener === newListener {
+                        self.listenerIsWaiting = true
+                    }
+                    self.logger.notice("Loopback frame receiver waiting: \(String(describing: err), privacy: .public)")
                 case .failed(let err):
                     self.logger.error("Loopback frame receiver failed: \(String(describing: err), privacy: .public)")
                     newListener.cancel()
                     if self.listener === newListener {
                         self.listener = nil
+                        self.listenerIsWaiting = false
                         self.queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                             self?._startOnQueue(port: port)
                         }
@@ -62,6 +82,7 @@ final class LoopbackFrameReceiver {
                 case .cancelled:
                     if self.listener === newListener {
                         self.listener = nil
+                        self.listenerIsWaiting = false
                     }
                 default:
                     break
@@ -247,6 +268,7 @@ final class LoopbackFrameReceiver {
 final class CompanionSchemeHandler: NSObject, WKURLSchemeHandler {
     private let logger = Logger(subsystem: "com.tgjgaming.blackjacktracker", category: "SchemeHandler")
     private let lock = NSLock()
+    private let frameReadQueue = DispatchQueue(label: "com.tgjgaming.blackjacktracker.schemeFrameRead", qos: .userInitiated)
     private let loopbackReceiver: LoopbackFrameReceiver
     var broadcastExtensionPresent: Bool = false
 
@@ -301,14 +323,12 @@ final class CompanionSchemeHandler: NSObject, WKURLSchemeHandler {
 
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
         let taskId = ObjectIdentifier(urlSchemeTask)
-        defer {
-            lock.lock()
-            stoppedTaskIds.remove(taskId)
-            lock.unlock()
-        }
 
         guard let url = urlSchemeTask.request.url else {
-            if !isTaskStopped(urlSchemeTask) {
+            lock.lock()
+            let stopped = stoppedTaskIds.remove(taskId) != nil
+            lock.unlock()
+            if !stopped {
                 urlSchemeTask.didFailWithError(URLError(.badURL))
             }
             return
@@ -325,82 +345,123 @@ final class CompanionSchemeHandler: NSObject, WKURLSchemeHandler {
                 clientLastSeq = sinceVal
             }
 
-            let loopbackState = loopbackReceiver.latestState()
-            var selectedPacket = loopbackState.packet
-            var transport = (selectedPacket != nil) ? "loopback" : (loopbackState.broadcastActive ? "loopback_waiting" : "idle")
-            var activeFlag = loopbackState.broadcastActive
+            let broadcastExtPresent = self.broadcastExtensionPresent
+            let appGroupAvailable = (self.appGroupId != nil)
 
-            if selectedPacket == nil, appGroupId != nil {
-                if ring == nil {
-                    ring = SharedFrameRing(isWriter: false)
-                    if let ring = ring, !loggedRingReady {
-                        loggedRingReady = true
-                        logger.info("Connected SharedFrameRing reader: \(ring.storageDescription, privacy: .public)")
+            frameReadQueue.async { [weak self] in
+                guard let self = self else { return }
+                if self.isTaskStopped(urlSchemeTask) {
+                    self.lock.lock()
+                    self.stoppedTaskIds.remove(taskId)
+                    self.lock.unlock()
+                    return
+                }
+
+                let loopbackState = self.loopbackReceiver.latestState()
+                var selectedPacket = loopbackState.packet
+                var transport = (selectedPacket != nil) ? "loopback" : (loopbackState.broadcastActive ? "loopback_waiting" : "idle")
+                var activeFlag = loopbackState.broadcastActive
+                var ringSeqUnchanged = false
+
+                if selectedPacket == nil, appGroupAvailable {
+                    if self.ring == nil {
+                        self.ring = SharedFrameRing(isWriter: false)
+                        if let ring = self.ring, !self.loggedRingReady {
+                            self.loggedRingReady = true
+                            self.logger.info("Connected SharedFrameRing reader: \(ring.storageDescription, privacy: .public)")
+                        }
+                    }
+                    if let ring = self.ring {
+                        let res = ring.readLatestPacket(sinceSeq: clientLastSeq)
+                        if res.isActive {
+                            transport = "appgroup"
+                            activeFlag = true
+                            if let data = res.data {
+                                selectedPacket = data
+                            } else if clientLastSeq != 0 && res.seq == clientLastSeq {
+                                ringSeqUnchanged = true
+                            }
+                        }
                     }
                 }
-                if let ringPacket = ring?.readLatestPacket() {
-                    selectedPacket = ringPacket
-                    transport = "appgroup"
-                    activeFlag = true
-                }
-            }
 
-            var frameInfoStr = ""
-            if let meta = loopbackState.meta {
-                frameInfoStr = "\(meta.rawW)x\(meta.rawH),ori=\(meta.rawOrientation)->\(meta.dstW)x\(meta.dstH)"
-            } else if let packet = selectedPacket, packet.count >= SharedFrameRing.headerBytes {
-                let pw = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 4))
-                let ph = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 8))
-                frameInfoStr = "\(pw)x\(ph)"
-            }
-
-            let diagHeaders: [String: String] = [
-                "Cache-Control": "no-store",
-                "Access-Control-Allow-Origin": "*",
-                "X-BJ-Transport": transport,
-                "X-BJ-Broadcast-Active": activeFlag ? "1" : "0",
-                "X-BJ-AppGroup-Ok": (appGroupId != nil) ? "1" : "0",
-                "X-BJ-BroadcastExt-Present": broadcastExtensionPresent ? "1" : "0",
-                "X-BJ-Frame-Info": frameInfoStr
-            ]
-
-            if let packet = selectedPacket, packet.count >= SharedFrameRing.headerBytes {
-                let pktSeq = FrameIPCConstants.readUInt32LE(from: packet, offset: 0)
-                let w = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 4))
-                let h = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 8))
-                let dims = (w, h)
-                if dims != loggedFrameDims {
-                    loggedFrameDims = dims
-                    logger.info("Streaming broadcast frame dimensions: \(dims.0)x\(dims.1) (via \(transport, privacy: .public))")
+                var frameInfoStr = ""
+                if let meta = loopbackState.meta {
+                    frameInfoStr = "\(meta.rawW)x\(meta.rawH),ori=\(meta.rawOrientation)->\(meta.dstW)x\(meta.dstH)"
+                } else if let packet = selectedPacket, packet.count >= SharedFrameRing.headerBytes {
+                    let pw = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 4))
+                    let ph = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 8))
+                    frameInfoStr = "\(pw)x\(ph)"
                 }
 
-                if clientLastSeq != 0 && pktSeq == clientLastSeq {
-                    respond(
-                        to: urlSchemeTask,
-                        url: url,
-                        statusCode: 204,
-                        headers: diagHeaders
-                    )
+                let diagHeaders: [String: String] = [
+                    "Cache-Control": "no-store",
+                    "Access-Control-Allow-Origin": "*",
+                    "X-BJ-Transport": transport,
+                    "X-BJ-Broadcast-Active": activeFlag ? "1" : "0",
+                    "X-BJ-AppGroup-Ok": appGroupAvailable ? "1" : "0",
+                    "X-BJ-BroadcastExt-Present": broadcastExtPresent ? "1" : "0",
+                    "X-BJ-Frame-Info": frameInfoStr
+                ]
+
+                let responseStatus: Int
+                let responseHeaders: [String: String]
+                let responseBody: Data?
+
+                if ringSeqUnchanged {
+                    responseStatus = 204
+                    responseHeaders = diagHeaders
+                    responseBody = nil
+                } else if let packet = selectedPacket, packet.count >= SharedFrameRing.headerBytes {
+                    let pktSeq = FrameIPCConstants.readUInt32LE(from: packet, offset: 0)
+                    let w = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 4))
+                    let h = Int(FrameIPCConstants.readUInt32LE(from: packet, offset: 8))
+                    let dims = (w, h)
+                    if dims != self.loggedFrameDims {
+                        self.loggedFrameDims = dims
+                        self.logger.info("Streaming broadcast frame dimensions: \(dims.0)x\(dims.1) (via \(transport, privacy: .public))")
+                    }
+
+                    if clientLastSeq != 0 && pktSeq == clientLastSeq {
+                        responseStatus = 204
+                        responseHeaders = diagHeaders
+                        responseBody = nil
+                    } else {
+                        var headers200 = diagHeaders
+                        headers200["Content-Type"] = "application/octet-stream"
+                        responseStatus = 200
+                        responseHeaders = headers200
+                        responseBody = packet
+                    }
                 } else {
-                    var headers200 = diagHeaders
-                    headers200["Content-Type"] = "application/octet-stream"
-                    respond(
+                    responseStatus = 204
+                    responseHeaders = diagHeaders
+                    responseBody = nil
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    defer {
+                        self.lock.lock()
+                        self.stoppedTaskIds.remove(taskId)
+                        self.lock.unlock()
+                    }
+                    self.respond(
                         to: urlSchemeTask,
                         url: url,
-                        statusCode: 200,
-                        headers: headers200,
-                        body: packet
+                        statusCode: responseStatus,
+                        headers: responseHeaders,
+                        body: responseBody
                     )
                 }
-            } else {
-                respond(
-                    to: urlSchemeTask,
-                    url: url,
-                    statusCode: 204,
-                    headers: diagHeaders
-                )
             }
             return
+        }
+
+        defer {
+            lock.lock()
+            stoppedTaskIds.remove(taskId)
+            lock.unlock()
         }
 
         if scheme == "bjtracker" {
@@ -536,10 +597,22 @@ final class KeepaliveExtensionRelay {
         onStatusChanged?(statusDictionary())
     }
 
+    private var listenerIsWaiting = false
+
     func startIfNeeded(port: UInt16 = 8765) {
         self.port = port
         self.isStopped = false
-        guard listener == nil, let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+        if let existing = listener {
+            if listenerIsWaiting {
+                logger.notice("KeepaliveRelay stuck in .waiting; restarting listener")
+                existing.cancel()
+                listener = nil
+                listenerIsWaiting = false
+            } else {
+                return
+            }
+        }
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         params.preferNoProxies = true
@@ -555,12 +628,21 @@ final class KeepaliveExtensionRelay {
                 guard let self = self, let newListener = newListener else { return }
                 switch state {
                 case .ready:
+                    if self.listener === newListener {
+                        self.listenerIsWaiting = false
+                    }
                     self.logger.info("Loopback WebSocket relay ready on 127.0.0.1:\(port)")
+                case .waiting(let error):
+                    if self.listener === newListener {
+                        self.listenerIsWaiting = true
+                    }
+                    self.logger.notice("KeepaliveRelay waiting: \(String(describing: error), privacy: .public)")
                 case .failed(let error):
                     self.logger.error("KeepaliveRelay failed: \(String(describing: error), privacy: .public)")
                     newListener.cancel()
                     if self.listener === newListener {
                         self.listener = nil
+                        self.listenerIsWaiting = false
                         if !self.isStopped {
                             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                                 guard let self = self, !self.isStopped else { return }
@@ -572,6 +654,7 @@ final class KeepaliveExtensionRelay {
                     self.logger.info("KeepaliveRelay cancelled")
                     if self.listener === newListener {
                         self.listener = nil
+                        self.listenerIsWaiting = false
                     }
                 default:
                     break
@@ -692,13 +775,13 @@ final class KeepaliveExtensionRelay {
         }
     }
 
-    func requestReload(keywords: [String]? = nil, allowActiveFallback: Bool = true, testImmediate: Bool = false) -> String {
+    func requestReload(keywords: [String]? = nil, allowActiveFallback: Bool = false, testImmediate: Bool = false) -> String {
         let targets = extConnections.filter { verifiedIds.contains(ObjectIdentifier($0)) }
         let cmd = PendingReload(
             keywords: keywords,
             allowActiveFallback: allowActiveFallback,
             testImmediate: testImmediate,
-            expiresAt: Date().addingTimeInterval(25.0)
+            expiresAt: Date().addingTimeInterval(75.0)
         )
         if !targets.isEmpty {
             pendingReload = nil
@@ -728,7 +811,17 @@ final class KeepaliveExtensionRelay {
 
     @discardableResult
     func broadcastReload() -> Bool {
-        return requestReload(keywords: nil, allowActiveFallback: true, testImmediate: false) == "delivered"
+        return requestReload(keywords: nil, allowActiveFallback: false, testImmediate: false) == "delivered"
+    }
+}
+
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var delegate: WKScriptMessageHandler?
+    init(_ delegate: WKScriptMessageHandler) {
+        self.delegate = delegate
+    }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        delegate?.userContentController(userContentController, didReceive: message)
     }
 }
 
@@ -765,7 +858,7 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
         config.websiteDataStore = .default()
         config.setURLSchemeHandler(schemeHandler, forURLScheme: "bjtracker")
         config.setURLSchemeHandler(schemeHandler, forURLScheme: "companion-frame")
-        config.userContentController.add(self, name: "ipadCompanion")
+        config.userContentController.add(WeakScriptMessageHandler(self), name: "ipadCompanion")
         config.allowsInlineMediaPlayback = true
 
         webView = WKWebView(frame: .zero, configuration: config)
@@ -775,9 +868,11 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
         webView.isOpaque = false
         webView.backgroundColor = view.backgroundColor
         webView.scrollView.backgroundColor = view.backgroundColor
+        #if DEBUG
         if #available(iOS 16.4, *) {
             webView.isInspectable = true
         }
+        #endif
         view.addSubview(webView)
 
         NSLayoutConstraint.activate([
@@ -979,7 +1074,19 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
             return
         }
 
-        decisionHandler(.allow)
+        if scheme == "file" || scheme == "companion-frame" {
+            decisionHandler(.allow)
+            return
+        }
+
+        logger.notice("Blocked unexpected WebView navigation to scheme '\(scheme, privacy: .public)'")
+        decisionHandler(.cancel)
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        logger.error("WKWebView WebContent process terminated (Jetsam/OOM); reloading tracker UI")
+        ensureServicesRunning()
+        webView.reload()
     }
 
     // MARK: - WKUIDelegate
@@ -1084,7 +1191,7 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
 
         case "reloadLeftSafari":
             let keywords = body["keywords"] as? [String]
-            let allowActiveFallback = (body["allowActiveFallback"] as? Bool) ?? true
+            let allowActiveFallback = (body["allowActiveFallback"] as? Bool) ?? false
             let testImmediate = (body["testImmediate"] as? Bool) ?? false
             let delivery = extRelay.requestReload(
                 keywords: keywords,
@@ -1104,12 +1211,21 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
                   let text = body["text"] as? String else {
                 return
             }
+            let payloadBytes = Data(text.utf8)
+            let maxExportBytes = 25 * 1024 * 1024
+            if payloadBytes.count > maxExportBytes {
+                logger.error("Rejected oversized export (\(payloadBytes.count) bytes > \(maxExportBytes))")
+                return
+            }
             let safeName = (rawName as NSString).lastPathComponent
             let cleanName = safeName.isEmpty ? "tracker_export.txt" : safeName
             let outURL = FileManager.default.temporaryDirectory.appendingPathComponent(cleanName)
             do {
-                try Data(text.utf8).write(to: outURL, options: .atomic)
+                try payloadBytes.write(to: outURL, options: .atomic)
                 let activityVC = UIActivityViewController(activityItems: [outURL], applicationActivities: nil)
+                activityVC.completionWithItemsHandler = { _, _, _, _ in
+                    try? FileManager.default.removeItem(at: outURL)
+                }
                 if let popover = activityVC.popoverPresentationController {
                     popover.sourceView = view
                     popover.sourceRect = CGRect(x: view.bounds.midX, y: 80, width: 1, height: 1)
@@ -1121,8 +1237,9 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
                 }
                 if !(host is UIAlertController) {
                     host.present(activityVC, animated: true)
-                    logger.info("Presented iOS Share Sheet for export '\(cleanName, privacy: .public)' (\(text.utf8.count) bytes)")
+                    logger.info("Presented iOS Share Sheet for export '\(cleanName, privacy: .public)' (\(payloadBytes.count) bytes)")
                 } else {
+                    try? FileManager.default.removeItem(at: outURL)
                     logger.error("Skipped Share Sheet for export '\(cleanName, privacy: .public)' because an alert is already active")
                 }
             } catch {

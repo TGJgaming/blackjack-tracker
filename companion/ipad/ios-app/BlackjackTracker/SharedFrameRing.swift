@@ -240,6 +240,10 @@ final class SharedFrameRing {
             return nil
         }
         mappedPtr = ptr
+        if isWriter {
+            // Ensure stale seq from a crashed previous session is cleared before first frame
+            Self.storeSeq(0, at: ptr)
+        }
         Self.logger.info("Opened SharedFrameRing (\(isWriter ? "writer" : "reader", privacy: .public)) at \(self.storageDescription, privacy: .public)")
     }
 
@@ -252,6 +256,27 @@ final class SharedFrameRing {
         }
     }
 
+    /// Acquire-load of the 32-bit sequence header at offset 0 using OSAtomic barrier semantics
+    /// (prevents compiler hoisting/CSE across seqlock retries without requiring iOS 18 Synchronization).
+    @inline(never)
+    private static func loadSeq(from base: UnsafeRawPointer) -> UInt32 {
+        let p = UnsafeMutablePointer<Int32>(mutating: base.assumingMemoryBound(to: Int32.self))
+        return UInt32(bitPattern: OSAtomicAdd32Barrier(0, p))
+    }
+
+    /// Release-store of the 32-bit sequence header at offset 0.
+    @inline(never)
+    private static func storeSeq(_ value: UInt32, at base: UnsafeMutableRawPointer) {
+        let p = base.assumingMemoryBound(to: Int32.self)
+        let target = Int32(bitPattern: value.littleEndian)
+        while true {
+            let cur = OSAtomicAdd32Barrier(0, p)
+            if OSAtomicCompareAndSwap32Barrier(cur, target, p) {
+                return
+            }
+        }
+    }
+
     func writeRGBAFrame(width: Int, height: Int, rgbaSource: UnsafeRawPointer, bytesPerRow: Int, seq: UInt32) {
         guard let base = mappedPtr, width > 0, height > 0 else { return }
         let w = min(width, Self.maxWidth)
@@ -259,16 +284,14 @@ final class SharedFrameRing {
         let dstStride = w * 4
         if Self.headerBytes + (dstStride * h) > Self.capacityBytes { return }
 
-        let hdr = base.assumingMemoryBound(to: UInt32.self)
         let safeSeq: UInt32 = (seq == 0) ? 1 : seq
 
         // Seqlock write protocol: zero seq before writing so readers detect mid-write tearing
-        hdr[0] = 0
-        OSMemoryBarrier()
+        Self.storeSeq(0, at: base)
 
-        hdr[1] = UInt32(w)
-        hdr[2] = UInt32(h)
-        hdr[3] = 4
+        FrameIPCConstants.writeUInt32LE(UInt32(w), to: base, offset: 4)
+        FrameIPCConstants.writeUInt32LE(UInt32(h), to: base, offset: 8)
+        FrameIPCConstants.writeUInt32LE(4, to: base, offset: 12)
 
         let dstPixels = base.advanced(by: Self.headerBytes)
         if bytesPerRow == dstStride {
@@ -281,48 +304,71 @@ final class SharedFrameRing {
             }
         }
 
-        OSMemoryBarrier()
-        hdr[0] = safeSeq
+        Self.storeSeq(safeSeq, at: base)
+        // Touch file mtime so readers can detect Jetsam-killed writer crashes (>6s stale)
+        if fd >= 0 {
+            futimes(fd, nil)
+        }
     }
 
     func clear() {
         guard let base = mappedPtr else { return }
-        let hdr = base.assumingMemoryBound(to: UInt32.self)
-        hdr[0] = 0
-        OSMemoryBarrier()
+        Self.storeSeq(0, at: base)
     }
 
-    func readLatestPacket() -> Data? {
-        guard let base = mappedPtr else { return nil }
-        let hdr = base.assumingMemoryBound(to: UInt32.self)
+    /// Reads the latest frame packet. When `sinceSeq != 0` and the current sequence matches
+    /// `sinceSeq`, returns `(seq: seq1, data: nil, isActive: true)` with zero heap allocation.
+    func readLatestPacket(sinceSeq: UInt32 = 0, staleThresholdSec: TimeInterval = 6.0) -> (seq: UInt32, data: Data?, isActive: Bool) {
+        guard let base = mappedPtr else { return (0, nil, false) }
+
+        // Detect Jetsam-killed extension leaving a stale non-zero seq in the mmap file
+        if fd >= 0 && staleThresholdSec > 0 {
+            var st = stat()
+            if fstat(fd, &st) == 0 {
+                let mtimeSec = Double(st.st_mtimespec.tv_sec) + (Double(st.st_mtimespec.tv_nsec) / 1_000_000_000.0)
+                let nowSec = Date().timeIntervalSince1970
+                if mtimeSec > 0 && (nowSec - mtimeSec) > staleThresholdSec {
+                    return (0, nil, false)
+                }
+            }
+        }
 
         for _ in 0..<3 {
-            let seq1 = hdr[0]
-            OSMemoryBarrier()
+            let seq1 = UInt32(littleEndian: Self.loadSeq(from: base))
             if seq1 == 0 {
                 sched_yield()
                 continue
             }
 
-            let w = Int(hdr[1])
-            let h = Int(hdr[2])
-            let c = Int(hdr[3])
+            if sinceSeq != 0 && seq1 == sinceSeq {
+                return (seq1, nil, true)
+            }
+
+            let hdr = base.assumingMemoryBound(to: UInt32.self)
+            let w = Int(UInt32(littleEndian: hdr[1]))
+            let h = Int(UInt32(littleEndian: hdr[2]))
+            let c = Int(UInt32(littleEndian: hdr[3]))
             if w <= 0 || h <= 0 || w > Self.maxWidth || h > Self.maxHeight || c != 4 {
-                return nil
+                sched_yield()
+                continue
             }
             let total = Self.headerBytes + (w * h * 4)
             if total > Self.capacityBytes {
-                return nil
+                sched_yield()
+                continue
             }
 
             let data = Data(bytes: base, count: total)
-            OSMemoryBarrier()
-            let seq2 = hdr[0]
+            let seq2 = UInt32(littleEndian: Self.loadSeq(from: base))
             if seq1 == seq2 {
-                return data
+                return (seq1, data, true)
             }
         }
-        return nil
+        return (0, nil, false)
+    }
+
+    func readLatestPacket() -> Data? {
+        return readLatestPacket(sinceSeq: 0).data
     }
 }
 

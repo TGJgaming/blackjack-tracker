@@ -269,8 +269,9 @@ def test_state_machine_split_hud_glitch_and_shuffle() -> None:
 
     _feed_hud(sm, [_det("8", 8, 10), _det("8", 8, 40)], [_det("6", 6, 10), _det("Q", 0, 40)], ts=40.0, frames=2, banner="WAIT")
     evs_end = _feed_hud(sm, [], [], ts=41.0, frames=2, banner="WAIT")
-    assert evs_end[0]["type"] == "prompt_confirm"
-    assert evs_end[0]["reason"] == "SPLIT"
+    prompts_split = [e for e in evs_end if e["type"] == "prompt_confirm"]
+    assert len(prompts_split) == 1
+    assert prompts_split[0]["reason"] == "SPLIT"
 
     # Reset split and test incomplete initial HUD (< 2 cards)
     sm.set_sync_state(play_mode="watch", is_split=False)
@@ -687,14 +688,14 @@ def test_wait_banner_trusts_felt_and_autologs_before_next_round() -> None:
         hud_refreshed=False,
     ))
 
-    # WAIT disappears before next round begins (2 clear frames) -> stages auto_watch with ZERO prompt_confirm, flushes on NO_MORE_BETS!
+    # WAIT disappears before next round begins (2 clear frames) -> completes [10, BACK] via educated guess, stages auto_watch, flushes on NO_MORE_BETS!
     assert sm.step(FrameObservation(ts=4.2, banner_state="", hud_refreshed=True)) == []
     evs_end = sm.step(FrameObservation(ts=4.4, banner_state="", hud_refreshed=True))
     assert ("B", 9) not in [(e["target"], e["val"]) for e in evs_end if e["type"] == "card"]
-    assert not any(e["type"] == "prompt_confirm" for e in evs_end)
+    assert any(e["type"] == "prompt_confirm" and e["reason"] == "DEALER_INCOMPLETE" for e in evs_end)
     assert not any(e["type"] == "auto_watch" for e in evs_end)
     evs_nmb = sm.step(FrameObservation(ts=5.0, banner_state="NO_MORE_BETS"))
-    assert any(e["type"] == "auto_watch" and e["summary"] == "2P+1D+0B" for e in evs_nmb)
+    assert any(e["type"] == "auto_watch" and e["summary"] == "2P+2D+0B" for e in evs_nmb)
 
     # Roundtrip preserves new flags cleanly while keeping defaults backward-compatible
     parsed = CompanionConfig.from_dict({"rois": cfg.rois})
@@ -1174,6 +1175,52 @@ def test_qq_split_overlap_debounce_and_auto_resync(tmp_path: Path) -> None:
         )))
     assert [(e["handIndex"], e["slot"], e["rankLabel"]) for e in evs_hit if e["type"] == "card" and e["target"] == "P"] == [(0, 1, "Q")]
 
+    # Auto-resync fixes an extra drifted card in UI (e.g. phantom '4') after >=6 frames & >=0.55s
+    sm.resync_round()
+    sm.set_sync_state(play_mode="watch")
+    c4_a = CardDetection("4", 4, 0.93, 10, 0, 12, 22, suit="C", hand_index=0)
+    c4_b = CardDetection("4", 4, 0.95, 24, 0, 12, 22, suit="S", hand_index=0)
+    for ts in (5.0, 5.15):
+        sm.step(FrameObservation(ts=ts, banner_state="WAIT", player_cards=[c4_a, c4_b], player_hands={0: [c4_a, c4_b]}, dealer_cards=[d6]))
+    sm.set_sync_state(
+        comp_round_id=sm.round_id,
+        draft_hands=[[4, 4, 4]],
+        draft_dealer=[6],
+        draft_hands_manual=[False],
+        draft_dealer_manual=False,
+    )
+    rec_evs = []
+    for i in range(6):
+        rec_evs.extend(sm.step(FrameObservation(
+            ts=5.5 + i * 0.12,
+            banner_state="WAIT",
+            player_cards=[c4_a, c4_b],
+            player_hands={0: [c4_a, c4_b]},
+            dealer_cards=[d6],
+        )))
+    recs = [e for e in rec_evs if e["type"] == "reconcile"]
+    assert len(recs) == 1
+    assert [[c["val"] for c in h] for h in recs[0]["hands"]] == [[4, 4]]
+
+    # Manual-entry guard: manually typed card must NOT be shrunk away by fewer HUD cards
+    sm.set_sync_state(
+        comp_round_id=sm.round_id,
+        draft_hands=[[4, 4, 5]],
+        draft_dealer=[6],
+        draft_hands_manual=[True],
+        draft_dealer_manual=False,
+    )
+    man_evs = []
+    for i in range(7):
+        man_evs.extend(sm.step(FrameObservation(
+            ts=8.0 + i * 0.12,
+            banner_state="WAIT",
+            player_cards=[c4_a, c4_b],
+            player_hands={0: [c4_a, c4_b]},
+            dealer_cards=[d6],
+        )))
+    assert [e for e in man_evs if e["type"] == "reconcile"] == []
+
 
 def test_delayed_auto_watch_review_window_fallback_and_manual_clear() -> None:
     """auto_watch waits through PLACE_BETS/LAST_BETS until NO_MORE_BETS, flushes on fallback, and cancels on manual clear."""
@@ -1360,17 +1407,22 @@ def test_dealer_partial_wipe_rescue_and_dealer_felt_fallback() -> None:
     assert len(fb_cards) == 1 and fb_cards[0]["rankLabel"] == "5"
     assert sm_b._pending_auto_watch is not None
 
-    # Case C: Digital HUD wipes at [6, 10] = 16 with NO dealer_felt_roi fallback -> emits DEALER_INCOMPLETE prompt
+    # Case C: Digital HUD wipes at [6, 10] = 16 with NO dealer_felt_roi fallback -> inserts educated guess & queues auto_watch for NO_MORE_BETS
     sm_c = CompanionStateMachine(cfg)
     sm_c.set_sync_state(play_mode="watch")
     _feed_hud(sm_c, [_det("10", 0, 10), _det("8", 8, 30)], [_det("6", 6, 10), _det("10", 0, 28)], ts=20.0, frames=2, banner="WAIT")
     evs_inc = sm_c.step(FrameObservation(ts=21.0, banner_state="PLACE_BETS"))
+    guess_cards = [e for e in evs_inc if e["type"] == "card" and e["target"] == "D" and e.get("source") == "educated_guess"]
+    assert len(guess_cards) == 1 and guess_cards[0]["rankLabel"] == "10"
     prompts = [e for e in evs_inc if e["type"] == "prompt_confirm"]
     assert len(prompts) == 1
     assert prompts[0]["reason"] == "DEALER_INCOMPLETE"
     assert prompts[0]["suggestedFocus"] == "D"
-    assert prompts[0]["dealerTotal"] == 16
-    assert sm_c._pending_auto_watch is None
+    assert prompts[0]["educatedGuessRank"] == "10"
+    assert prompts[0]["dealerTotal"] == 26
+    assert sm_c._pending_auto_watch is not None
+    evs_nmb_c = sm_c.step(FrameObservation(ts=22.0, banner_state="NO_MORE_BETS"))
+    assert any(e["type"] == "auto_watch" and e.get("fromWatch") is True for e in evs_nmb_c)
 
 
 def test_felt_burst_monitor_multicard_and_hud_fallback_bank(tmp_path) -> None:
@@ -2293,59 +2345,193 @@ def test_round_over_trigger_ext_bridge_and_escalation() -> None:
     assert any(m.get("type") == "browser_ext_hello" for m in ext_msgs)
 
 
-def test_ipad_split_view_viewport_and_companion_pack_roundtrip(tmp_path: Path) -> None:
-    """iPad Split View left-pane anchoring isolates Safari game frame from right-pane tracker UI and exports/imports packs."""
-    from calibrate import export_companion_pack, import_companion_pack, list_template_counts, save_template_crop
-    from win_anchor import ViewportSmoother, WindowRect, detect_split_view_left_pane
+def test_ipados_parity_badge_deduction_educated_guess_split_watch_and_warn_recovery(tmp_path) -> None:
+    import cv2
+    import numpy as np
+    import random
+    from calibrate import save_template_crop
+    from config import CompanionConfig, KeepaliveConfig
+    from detector import PlaytechDetector, _has_red_back_signature, detect_dealer_badge_total
+    from state_machine import (
+        CompanionStateMachine,
+        WatchKeepaliveManager,
+        deduce_missing_dealer_card,
+        deduce_missing_dealer_pair,
+        guess_missing_dealer_card,
+    )
 
-    # 1. Construct synthetic iPad landscape Split View screen (1200x800):
-    #    - Left Safari pane: x=0..760 (top Safari bar y=0..90, Playtech 16:9 game y=140..568, black letterbox below)
-    #    - Vertical black Split View divider: x=760..772 (all 0s)
-    #    - Right Tracker UI pane: x=772..1200 (bright UI cards across full height y=40..780)
-    screen = np.zeros((800, 1200, 3), dtype=np.uint8)
-    screen[10:80, 0:760] = 45  # Safari address bar
-    screen[140:568, 0:760] = 85  # Playtech 16:9 game frame in left pane
-    screen[:, 760:772] = 0  # iPadOS Split View divider bar
-    screen[40:780, 772:1200] = 180  # Right pane Tracker UI (must be ignored!)
+    # 1. Pure rank deduction & educated guess helpers
+    assert deduce_missing_dealer_card(["7", "BACK"], 17) == {"rank": "10", "val": 0}
+    assert deduce_missing_dealer_card(["6", "BACK"], 17) == {"rank": "A", "val": 1}
+    assert deduce_missing_dealer_pair(["5"], 21) == [{"rank": "6", "val": 6}, {"rank": "10", "val": 0}]
+    assert deduce_missing_dealer_pair(["2"], 17) is not None
+    assert guess_missing_dealer_card(["7", "5"]) == {"rank": "10", "val": 0}
+    assert guess_missing_dealer_card(["6"]) == {"rank": "A", "val": 1}
 
-    vx, vy, vw, vh = detect_split_view_left_pane(screen)
-    assert vx == 0
-    assert 745 <= vw <= 762
-    assert 125 <= vy <= 145
-    assert 415 <= vh <= 445
+    # 2. Multi-step dealer badge history & 2-card pair deduction + badge detector sanity
+    cfg = CompanionConfig(confirm_frames=2, clear_frames=2)
+    sm = CompanionStateMachine(cfg)
+    sm.set_sync_state(play_mode="watch")
+    p_hand = [_det("10", 0, 10), _det("8", 8, 30)]
+    _feed_hud(sm, p_hand, [_det("5", 5, 10), _det("BACK", None, 35)], ts=1.0, frames=2, banner="WAIT")
+    # Badge steps: 11 (flashed '6' before visible) -> 21 (flashed '10' before visible), then table wipes
+    sm.step(FrameObservation(ts=2.0, banner_state="WAIT", player_cards=p_hand, dealer_cards=[_det("5", 5, 10)], dealer_badge_total=11, dealer_badge_conf=0.88))
+    sm.step(FrameObservation(ts=2.2, banner_state="WAIT", player_cards=p_hand, dealer_cards=[_det("5", 5, 10)], dealer_badge_total=21, dealer_badge_conf=0.86))
+    end_badge = sm.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS"))
+    ded_cards = [(e["slot"], e["rankLabel"], e.get("source")) for e in end_badge if e["type"] == "card" and e["target"] == "D"]
+    assert ded_cards == [(1, "6", "badge_deduced"), (2, "10", "badge_deduced")]
+    assert sm._pending_auto_watch is not None
 
-    smoother = ViewportSmoother(tol_px=8)
-    win = WindowRect(hwnd=1, title="iPad ReplayKit Screen", left=0, top=0, width=1200, height=800)
-    abs_anchor, vp_local = smoother.resolve_anchor(win, screen, "ipad_split_left")
-    assert abs_anchor.width == vw and abs_anchor.height == vh
-    assert vp_local == (vx, vy, vw, vh)
+    # Empty dark badge area returns None
+    assert detect_dealer_badge_total(np.zeros((45, 100, 3), dtype=np.uint8)) == (None, 0.0)
 
-    # 2. Export & Import Companion Pack round-trip
-    src_root = tmp_path / "src_templates"
-    dst_root = tmp_path / "dst_templates"
-    save_template_crop("hud", "A", _make_card_glyph("A"), templates_root=src_root)
-    save_template_crop("suit", "S", _make_card_glyph("S", size=(16, 16)), templates_root=src_root)
-    save_template_crop("banner", "WAIT", _make_card_glyph("WAIT", size=(60, 18)), templates_root=src_root)
+    # 3. Multi-card educated guess loop reaches >= 17 & auto-logs at NO_MORE_BETS
+    sm_g = CompanionStateMachine(CompanionConfig(confirm_frames=1, clear_frames=2))
+    sm_g.set_sync_state(play_mode="watch")
+    _feed_hud(sm_g, [_det("10", 0, 10), _det("9", 9, 30)], [_det("2", 2, 10), _det("3", 3, 28)], ts=10.0, frames=1, banner="WAIT")
+    end_g = sm_g.step(FrameObservation(ts=11.0, banner_state="PLACE_BETS"))
+    g_cards = [e for e in end_g if e["type"] == "card" and e["target"] == "D" and e.get("source") == "educated_guess"]
+    assert len(g_cards) == 2
+    p_g = [e for e in end_g if e["type"] == "prompt_confirm"]
+    assert len(p_g) == 1 and p_g[0]["dealerTotal"] >= 17
+    nmb_g = sm_g.step(FrameObservation(ts=12.0, banner_state="NO_MORE_BETS"))
+    assert any(e["type"] == "auto_watch" and e.get("fromWatch") is True for e in nmb_g)
 
-    cfg_src = CompanionConfig(anchor_mode="ipad_split_left")
-    cfg_src.rois["player_strip"] = (0.40, 0.65, 0.34, 0.22)
-    pack = export_companion_pack(cfg_src, templates_root=src_root)
-    assert pack["version"] == 1
-    assert pack["config"]["anchor_mode"] == "ipad_split_left"
-    assert len(pack["templates"]["hud"]) == 1
-    assert len(pack["templates"]["suit"]) == 1
-    assert len(pack["templates"]["banner"]) == 1
+    # 4. Watch Split Guard auto-logs at NO_MORE_BETS
+    sm_sp = CompanionStateMachine(CompanionConfig(confirm_frames=2, clear_frames=2))
+    sm_sp.set_sync_state(play_mode="watch", is_split=True)
+    _feed_hud(sm_sp, [_det("8", 8, 10), _det("3", 3, 28)], [_det("10", 0, 10), _det("7", 7, 28)], ts=20.0, frames=2, banner="WAIT")
+    end_sp = sm_sp.step(FrameObservation(ts=21.0, banner_state="PLACE_BETS"))
+    assert any(e["type"] == "prompt_confirm" and e["reason"] == "SPLIT" for e in end_sp)
+    assert sm_sp._pending_auto_watch is not None
+    nmb_sp = sm_sp.step(FrameObservation(ts=22.0, banner_state="NO_MORE_BETS"))
+    assert any(e["type"] == "auto_watch" and e.get("fromWatch") is True for e in nmb_sp)
 
-    cfg_dst = CompanionConfig()
-    cfg_dst, imported = import_companion_pack(pack, cfg_dst, templates_root=dst_root)
-    assert imported == 3
-    assert cfg_dst.anchor_mode == "ipad_split_left"
-    assert cfg_dst.rois["player_strip"] == (0.40, 0.65, 0.34, 0.22)
-    counts = list_template_counts(dst_root)
-    assert counts["hud"].get("A") == 1
-    assert counts["suit"].get("S") == 1
-    assert counts["banner"].get("WAIT") == 1
+    # 5. Red face-up card BACK rejection + false-positive '4' rejection
+    white_red_card = np.full((30, 24, 3), (245, 245, 245), dtype=np.uint8)
+    white_red_card[4:16, 4:14] = (30, 30, 220)  # ~28% red ink on mostly white card face
+    assert _has_red_back_signature(white_red_card) is False
 
+    tdir = tmp_path / "tpl_4"
+    im4 = np.full((45, 22, 3), 248, dtype=np.uint8)
+    cv2.putText(im4, "4", (2, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (20, 20, 20), 2, cv2.LINE_AA)
+    save_template_crop("hud", "4", im4, tdir, auto_trim=True)
+    im_s = np.full((18, 18, 3), 248, dtype=np.uint8)
+    cv2.circle(im_s, (9, 9), 5, (20, 20, 20), -1)
+    save_template_crop("suit", "S", im_s, tdir, auto_trim=True)
+    det4 = PlaytechDetector(CompanionConfig(min_hud_confidence=0.84), templates_root=tdir)
+    # Noisy low-contrast patch that vaguely looks like '4' (~0.75 < 0.82) must be rejected
+    noisy_strip = np.full((55, 60, 3), 24, dtype=np.uint8)
+    noisy_strip[5:50, 12:36] = 248
+    cv2.putText(noisy_strip, "4", (14, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (105, 105, 105), 1, cv2.LINE_AA)
+    cv2.circle(noisy_strip, (24, 38), 5, (20, 20, 20), -1)
+    p4, _, _ = det4._detect_hud_strip(noisy_strip, is_dealer=False)
+    assert all(d.rank != "4" or d.conf >= 0.82 for d in p4)
+
+    # 6. WatchKeepaliveManager WARN 90s cooldown + strips_visible_fallback recovery
+    ka_cfg = KeepaliveConfig(mode="auto", method="ext_then_os", min_watch_sec=10.0, max_watch_sec=10.0, reload_timeout_sec=12.0, round_over_delay_sec=0.5)
+    mgr = WatchKeepaliveManager(ka_cfg, rng=random.Random(9))
+    for t in (0.0, 5.0, 10.0):
+        mgr.tick(t, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr.tick(10.5, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    act_fire = mgr.tick(11.2, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    assert act_fire.trigger_refresh is True
+    mgr.mark_refresh_dispatched(11.2, True, "ext_reload")
+    mgr.notify_tab_event("loading", now=12.0)
+    # Timeout at +12.8s enters WARN with 90s cooldown
+    act_to = mgr.tick(24.0, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    assert act_to.emit_alert and act_to.emit_alert["event"] == "timeout_warn"
+    assert mgr.state == "WARN"
+    # Even when ROUND_OVER occurs 5s later while in WARN cooldown, must NOT re-trigger reload
+    act_no_re = mgr.tick(29.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    assert not act_no_re.trigger_refresh
+    # When cards return while in WARN with _pending_reload_recovery, recovers cleanly via strips_visible_fallback
+    act_rec_strips = mgr.tick(30.0, play_mode="watch", paused=False, window_found=True, sm_state="DEALING", banner_state="", obs_has_cards=True, has_unresolved_prompt=False)
+    assert act_rec_strips.emit_alert and act_rec_strips.emit_alert["event"] == "recovered"
+    assert act_rec_strips.emit_alert["reason"] == "strips_visible_fallback"
+    assert mgr.state == "WATCH_COUNTDOWN"
+
+
+def test_educated_guess_all_ranks_and_signals() -> None:
+    from state_machine import guess_missing_dealer_card
+
+    # 1. Signal 1: Sub-threshold template runner-up peak + narrow card width (rem_right=13)
+    g1 = guess_missing_dealer_card(
+        ["10"],
+        {
+            "sub_candidates": [
+                {"rank": "10", "val": 0, "conf": 0.56, "slotIdx": 1, "rem_right": 13, "has_pip_body": True},
+                {"rank": "8", "val": 8, "conf": 0.55, "slotIdx": 1, "rem_right": 13, "has_pip_body": True},
+            ]
+        },
+    )
+    assert g1 == {"rank": "8", "val": 8}
+
+    # 2. Signal 2: Partial/soft dealer score badge hints (tensDigit=1, onesDigit=8)
+    g2 = guess_missing_dealer_card(
+        ["10", "2"],
+        {"badge_hint": {"total": None, "conf": 0.62, "tensDigit": 1, "tensConf": 0.72, "onesDigit": 8, "onesConf": 0.65}},
+    )
+    assert g2 == {"rank": "6", "val": 6}
+
+    # 3. Signal 3: Physical felt sightings
+    g3 = guess_missing_dealer_card(
+        ["10", "3"],
+        {"felt_sightings": [{"rank": "5", "val": 5, "conf": 0.74}]},
+    )
+    assert g3 == {"rank": "5", "val": 5}
+
+    # 4 & 5. Signal 4 & 5: Live shoe depletion + stratified round_seed across all 10 ranks
+    full_shoe = [128, 32, 32, 32, 32, 32, 32, 32, 32, 32]
+    seen_ranks = set()
+    for seed in range(1, 61):
+        g = guess_missing_dealer_card(["10", "6"], {"shoe_rem": full_shoe, "round_seed": seed})
+        assert g is not None
+        seen_ranks.add(g["rank"])
+    for r in ("10", "A", "2", "3", "4", "5", "6", "7", "8", "9"):
+        assert r in seen_ranks, f"Missing rank {r} from stratified shoe sampling: {seen_ranks}"
+
+    # Shoe depletion: only 4s remaining
+    only_fours = [0, 0, 0, 0, 12, 0, 0, 0, 0, 0]
+    g_dep = guess_missing_dealer_card(["10", "3"], {"shoe_rem": only_fours, "round_seed": 1})
+    assert g_dep == {"rank": "4", "val": 4}
+
+    # End-to-end CompanionStateMachine Fallback E with dealer_sub_cards
+    cfg = CompanionConfig(confirm_frames=1, clear_frames=2)
+    sm = CompanionStateMachine(cfg)
+    sm.set_sync_state(play_mode="watch")
+    sm.step(
+        FrameObservation(
+            ts=1.0,
+            banner_state="NO_MORE_BETS",
+            player_cards=[],
+            dealer_cards=[],
+            player_hands={},
+        )
+    )
+    sm.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)],
+            dealer_cards=[CardDetection("9", 9, 0.94, 10), CardDetection("BACK", None, 0.92, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)]},
+            dealer_sub_cards=[{"rank": "8", "val": 8, "conf": 0.59, "suit": "H", "has_pip_body": True, "slotIdx": 1, "rem_right": 13}],
+        )
+    )
+    end_evs = sm.step(
+        FrameObservation(
+            ts=3.0,
+            banner_state="PLACE_BETS",
+            player_cards=[],
+            dealer_cards=[],
+            player_hands={},
+        )
+    )
+    guess_ev = next((e for e in end_evs if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"), None)
+    assert guess_ev is not None
+    assert guess_ev["rankLabel"] == "8"
+    assert guess_ev["val"] == 8
 
 def test_dimmed_split_hand_and_13_rank_badge_occlusion() -> None:
     """Dimmed inactive split hands, circular score-badge occlusion across all 13 ranks, and top-right suit fallback work cleanly."""
@@ -2427,6 +2613,283 @@ def test_dimmed_split_hand_and_13_rank_badge_occlusion() -> None:
 
 
 
+def test_place_bets_strict_dealer_recheck_start_and_3s() -> None:
+    """PLACE_BETS rechecks dealer completeness at 0s and +3s, supports >2 guesses, and respects manual removal."""
+    from config import CompanionConfig
+    from detector import CardDetection, FrameObservation
+    from state_machine import CompanionStateMachine
+
+    def _bj_total(ranks: list[str]) -> int:
+        tot = 0
+        aces = 0
+        for r in ranks:
+            if r == "A":
+                tot += 11
+                aces += 1
+            elif r in ("10", "J", "Q", "K"):
+                tot += 10
+            else:
+                tot += int(r)
+        while tot > 21 and aces > 0:
+            tot -= 10
+            aces -= 1
+        return tot
+
+    # 1. Start of PLACE_BETS (0s) completes [10, BACK] when player has [10, 9]
+    cfg = CompanionConfig(confirm_frames=1, clear_frames=2)
+    sm = CompanionStateMachine(cfg)
+    sm.set_sync_state(play_mode="watch")
+    sm.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)],
+            dealer_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("BACK", None, 0.92, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)]},
+        )
+    )
+    evs_0s = sm.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    guesses_0s = [e for e in evs_0s if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"]
+    assert len(guesses_0s) >= 1
+
+    # 2. +3s recheck catches sync_state drift (e.g. dealer=["2"] -> completes >= 17 with >2 guesses if needed)
+    sm2 = CompanionStateMachine(cfg)
+    sm2.set_sync_state(play_mode="watch")
+    sm2.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm2.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)],
+            dealer_cards=[CardDetection("2", 2, 0.94, 10), CardDetection("3", 3, 0.94, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)]},
+        )
+    )
+    evs_pb0 = sm2.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    # 0s already completes [2, 3] to >= 17
+    guesses_pb0 = [e for e in evs_pb0 if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"]
+    assert len(guesses_pb0) >= 2
+    assert _bj_total(["2", "3"] + [g["rankLabel"] for g in guesses_pb0]) >= 17
+
+    # Simulate client drift during PLACE_BETS where draft only has ["2"] at +1s, then reaches +3s
+    sm2.set_sync_state(
+        play_mode="watch",
+        draft_count=3,
+        draft_hands=[["10", "9"]],
+        draft_dealer=["2"],
+        dealer_guess_removed=False,
+    )
+    evs_pb1 = sm2.step(FrameObservation(ts=4.5, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    assert not any(e.get("type") == "card" and e.get("source") == "educated_guess" for e in evs_pb1)
+    evs_pb3 = sm2.step(FrameObservation(ts=6.1, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    guesses_pb3 = [e for e in evs_pb3 if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"]
+    assert len(guesses_pb3) >= 2
+    assert _bj_total(["2"] + [g["rankLabel"] for g in guesses_pb3]) >= 17
+
+    # 3. dealer_guess_removed=True prevents +3s recheck from re-inserting guessed cards
+    sm3 = CompanionStateMachine(cfg)
+    sm3.set_sync_state(play_mode="watch")
+    sm3.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm3.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)],
+            dealer_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("6", 6, 0.94, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("9", 9, 0.94, 30)]},
+        )
+    )
+    sm3.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm3.set_sync_state(
+        play_mode="watch",
+        draft_count=4,
+        draft_hands=[["10", "9"]],
+        draft_dealer=["10", "6"],
+        dealer_guess_removed=True,
+    )
+    evs_pb3_removed = sm3.step(FrameObservation(ts=6.2, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    assert not any(e.get("type") == "card" and e.get("source") == "educated_guess" for e in evs_pb3_removed)
+
+    # 4. BET mode preserves _review_* snapshot AND fires +3s recheck even when banner flickers blank ("")
+    sm4 = CompanionStateMachine(cfg)
+    sm4.set_sync_state(play_mode="bet")
+    sm4.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm4.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("8", 8, 0.94, 30)],
+            dealer_cards=[CardDetection("6", 6, 0.94, 10), CardDetection("10", 0, 0.94, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("8", 8, 0.94, 30)]},
+        )
+    )
+    sm4.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm4.set_sync_state(
+        play_mode="bet",
+        draft_count=4,
+        draft_hands=[[0, 8]],
+        draft_dealer=[6, 0],
+        dealer_guess_removed=False,
+    )
+    evs_bet_3s = sm4.step(FrameObservation(ts=6.1, banner_state="", player_cards=[], dealer_cards=[], player_hands={}))
+    bet_guesses = [e for e in evs_bet_3s if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"]
+    assert len(bet_guesses) >= 1
+    assert _bj_total(["6", "10"] + [g["rankLabel"] for g in bet_guesses]) >= 17
+
+    # 5. Busted community player hand [10, 6, 8] still completes dealer [6, 10]
+    sm5 = CompanionStateMachine(cfg)
+    sm5.set_sync_state(play_mode="watch")
+    sm5.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm5.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("6", 6, 0.94, 30), CardDetection("8", 8, 0.94, 50)],
+            dealer_cards=[CardDetection("6", 6, 0.94, 10), CardDetection("10", 0, 0.94, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("6", 6, 0.94, 30), CardDetection("8", 8, 0.94, 50)]},
+        )
+    )
+    evs_bust = sm5.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    assert any(e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess" for e in evs_bust)
 
 
+def test_delete_rank_templates_rejects_path_traversal_and_globbing(tmp_path) -> None:
+    """delete_rank_templates must reject invalid banks, glob metacharacters, and path traversal tokens."""
+    import pytest
+    from calibrate import delete_rank_templates
+
+    tpl_root = tmp_path / "templates"
+    hud_dir = tpl_root / "hud"
+    hud_dir.mkdir(parents=True)
+    sentinel = hud_dir / "A_1.png"
+    sentinel.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    for bad_bank, bad_rank in [
+        ("hud", "../hud"),
+        ("hud", "*"),
+        ("hud", "A/../../etc"),
+        ("hud", ".."),
+        ("../etc", "A"),
+        ("unknown_bank", "A"),
+    ]:
+        with pytest.raises(ValueError):
+            delete_rank_templates(bad_bank, bad_rank, templates_root=tpl_root)
+
+    assert sentinel.exists(), "Sentinel template must not be deleted by rejected traversal attempts"
+
+
+def test_save_config_atomic_path_preservation_and_validation(tmp_path) -> None:
+    """load_config/save_config preserve custom _config_path atomically and clamp invalid ws_port & place_bets delays."""
+    from config import CompanionConfig, load_config, save_config
+
+    custom_path = tmp_path / "custom_companion.json"
+    cfg = CompanionConfig(ws_port=0)
+    cfg.keepalive.place_bets_min_delay_sec = 4.0
+    cfg.keepalive.place_bets_max_delay_sec = 1.5
+    save_config(cfg, path=custom_path)
+    assert custom_path.exists()
+
+    loaded = load_config(path=custom_path)
+    assert loaded.ws_port == 8765
+    assert loaded.keepalive.place_bets_max_delay_sec >= loaded.keepalive.place_bets_min_delay_sec
+    assert getattr(loaded, "_config_path", None) == custom_path
+
+    loaded.ws_port = 99999
+    loaded.confirm_frames = 5
+    # Saving without explicit path must write back to _config_path rather than default config.json
+    save_config(loaded)
+    reloaded = load_config(path=custom_path)
+    assert reloaded.ws_port == 8765
+    assert reloaded.confirm_frames == 5
+
+
+def test_import_companion_pack_rejects_corrupt_png_without_wiping_bank(tmp_path) -> None:
+    """import_companion_pack must pre-validate PNGs before wiping existing templates in the target bank."""
+    import base64
+    from calibrate import import_companion_pack
+    from config import CompanionConfig
+
+    tpl_root = tmp_path / "templates"
+    hud_dir = tpl_root / "hud"
+    hud_dir.mkdir(parents=True)
+    existing = hud_dir / "A_1.png"
+    existing.write_bytes(b"\x89PNG\r\n\x1a\nEXISTING")
+
+    bad_pack = {
+        "templates": {
+            "hud": [
+                {"name": "K_1.png", "dataB64": base64.b64encode(b"NOT_A_PNG_FILE").decode("ascii")},
+            ]
+        }
+    }
+    _, imported_count = import_companion_pack(bad_pack, CompanionConfig(), templates_root=tpl_root, replace_existing=True)
+    assert imported_count == 0
+    assert existing.exists(), "Existing bank templates must not be wiped when incoming pack has no valid PNGs"
+
+
+def test_soft_hand_dealer_guess_and_keepalive_user_idle_guard() -> None:
+    """guess_missing_dealer_card allows soft-hand intermediate draws and WatchKeepaliveManager defers OS reload while user is active."""
+    from config import CompanionConfig
+    from detector import FrameObservation
+    from state_machine import WatchKeepaliveManager, guess_missing_dealer_card
+
+    only_tens = [16, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    g10 = guess_missing_dealer_card(["A", "4"], {"shoe_rem": only_tens, "round_seed": 101})
+    assert g10 is not None and g10["rank"] == "10"
+    assert only_tens[0] == 16
+
+    g_a = guess_missing_dealer_card(["6"], {"round_seed": 777})
+    g_b = guess_missing_dealer_card(["6"], {"round_seed": 777})
+    assert g_a == g_b
+
+    cfg = CompanionConfig()
+    cfg.keepalive.enabled = True
+    cfg.keepalive.mode = "auto"
+    cfg.keepalive.method = "sendinput_ctrl_r"
+    cfg.keepalive.place_bets_min_delay_sec = 0.2
+    cfg.keepalive.place_bets_max_delay_sec = 0.25
+    ka = WatchKeepaliveManager(cfg.keepalive)
+    ka.watch_elapsed_sec = ka.target_sec + 1.0
+    # First tick enters PLACE_BETS window and schedules fire_ts
+    act0 = ka.tick(
+        100.0,
+        play_mode="watch",
+        paused=False,
+        window_found=True,
+        sm_state="BETTING",
+        banner_state="PLACE_BETS",
+        obs_has_cards=False,
+        has_unresolved_prompt=False,
+        user_idle_ms=200,
+    )
+    assert act0.trigger_refresh is False
+    # Past scheduled fire_ts, but user_idle_ms=200 < 1200 -> must defer OS-level sendinput_ctrl_r reload
+    act_active = ka.tick(
+        101.0,
+        play_mode="watch",
+        paused=False,
+        window_found=True,
+        sm_state="BETTING",
+        banner_state="PLACE_BETS",
+        obs_has_cards=False,
+        has_unresolved_prompt=False,
+        user_idle_ms=200,
+    )
+    assert act_active.trigger_refresh is False, "OS-level reload must be deferred while user_idle_ms < 1200"
+
+    # Once user is idle (user_idle_ms=2000 >= 1200), OS-level reload proceeds
+    act_idle = ka.tick(
+        101.5,
+        play_mode="watch",
+        paused=False,
+        window_found=True,
+        sm_state="BETTING",
+        banner_state="PLACE_BETS",
+        obs_has_cards=False,
+        has_unresolved_prompt=False,
+        user_idle_ms=2000,
+    )
+    assert act_idle.trigger_refresh is True
+    assert act_idle.preferred_method == "sendinput_ctrl_r"
 

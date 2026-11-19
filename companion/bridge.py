@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 import uuid
 from typing import Any, Callable
 
 from websockets.asyncio.server import Server, ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_ORIGINS = [
     None,
@@ -89,8 +93,10 @@ class CompanionBridge:
                     continue
                 if isinstance(msg, dict):
                     await self._dispatch(conn, msg)
-        except Exception:
+        except ConnectionClosed:
             pass
+        except Exception as exc:
+            logger.warning("WebSocket handler error: %s", exc)
         finally:
             was_ext = conn in self.ext_clients
             self.clients.discard(conn)
@@ -100,8 +106,8 @@ class CompanionBridge:
                     out = self.on_ext_disconnect()
                     if inspect.isawaitable(out):
                         await out
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("on_ext_disconnect error: %s", exc)
 
     async def start(self) -> None:
         self._server = await serve(
@@ -125,15 +131,19 @@ class CompanionBridge:
         if not targets:
             return
         payload = json.dumps(event)
-        stale: list[ServerConnection] = []
-        for conn in targets:
+
+        async def _send_one(conn: ServerConnection) -> ServerConnection | None:
             try:
-                await conn.send(payload)
+                await asyncio.wait_for(conn.send(payload), timeout=1.5)
+                return None
             except Exception:
-                stale.append(conn)
-        for conn in stale:
-            self.clients.discard(conn)
-            self.ext_clients.discard(conn)
+                return conn
+
+        results = await asyncio.gather(*(_send_one(c) for c in targets))
+        for conn in results:
+            if conn is not None:
+                self.clients.discard(conn)
+                self.ext_clients.discard(conn)
 
     async def request_extension_reload(
         self,

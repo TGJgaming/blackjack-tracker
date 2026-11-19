@@ -12,8 +12,14 @@ function ask(msg) {
 (async () => {
   try {
     const tabs = await api.tabs.query({});
-    st.textContent = "✅ Extension active";
-    tabsEl.textContent = tabs.length + " tab(s) visible to the extension";
+    const hasAccess = tabs.length === 0 || tabs.some((t) => Boolean((t && t.url) || (t && t.title)));
+    if (hasAccess) {
+      st.textContent = "✅ Extension active";
+      tabsEl.textContent = tabs.length + " tab(s) visible to the extension";
+    } else {
+      st.textContent = "⚠️ Website access not granted yet";
+      tabsEl.textContent = "Tap aA → Manage Extensions → Newport Keep-Alive → Always Allow on Every Website.";
+    }
   } catch (e) {
     st.textContent = "⚠️ Website access not granted yet";
     tabsEl.textContent = "Tap aA → Manage Extensions → Newport Keep-Alive → Always Allow.";

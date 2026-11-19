@@ -16,6 +16,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Run iPadOS Engine Tests & Default Pack Verification
+        run: |
+          node companion/ipad/test_engine.js
+          python3 companion/ipad/build_default_pack.py --check
+
       - name: Install XcodeGen
         run: |
           if ! command -v xcodegen >/dev/null 2>&1; then
@@ -54,7 +59,11 @@ jobs:
             Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/manifest.json \
             Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/background.js \
             Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/popup.html \
-            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/icon-96.png
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/popup.js \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/icon-48.png \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/icon-96.png \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/icon-128.png \
+            Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/icon-256.png
           do
             test -f "$f" || { echo "Missing expected bundle file: $f" >&2; exit 1; }
           done
@@ -92,7 +101,9 @@ jobs:
           for key in ("UISupportedInterfaceOrientations", "UISupportedInterfaceOrientations~ipad"):
               actual = set(app_pl.get(key) or [])
               assert expected_orients.issubset(actual), f"{key} missing orientations: {expected_orients - actual}"
-          assert app_pl.get("CFBundleShortVersionString") == "1.0.0", f"Unexpected version: {app_pl.get('CFBundleShortVersionString')}"
+          app_short_ver = str(app_pl.get("CFBundleShortVersionString") or "").strip()
+          app_build_ver = str(app_pl.get("CFBundleVersion") or "").strip()
+          assert app_short_ver and app_build_ver, f"Missing version keys in app Info.plist: {app_short_ver}/{app_build_ver}"
           assert app_pl.get("CFBundleDisplayName") == "BlackTrack", f"Unexpected display name: {app_pl.get('CFBundleDisplayName')}"
           assert str(app_pl.get("NSLocalNetworkUsageDescription") or "").strip(), "Missing NSLocalNetworkUsageDescription"
           scene_manifest = app_pl.get("UIApplicationSceneManifest") or {}
@@ -100,22 +111,26 @@ jobs:
           role_cfgs = (scene_manifest.get("UISceneConfigurations") or {}).get("UIWindowSceneSessionRoleApplication") or []
           assert role_cfgs and str(role_cfgs[0].get("UISceneDelegateClassName") or "").endswith(".SceneDelegate"), f"Missing SceneDelegate config: {role_cfgs}"
 
-          # 4. Verify BroadcastExtension Info.plist
+          # 4. Verify BroadcastExtension Info.plist & cross-target version consistency
           with open("Payload/BlackjackTracker.app/PlugIns/BroadcastExtension.appex/Info.plist", "rb") as fp:
               bc_pl = plistlib.load(fp)
           assert bc_pl.get("UIDeviceFamily") == [2], f"BroadcastExtension UIDeviceFamily={bc_pl.get('UIDeviceFamily')}"
+          assert bc_pl.get("CFBundleShortVersionString") == app_short_ver, f"BroadcastExtension short version mismatch: {bc_pl.get('CFBundleShortVersionString')} != {app_short_ver}"
+          assert bc_pl.get("CFBundleVersion") == app_build_ver, f"BroadcastExtension build version mismatch: {bc_pl.get('CFBundleVersion')} != {app_build_ver}"
           bc_ext = bc_pl.get("NSExtension") or {}
           assert bc_ext.get("NSExtensionPointIdentifier") == "com.apple.broadcast-services-upload", f"Bad Broadcast NSExtension: {bc_ext}"
           assert bc_ext.get("RPBroadcastProcessMode") == "RPBroadcastProcessModeSampleBuffer", f"Bad RPBroadcastProcessMode: {bc_ext}"
 
-          # 5. Verify SafariKeepaliveExtension Info.plist
+          # 5. Verify SafariKeepaliveExtension Info.plist & cross-target version consistency
           with open("Payload/BlackjackTracker.app/PlugIns/SafariKeepaliveExtension.appex/Info.plist", "rb") as fp:
               sk_pl = plistlib.load(fp)
           assert sk_pl.get("UIDeviceFamily") == [2], f"SafariKeepaliveExtension UIDeviceFamily={sk_pl.get('UIDeviceFamily')}"
+          assert sk_pl.get("CFBundleShortVersionString") == app_short_ver, f"SafariKeepaliveExtension short version mismatch: {sk_pl.get('CFBundleShortVersionString')} != {app_short_ver}"
+          assert sk_pl.get("CFBundleVersion") == app_build_ver, f"SafariKeepaliveExtension build version mismatch: {sk_pl.get('CFBundleVersion')} != {app_build_ver}"
           sk_ext = sk_pl.get("NSExtension") or {}
           assert sk_ext.get("NSExtensionPointIdentifier") == "com.apple.Safari.web-extension", f"Bad Safari NSExtension: {sk_ext}"
 
-          print("All IPA bundle Info.plist & entitlement assertions PASSED!")
+          print(f"All IPA bundle Info.plist & entitlement assertions PASSED (v{app_short_ver} build {app_build_ver})!")
           PY
           zip -qry BlackjackTracker.ipa Payload
           ls -lh BlackjackTracker.ipa

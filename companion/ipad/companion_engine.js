@@ -450,10 +450,13 @@
     return { mean, std: Math.sqrt(variance), min, max };
   }
 
+  const _HIST_SCRATCH = new Int32Array(256);
+
   function percentileU8(u8, q) {
     const n = u8.length;
     if (n === 0) return 0;
-    const hist = new Int32Array(256);
+    const hist = _HIST_SCRATCH;
+    hist.fill(0);
     for (let i = 0; i < n; i++) hist[u8[i]]++;
     const target = (q / 100) * (n - 1);
     const loIdx = Math.floor(target);
@@ -757,6 +760,14 @@
     }
   }
 
+  function _clearTplFftLRU() {
+    while (_tplFftLRU.length > 0) {
+      const oldest = _tplFftLRU.pop();
+      if (oldest && oldest.map) oldest.map.clear();
+    }
+    _tplFftBytes = 0;
+  }
+
   function _computeTplFftSpec(tZero, tw, th, prep, outRe, outIm) {
     const { Fx, Fy, halfX, specStride, planX, planY, rowRe, rowIm, colRe, colIm } = prep;
     outRe.fill(0);
@@ -924,7 +935,7 @@
     const effX = maxXLimit !== null ? Math.min(rw, Math.max(0, maxXLimit | 0)) : rw;
     const effY = maxYLimit !== null ? Math.min(rh, Math.max(0, maxYLimit | 0)) : rh;
     const work = effX * effY * tw * th;
-    if (work > 12000 && prep.sw >= 16 && prep.sh >= 16 && tw >= 4 && th >= 4 && (maxXLimit === null && maxYLimit === null ? true : work > 90000)) {
+    if (maxXLimit === null && maxYLimit === null && work > 12000 && prep.sw >= 16 && prep.sh >= 16 && tw >= 4 && th >= 4) {
       return matchFFTPacked(prep, tplGray, tZero, tNorm);
     }
     return matchSpatialIntegral(prep, tplGray, tZero, tNorm, maxXLimit, maxYLimit);
@@ -954,13 +965,23 @@
       : matchSpatialIntegral(prep, tplGray, tZero, tNorm);
   }
 
+  let _ccLabelsScratch = new Int32Array(0);
+  let _ccQueueScratch = new Int32Array(0);
+
   /**
    * 8-connected components with bounding box + area stats (matches cv2.connectedComponentsWithStats).
    */
   function connectedComponentsWithStats(maskU8, w, h) {
-    const labels = new Int32Array(w * h);
+    const n = w * h;
+    if (_ccLabelsScratch.length < n) {
+      _ccLabelsScratch = new Int32Array(n);
+      _ccQueueScratch = new Int32Array(n);
+    } else {
+      _ccLabelsScratch.fill(0, 0, n);
+    }
+    const labels = _ccLabelsScratch;
     const stats = [[0, 0, w, h, 0]]; // index 0 = background
-    const q = new Int32Array(w * h);
+    const q = _ccQueueScratch;
     let curLabel = 0;
 
     for (let y = 0; y < h; y++) {
@@ -1126,7 +1147,10 @@
     if (searchX1 > searchX0 + 8) {
       const nCols = searchX1 - searchX0;
       const darkCols = new Uint8Array(nCols);
+      const lightCols = new Uint8Array(nCols);
       const colBuf = new Uint8Array(bandH);
+      const colMeans = new Float32Array(nCols);
+      const colSpreads = new Float32Array(nCols);
       for (let i = 0; i < nCols; i++) {
         const x = searchX0 + i;
         let sum = 0;
@@ -1137,7 +1161,13 @@
         }
         const mean = sum / bandH;
         const p90 = percentileU8(colBuf, 90);
+        const p10 = percentileU8(colBuf, 10);
+        const spread = p90 - p10;
+        colMeans[i] = mean;
+        colSpreads[i] = spread;
         if (p90 <= 24.0 && mean <= 19.0) darkCols[i] = 1;
+        // iPadOS Light Mode Split View divider (#E5E5EA / #D1D1D6): uniform light gray vertical bar
+        if (mean >= 200.0 && mean <= 246.0 && spread <= 8.0) lightCols[i] = 1;
       }
       let firstRun = null;
       let i = 0;
@@ -1152,6 +1182,30 @@
           i = j;
         } else {
           i++;
+        }
+      }
+      if (!firstRun) {
+        i = 0;
+        while (i < nCols) {
+          if (lightCols[i]) {
+            let j = i;
+            while (j < nCols && lightCols[j]) j++;
+            const runW = j - i;
+            if (runW >= 4 && runW <= 26) {
+              const leftIdx = Math.max(0, i - 3);
+              const rightIdx = Math.min(nCols - 1, j + 2);
+              const divMean = colMeans[i];
+              const leftDelta = Math.abs(colMeans[leftIdx] - divMean);
+              const rightDelta = Math.abs(colMeans[rightIdx] - divMean);
+              if (leftDelta >= 12 || rightDelta >= 12 || colSpreads[leftIdx] >= 12 || colSpreads[rightIdx] >= 12) {
+                firstRun = [i, j];
+                break;
+              }
+            }
+            i = j;
+          } else {
+            i++;
+          }
         }
       }
       if (firstRun) {
@@ -1486,7 +1540,8 @@
     if (!roiBgr || roiBgr.w === 0 || roiBgr.h === 0) return [];
     const mb = toMinGray(roiBgr);
     let chroma = null;
-    if (roiBgr.c === 3) {
+    const ensureChroma = () => {
+      if (chroma !== null || roiBgr.c !== 3) return chroma;
       chroma = new Uint8Array(mb.data.length);
       const sd = roiBgr.data;
       for (let i = 0, j = 0; i < mb.data.length; i++, j += 3) {
@@ -1494,13 +1549,19 @@
         const mx = b > g ? (b > r ? b : r) : (g > r ? g : r);
         chroma[i] = mx - mb.data[i];
       }
-    }
+      return chroma;
+    };
 
     const runPass = (maskThr, gt1, gt2, maxChroma = null) => {
       const mask = new Uint8Array(mb.data.length);
-      if (maxChroma !== null && chroma !== null) {
-        for (let i = 0; i < mb.data.length; i++) {
-          mask[i] = (mb.data[i] > maskThr && chroma[i] <= maxChroma) ? 1 : 0;
+      if (maxChroma !== null) {
+        const ch = ensureChroma();
+        if (ch !== null) {
+          for (let i = 0; i < mb.data.length; i++) {
+            mask[i] = (mb.data[i] > maskThr && ch[i] <= maxChroma) ? 1 : 0;
+          }
+        } else {
+          for (let i = 0; i < mb.data.length; i++) mask[i] = mb.data[i] > maskThr ? 1 : 0;
         }
       } else {
         for (let i = 0; i < mb.data.length; i++) mask[i] = mb.data[i] > maskThr ? 1 : 0;
@@ -1511,20 +1572,27 @@
 
       for (let i = 1; i < cc.count; i++) {
         const [x, y, w, h, area] = cc.stats[i];
+        // Fast pre-filter before allocating a cropImage patch (skips 1px-5px noise)
+        if (area < 36 || h < 8 || w < 5) continue;
         const fill = area / Math.max(1, w * h);
+        const isSmallCap = h < 13 || area < 105;
+        if (isSmallCap) {
+          if (h > 24 || fill < 0.25) continue;
+        } else if ((w / Math.max(1, h) > 4.0 && fill < 0.45) || fill < 0.19) {
+          continue;
+        }
         const patch = cropImage(mb, x, y, w, h);
         let c1 = 0, c2 = 0;
         for (let k = 0; k < patch.data.length; k++) {
           if (patch.data[k] > gt1) c1++;
           if (patch.data[k] > gt2) c2++;
         }
-        if (h < 13 || area < 105) {
-          if (h >= 8 && h <= 24 && w >= 5 && area >= 36 && fill >= 0.25 && c1 / patch.data.length >= 0.25) {
+        if (isSmallCap) {
+          if (c1 / patch.data.length >= 0.25) {
             caps.push([x, y, w, h]);
           }
           continue;
         }
-        if ((w / Math.max(1, h) > 4.0 && fill < 0.45) || fill < 0.19) continue;
         if (c2 / patch.data.length < 0.25) continue;
         if (maxChroma !== null) {
           const p95 = percentileU8(patch.data, 95);
@@ -1602,19 +1670,37 @@
 
   function hasRedBackSignature(bgrPatch) {
     if (!bgrPatch || bgrPatch.c !== 3 || bgrPatch.w === 0 || bgrPatch.h === 0) return false;
-    const n = bgrPatch.w * bgrPatch.h;
+    const w = bgrPatch.w, h = bgrPatch.h;
+    const n = w * h;
     const d = bgrPatch.data;
-    let redCnt = 0, dotCnt = 0, whiteCnt = 0;
-    for (let i = 0, j = 0; i < n; i++, j += 3) {
-      const b = d[j], g = d[j + 1], r = d[j + 2];
-      const mn = Math.min(b, g, r);
-      if (r - Math.max(b, g) > 32) redCnt++;
-      if (mn > 150) dotCnt++;
-      if (mn >= 225) whiteCnt++;
+    const midY = h >> 1;
+    let redCnt = 0, redTop = 0, redBot = 0, dotCnt = 0, whiteCnt = 0;
+    for (let y = 0; y < h; y++) {
+      let j = y * w * 3;
+      for (let x = 0; x < w; x++, j += 3) {
+        const b = d[j], g = d[j + 1], r = d[j + 2];
+        const mn = b < g ? (b < r ? b : r) : (g < r ? g : r);
+        const mxBg = b > g ? b : g;
+        if (r - mxBg > 32) {
+          redCnt++;
+          if (y < midY) redTop++;
+          else redBot++;
+        }
+        if (mn > 150) dotCnt++;
+        if (mn >= 225) whiteCnt++;
+      }
     }
-    // Face-up hearts/diamonds (red ink on a white card) are mostly near-white; a card back is mostly red
-    // with sparse white dots, so cap the near-white share to avoid mistaking a red face card for a BACK.
-    return redCnt / n >= 0.24 && dotCnt / n >= 0.10 && whiteCnt / n <= 0.42;
+    // Face-up hearts/diamonds (red ink on a white card) are mostly near-white and localized;
+    // a card back has red pattern across both top and bottom halves with sparse white dots.
+    const halfN = Math.max(1, midY * w);
+    const botN = Math.max(1, (h - midY) * w);
+    return (
+      redCnt / n >= 0.24 &&
+      redTop / halfN >= 0.14 &&
+      redBot / botN >= 0.14 &&
+      dotCnt / n >= 0.10 &&
+      whiteCnt / n <= 0.42
+    );
   }
 
   function classifySuitZone(suitZone, inkZones, suitTemplates, paperHi = 250) {
@@ -1646,15 +1732,44 @@
 
     const suitMin = toMinGray(suitZone);
     const suitPrep = prepareSourceForMatch(suitMin, false);
+    const perSuitBest = {};
     let bestSuit = null, bestConf = 0.0;
     for (const tpl of activeTpls) {
       for (const sc of [0.88, 0.96, 1.0, 1.06, 1.12]) {
         const entry = getScaledTplGray(tpl, sc, true);
         if (!entry || entry.sw > suitMin.w || entry.sh > suitMin.h) continue;
         const m = matchPreparedTemplate(suitPrep, entry.scaled, entry.tZero, entry.tNorm);
-        if (Number.isFinite(m.maxVal) && m.maxVal > bestConf) {
-          bestConf = m.maxVal;
-          bestSuit = tpl.rank;
+        if (Number.isFinite(m.maxVal)) {
+          if (!perSuitBest[tpl.rank] || m.maxVal > perSuitBest[tpl.rank].conf) {
+            perSuitBest[tpl.rank] = { conf: m.maxVal, x: m.maxX, y: m.maxY, w: entry.sw, h: entry.sh };
+          }
+          if (m.maxVal > bestConf) {
+            bestConf = m.maxVal;
+            bestSuit = tpl.rank;
+          }
+        }
+      }
+    }
+    // Clubs vs Spades disambiguation when grayscale NCC is within 0.045:
+    // Spades has a pointed narrow apex in the top ~25% rows; Clubs has a wider rounded top lobe.
+    if (!isRed && bestSuit && perSuitBest[bestSuit] && perSuitBest.C && perSuitBest.S && Math.abs(perSuitBest.C.conf - perSuitBest.S.conf) <= 0.045) {
+      const ref = perSuitBest[bestSuit];
+      const topH = Math.max(2, Math.round(ref.h * 0.28));
+      let topInk = 0, topTot = 0;
+      for (let py = 0; py < topH && ref.y + py < suitMin.h; py++) {
+        for (let px = 0; px < ref.w && ref.x + px < suitMin.w; px++) {
+          topTot++;
+          if (suitMin.data[(ref.y + py) * suitMin.w + (ref.x + px)] < suitInkThr) topInk++;
+        }
+      }
+      if (topTot > 0) {
+        const topFill = topInk / topTot;
+        if (topFill < 0.24 && perSuitBest.S.conf >= bestConf - 0.03) {
+          bestSuit = "S";
+          bestConf = perSuitBest.S.conf;
+        } else if (topFill > 0.34 && perSuitBest.C.conf >= bestConf - 0.03) {
+          bestSuit = "C";
+          bestConf = perSuitBest.C.conf;
         }
       }
     }
@@ -2380,7 +2495,7 @@
   }
 
   function detectDealerBadgeTotal(dealerImg, clusters = []) {
-    if (!dealerImg || dealerImg.w < 16 || dealerImg.h < 16) return [null, 0.0];
+    if (!dealerImg || dealerImg.w < 16 || dealerImg.h < 16) return [null, 0.0, null];
     let bx0 = 0;
     let by0 = Math.round(dealerImg.h * 0.20);
     let bx1 = Math.round(dealerImg.w * 0.55);
@@ -2400,12 +2515,25 @@
 
     const bw = bx1 - bx0;
     const bh = by1 - by0;
-    if (bw < 10 || bh < 10) return [null, 0.0];
+    if (bw < 10 || bh < 10) return [null, 0.0, null];
 
-    const subGray = toGray(cropImage(dealerImg, bx0, by0, bw, bh));
+    const subBgr = cropImage(dealerImg, bx0, by0, bw, bh);
+    const subGray = toGray(subBgr);
+    const isColor = subBgr.c === 3;
     const mask = new Uint8Array(bw * bh);
-    for (let i = 0; i < mask.length; i++) {
-      if (subGray.data[i] >= 150) mask[i] = 1;
+    if (isColor) {
+      const sd = subBgr.data;
+      for (let i = 0, j = 0; i < mask.length; i++, j += 3) {
+        const b = sd[j], g = sd[j + 1], r = sd[j + 2];
+        const mn = b < g ? (b < r ? b : r) : (g < r ? g : r);
+        const mx = b > g ? (b > r ? b : r) : (g > r ? g : r);
+        // White digit foreground: high minimum channel or bright low-chroma pixel
+        if (mn >= 150 || (subGray.data[i] >= 165 && (mx - mn) < 42)) mask[i] = 1;
+      }
+    } else {
+      for (let i = 0; i < mask.length; i++) {
+        if (subGray.data[i] >= 150) mask[i] = 1;
+      }
     }
 
     const { stats } = connectedComponentsWithStats(mask, bw, bh);
@@ -2417,21 +2545,30 @@
       if (area < 6) continue;
       if (x + w >= bw - 1 && h >= maxDigitH * 0.9) continue;
 
-      // Verify surrounding badge ring is dark (white-on-dark circular pill, not card text on white)
+      // Verify surrounding badge ring is either dark (< 135) OR a saturated colored pill (green win / red bust)
       const mx0 = Math.max(0, x - 3);
       const my0 = Math.max(0, y - 3);
       const mx1 = Math.min(bw, x + w + 3);
       const my1 = Math.min(bh, y + h + 3);
-      let darkBorder = 0;
+      let pillBgBorder = 0;
       let borderCnt = 0;
       for (let py = my0; py < my1; py++) {
         for (let px = mx0; px < mx1; px++) {
           if (px >= x && px < x + w && py >= y && py < y + h) continue;
           borderCnt++;
-          if (subGray.data[py * bw + px] < 135) darkBorder++;
+          const idx = py * bw + px;
+          if (subGray.data[idx] < 135) {
+            pillBgBorder++;
+          } else if (isColor) {
+            const j = idx * 3;
+            const b = subBgr.data[j], g = subBgr.data[j + 1], r = subBgr.data[j + 2];
+            const mn = b < g ? (b < r ? b : r) : (g < r ? g : r);
+            const mx = b > g ? (b > r ? b : r) : (g > r ? g : r);
+            if ((mx - mn) >= 45 && mn < 155) pillBgBorder++;
+          }
         }
       }
-      const darkRatio = borderCnt > 0 ? darkBorder / borderCnt : 0;
+      const darkRatio = borderCnt > 0 ? pillBgBorder / borderCnt : 0;
       if (borderCnt > 0 && darkRatio < 0.45) continue;
 
       const [digit, conf] = matchBadgeDigitPatch(subGray, x, y, w, h);
@@ -2441,24 +2578,43 @@
       }
     }
 
-    if (!digitCands.length) return [null, 0.0];
+    if (!digitCands.length) return [null, 0.0, null];
     digitCands.sort((a, b) => a.x - b.x);
 
-    // Group horizontally adjacent digits on the same baseline (take rightmost group if soft X/Y)
-    const groups = [];
+    // Group horizontally adjacent digits on the same baseline (allow 3-digit soft X/Y runs before splitting)
+    const rawRuns = [];
     for (const c of digitCands) {
-      const lastG = groups.length ? groups[groups.length - 1] : null;
+      const lastG = rawRuns.length ? rawRuns[rawRuns.length - 1] : null;
       if (lastG) {
         const prev = lastG[lastG.length - 1];
         const sameRow = Math.abs(c.y - prev.y) <= Math.max(3, Math.round(prev.h * 0.25));
         const sameH = c.h >= prev.h * 0.70 && c.h <= prev.h * 1.40;
         const gap = c.x - (prev.x + prev.w);
-        if (sameRow && sameH && gap >= -2 && gap <= Math.max(4, Math.round(prev.h * 0.55)) && lastG.length < 2) {
+        if (sameRow && sameH && gap >= -2 && gap <= Math.max(4, Math.round(prev.h * 0.55))) {
           lastG.push(c);
           continue;
         }
       }
-      groups.push([c]);
+      rawRuns.push([c]);
+    }
+
+    // Split any 3+ digit run (e.g. "7/17" with '/' dropped -> [7, 1, 7]) from the right so the rightmost 2-digit total wins
+    const groups = [];
+    for (const run of rawRuns) {
+      if (run.length <= 2) {
+        groups.push(run);
+      } else {
+        const tail2 = run.slice(-2);
+        const tailVal = parseInt(tail2.map((c) => c.digit).join(""), 10);
+        if (tailVal >= 12 && tailVal <= 21) {
+          groups.push(run.slice(0, run.length - 2));
+          groups.push(tail2);
+        } else {
+          for (let i = 0; i < run.length; i += 2) {
+            groups.push(run.slice(i, i + 2));
+          }
+        }
+      }
     }
 
     let bestTotal = null;
@@ -2594,6 +2750,13 @@
 
     const slotIdx = Number.isInteger(context.slotIdx) ? context.slotIdx : dCommittedRanks.length;
     const mustReach17 = context.mustReach17 !== false;
+    const isValidStep = (rank) => {
+      if (!mustReach17) return true;
+      const [newTot] = evalBjRanks([...dCommittedRanks, rank]);
+      if (dSoft && dTot < 17) return true; // Soft 12..16 can legally draw any card (including 10 -> hard 12..16)
+      if (dTot >= 7 && newTot < 17) return false;
+      return true;
+    };
 
     // 1. Sub-threshold runner-up template peak (0.42..0.72) + rightmost card width prior
     const subCands = [];
@@ -2611,8 +2774,7 @@
         if (!sc || !sc.rank || sc.rank === "BACK") continue;
         const val = RANK_TO_VAL[sc.rank];
         if (val === undefined || val === null) continue;
-        const [newTot] = evalBjRanks([...dCommittedRanks, sc.rank]);
-        if (mustReach17 && dTot >= 7 && newTot < 17) continue;
+        if (!isValidStep(sc.rank)) continue;
         let score = Number(sc.conf) || 0.45;
         // Width prior: a single-digit rank has narrower remRight (11..15 px) while "10" requires wider card tail (>= 16 px)
         if (typeof sc.remRight === "number") {
@@ -2667,8 +2829,7 @@
         const val = rk && Object.prototype.hasOwnProperty.call(RANK_TO_VAL, rk) ? RANK_TO_VAL[rk] : (fs ? fs.val : null);
         if (val !== null && val !== undefined) {
           const canonRank = val === 0 ? "10" : val === 1 ? "A" : String(val);
-          const [newTot] = evalBjRanks([...dCommittedRanks, canonRank]);
-          if (!mustReach17 || dTot < 7 || newTot >= 17) {
+          if (isValidStep(canonRank)) {
             return { rank: canonRank, val };
           }
         }
@@ -2683,13 +2844,7 @@
       : defaultRem;
 
     // Filter candidate ranks that satisfy dealer progression rules
-    let validPool = ALL_RANKS.filter((c) => {
-      const [tot] = evalBjRanks([...dCommittedRanks, c.rank]);
-      if (mustReach17 && dTot >= 7) {
-        return tot >= 17;
-      }
-      return true;
-    });
+    let validPool = ALL_RANKS.filter((c) => isValidStep(c.rank));
     if (!validPool.length) validPool = ALL_RANKS;
 
     // If narrow rightmost cluster width was observed (e.g. < 15 normalized px), exclude "10" from the pool
@@ -2765,9 +2920,11 @@
 
     loadPack(pack) {
       this.banks = { hud: [], felt: [], banner: [], suit: [], ui: [] };
+      this._lazyRawBanks = { felt: [], ui: [] };
+      _clearTplFftLRU();
       this.invalidateCaches();
       if (!pack || !pack.templates) return;
-      for (const bank of ["hud", "felt", "banner", "suit", "ui"]) {
+      for (const bank of ["hud", "banner", "suit"]) {
         const items = pack.templates[bank] || [];
         for (const item of items) {
           if (item.bgrB64 && item.w && item.h) {
@@ -2780,6 +2937,26 @@
           }
         }
       }
+      for (const bank of ["felt", "ui"]) {
+        const items = pack.templates[bank] || [];
+        this._lazyRawBanks[bank] = items.filter((item) => item && ((item.bgrB64 && item.w && item.h) || (item.bgr && item.bgr.data)));
+      }
+    }
+
+    _ensureBankDecoded(bankName) {
+      if (!this._lazyRawBanks || !this._lazyRawBanks[bankName] || !this._lazyRawBanks[bankName].length) return;
+      const items = this._lazyRawBanks[bankName];
+      this._lazyRawBanks[bankName] = [];
+      for (const item of items) {
+        if (item.bgrB64 && item.w && item.h) {
+          const bgr = { w: item.w, h: item.h, c: 3, data: b64ToUint8(item.bgrB64) };
+          const entry = createTemplateEntry(bankName, item.name, bgr, item.dataB64 || "");
+          if (entry) this.banks[bankName].push(entry);
+        } else if (item.bgr && item.bgr.data) {
+          const entry = createTemplateEntry(bankName, item.name, item.bgr, item.dataB64 || "");
+          if (entry) this.banks[bankName].push(entry);
+        }
+      }
     }
 
     listTemplateCounts() {
@@ -2787,6 +2964,11 @@
       for (const bank of Object.keys(summary)) {
         for (const t of this.banks[bank] || []) {
           summary[bank][t.rank] = (summary[bank][t.rank] || 0) + 1;
+        }
+        const lazyItems = (this._lazyRawBanks && this._lazyRawBanks[bank]) || [];
+        for (const item of lazyItems) {
+          const rk = item.rank || String(item.name || "").replace(/\.png$/i, "").toUpperCase().split("_")[0];
+          if (rk) summary[bank][rk] = (summary[bank][rk] || 0) + 1;
         }
       }
       return summary;
@@ -2797,6 +2979,7 @@
       if (!["hud", "felt", "banner", "suit", "ui"].includes(bankName)) {
         throw new Error(`Unsupported template bank: ${bankName}`);
       }
+      this._ensureBankDecoded(bankName);
       if (!cropBgr || cropBgr.w === 0 || cropBgr.h === 0 || arrayStats(cropBgr.data).std < 1.0) {
         throw new Error("Selected crop has no contrast (blank region)");
       }
@@ -2818,19 +3001,23 @@
     }
 
     deleteRankTemplates(bankName, rank) {
+      this._ensureBankDecoded(bankName);
       const tok = String(rank || "").trim().toUpperCase();
       const list = this.banks[bankName] || [];
       const kept = list.filter((t) => t.rank !== tok);
       const removed = list.length - kept.length;
       this.banks[bankName] = kept;
+      _clearTplFftLRU();
       this.invalidateCaches();
       return removed;
     }
 
     clearBankTemplates(bankName) {
+      this._ensureBankDecoded(bankName);
       const list = this.banks[bankName] || [];
       const removed = list.length;
       this.banks[bankName] = [];
+      _clearTplFftLRU();
       this.invalidateCaches();
       return removed;
     }
@@ -2838,7 +3025,7 @@
     exportPack() {
       const templates = {};
       for (const bank of ["hud", "felt", "banner", "suit", "ui"]) {
-        templates[bank] = (this.banks[bank] || []).map((t) => ({
+        const decoded = (this.banks[bank] || []).map((t) => ({
           name: t.name,
           rank: t.rank,
           w: t.bgr.w,
@@ -2846,6 +3033,15 @@
           bgrB64: uint8ToB64(t.bgr.data),
           dataB64: t.dataB64 || "",
         }));
+        const lazy = ((this._lazyRawBanks && this._lazyRawBanks[bank]) || []).map((item) => ({
+          name: item.name,
+          rank: item.rank || String(item.name || "").replace(/\.png$/i, "").toUpperCase().split("_")[0],
+          w: item.w || (item.bgr ? item.bgr.w : 0),
+          h: item.h || (item.bgr ? item.bgr.h : 0),
+          bgrB64: item.bgrB64 || (item.bgr && item.bgr.data ? uint8ToB64(item.bgr.data) : ""),
+          dataB64: item.dataB64 || "",
+        }));
+        templates[bank] = [...decoded, ...lazy];
       }
       return {
         version: 1,
@@ -3076,7 +3272,7 @@
 
       let pbConf = 0.0;
       let pbRank = "";
-      if (placeBetsImg && placeBetsImg.w > 0 && bannerTpls.length) {
+      if (placeBetsImg && placeBetsImg.w > 0 && bannerTpls.length && !bannerState) {
         const pbTpls = bannerTpls.filter((t) => t.rank === "PLACE_BETS" || t.rank === "LAST_BETS" || t.rank === "NO_MORE_BETS");
         if (pbTpls.length) {
           const pbSig = computeRoiSignature(placeBetsImg, 36, 12, false);
@@ -3103,17 +3299,18 @@
             pbConf = ptpl ? pconf : 0.0;
             this._cachedPb = [pbRank, pbConf];
           }
-          if (pbRank && pbConf > 0.0 && !bannerState) {
+          if (pbRank && pbConf > 0.0) {
             bannerState = pbRank;
             bannerConf = pbConf;
             bannerSource = "place_bets_roi";
           }
         }
-      } else {
+      } else if (!placeBetsImg || placeBetsImg.w === 0) {
         this._lastPbSig = null;
         this._cachedPb = ["", 0.0];
       }
-      if (pbRank !== "PLACE_BETS") pbConf = 0.0;
+      if (bannerState === "PLACE_BETS" && pbConf === 0.0) pbConf = bannerConf;
+      else if (pbRank !== "PLACE_BETS") pbConf = 0.0;
 
       if (bannerState === "SHUFFLE") {
         shufOn = true;
@@ -3146,12 +3343,6 @@
   /* ==========================================================================
      4. Sequence Debouncer, Keep-Alive Manager & Companion State Machine
      ========================================================================== */
-
-  function sameBjValue(r1, r2) {
-    const v1 = RANK_TO_VAL[r1];
-    const v2 = RANK_TO_VAL[r2];
-    return v1 !== undefined && v1 !== null && v1 === v2;
-  }
 
   function evalBjRanks(ranks) {
     let total = 0, aces = 0;
@@ -3234,7 +3425,7 @@
       if (this.fastTailConfirm && this.committedRanks.length && detections.length >= this.committedRanks.length) {
         let prefixOkWipe = true;
         for (let k = 0; k < this.committedRanks.length; k++) {
-          if (this.committedRanks[k] !== "BACK" && detections[k].rank !== this.committedRanks[k]) {
+          if (this.committedRanks[k] !== "BACK" && !sameBjValue(detections[k].rank, this.committedRanks[k])) {
             prefixOkWipe = false;
             break;
           }
@@ -3253,7 +3444,7 @@
       const committedWipe = detections.length < this.committedRanks.length;
       let prefixOk = !committedWipe;
       for (let k = 0; k < this.committedRanks.length && prefixOk; k++) {
-        if (this.committedRanks[k] !== "BACK" && detections[k].rank !== this.committedRanks[k]) {
+        if (this.committedRanks[k] !== "BACK" && !sameBjValue(detections[k].rank, this.committedRanks[k])) {
           prefixOk = false;
         }
       }
@@ -3819,6 +4010,8 @@
       // Fallback E: multi-signal educated guess across all 10 ranks (A, 2..9, 10) so dealer reaches >= 17
       let educatedGuessRank = null;
       let guessCount = 0;
+      const shoeRemCopy = Array.isArray(this.sync_shoe_rem) ? this.sync_shoe_rem.slice() : null;
+      let activeBadgeHint = this._lastDealerBadgeHint;
       while (isDealerStillIncomplete() && guessCount < 6) {
         const dCommBefore = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
         const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
@@ -3826,10 +4019,10 @@
         const guess = guessMissingDealerCard(dCommBefore, {
           slotIdx,
           subCandidates: this._bestSubDealerTail,
-          badgeHint: this._lastDealerBadgeHint,
+          badgeHint: activeBadgeHint,
           feltSightings: this._feltSightings,
-          shoeRem: this.sync_shoe_rem,
-          roundSeed: this.sync_shoe_rem ? this._roundSeq + guessCount * 7 : null,
+          shoeRem: shoeRemCopy,
+          roundSeed: this._roundSeq + guessCount * 7,
           mustReach17: true,
         });
         if (!guess) break;
@@ -3838,6 +4031,10 @@
         } else {
           this.dDebouncer.committedRanks.push(guess.rank);
         }
+        if (shoeRemCopy && guess.val >= 0 && guess.val < shoeRemCopy.length && shoeRemCopy[guess.val] > 0) {
+          shoeRemCopy[guess.val]--;
+        }
+        activeBadgeHint = null;
         educatedGuessRank = educatedGuessRank ? `${educatedGuessRank},${guess.rank}` : guess.rank;
         const guessDet = {
           rank: guess.rank,
@@ -3960,9 +4157,14 @@
         if (uiHands.length) pHandsRanks = uiHands;
       }
       let dRanks = this._reviewDealerRanks.slice();
+      const reviewRealCount = dRanks.filter((r) => r !== "BACK").length;
       if (Array.isArray(this.sync_draft_dealer) && (this.sync_draft_count > 0 || !dRanks.length)) {
         const uiD = this.sync_draft_dealer.map((v) => (v === 0 ? "10" : v === 1 ? "A" : String(v)));
-        if (stage === "3s" || uiD.length >= dRanks.filter((r) => r !== "BACK").length) {
+        if (this.sync_draft_dealer_manual && uiD.length < reviewRealCount) {
+          // User manually deleted/edited dealer cards in draft — respect their edit and skip auto re-guess
+          return;
+        }
+        if (stage === "3s" || uiD.length >= reviewRealCount) {
           dRanks = uiD;
         }
       }
@@ -3991,10 +4193,17 @@
 
       if (!revIncomplete()) return;
 
-      // Check if late dealer cards appeared on the current frame during PLACE_BETS
+      // Check if late dealer cards appeared on the current frame during PLACE_BETS (verify prefix matches)
       if (obs && Array.isArray(obs.dealer_cards) && obs.dealer_cards.length) {
         const realObs = obs.dealer_cards.filter((d) => d.rank !== "BACK" && d.val !== null && d.val !== undefined && d.conf >= 0.72);
-        while (realObs.length > dRanks.filter((r) => r !== "BACK").length) {
+        const existingReal = dRanks.filter((r) => r !== "BACK");
+        let prefixMatches = realObs.length > existingReal.length;
+        for (let k = 0; k < existingReal.length && prefixMatches; k++) {
+          if (!sameBjValue(realObs[k].rank, existingReal[k])) {
+            prefixMatches = false;
+          }
+        }
+        while (prefixMatches && realObs.length > dRanks.filter((r) => r !== "BACK").length) {
           const nxtIdx = dRanks.filter((r) => r !== "BACK").length;
           const det = realObs[nxtIdx];
           const backIdx = dRanks.indexOf("BACK");
@@ -4019,6 +4228,8 @@
 
       const guessedRanks = [];
       let guessCount = 0;
+      const shoeRemCopy = Array.isArray(this.sync_shoe_rem) ? this.sync_shoe_rem.slice() : null;
+      let activeBadgeHint = this._reviewBadgeHint;
       while (revIncomplete() && guessCount < 6) {
         const dCommBefore = dRanks.filter((r) => r !== "BACK");
         const backIdx = dRanks.indexOf("BACK");
@@ -4026,15 +4237,19 @@
         const guess = guessMissingDealerCard(dCommBefore, {
           slotIdx,
           subCandidates: this._reviewSubDealerTail,
-          badgeHint: this._reviewBadgeHint,
+          badgeHint: activeBadgeHint,
           feltSightings: this._reviewFeltSightings,
-          shoeRem: this.sync_shoe_rem,
-          roundSeed: this.sync_shoe_rem ? this._roundSeq + guessCount * 7 + (stage === "3s" ? 13 : 0) : null,
+          shoeRem: shoeRemCopy,
+          roundSeed: this._roundSeq + guessCount * 7 + (stage === "3s" ? 13 : 0),
           mustReach17: true,
         });
         if (!guess) break;
         if (backIdx >= 0) dRanks[backIdx] = guess.rank;
         else dRanks.push(guess.rank);
+        if (shoeRemCopy && guess.val >= 0 && guess.val < shoeRemCopy.length && shoeRemCopy[guess.val] > 0) {
+          shoeRemCopy[guess.val]--;
+        }
+        activeBadgeHint = null;
         guessedRanks.push(guess.rank);
         this._reviewEmittedD++;
         events.push({
@@ -4292,13 +4507,15 @@
         const prevH0 = this.pDebouncers[0] ? this.pDebouncers[0].committedRanks.slice() : [];
         let h0List = handsInput[0] || [];
         let h1List = handsInput[1] || [];
+        const h1HasSplitSeed = h1List.length >= 1 && prevH0.length >= 2 && sameBjValue(h1List[0].rank, prevH0[1]);
         const unseparatedOverlap =
           this._emittedSplitHands === 1 &&
           prevH0.length === 2 &&
           sameBjValue(prevH0[0], prevH0[1]) &&
           h0List.length >= 2 &&
           sameBjValue(h0List[0].rank, prevH0[0]) &&
-          sameBjValue(h0List[1].rank, prevH0[1]);
+          sameBjValue(h0List[1].rank, prevH0[1]) &&
+          !h1HasSplitSeed;
 
         if (unseparatedOverlap) {
           this._splitCandCount = 0;
@@ -4339,6 +4556,8 @@
             let inferredSeedRk = null;
             if (pairCanReanchor) {
               inferredSeedRk = prevH0[0];
+            } else if (this._splitSeedCards.has(0)) {
+              inferredSeedRk = this._splitSeedCards.get(0).rank;
             } else if (prevH0.length === 1 && prevH0[0] !== "BACK") {
               inferredSeedRk = prevH0[0];
             } else if (h0List.length && h1List.length) {
@@ -4348,7 +4567,7 @@
             }
 
             const splitCards = [];
-            for (const hK of inputKeys.slice(0, 2)) {
+            for (const hK of inputKeys.slice(0, 4)) {
               const c0 = handsInput[hK][0];
               const rk0 = pairCanReanchor && hK < 2 ? prevH0[hK] : (inferredSeedRk !== null ? inferredSeedRk : c0.rank);
               const val0 = RANK_TO_VAL[rk0] !== undefined && RANK_TO_VAL[rk0] !== null ? RANK_TO_VAL[rk0] : c0.val;
@@ -4394,23 +4613,37 @@
                 this.pDebouncers[0].reanchor([prevH0[0]]);
               }
 
-              const d1 = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
-              if (h1List.length) {
-                const seq1Cur = h1List.map((d) => d.rank).join(",");
-                const p1Entry = priorPending.get(1);
-                const p1Seq = p1Entry ? p1Entry[0] : "";
-                const p1Cnt = p1Entry ? p1Entry[1] : 0;
-                const p1Arr = p1Seq ? p1Seq.split(",") : [];
-                const p1Norm = (p1Arr.length && sameBjValue(p1Arr[0], prevH0[1])) ? p1Seq : (p1Arr.length ? [prevH0[1], ...p1Arr].join(",") : "");
-                if (sameBjValue(h1List[0].rank, prevH0[1]) && p1Norm === seq1Cur && p1Cnt > 0 && h1List.length > 1) {
-                  d1.reanchor([prevH0[1]], seq1Cur, p1Cnt);
+              for (const hK of inputKeys.slice(1, 4)) {
+                const seedRk = hK < 2 ? prevH0[1] : (inferredSeedRk || prevH0[0]);
+                const hList = handsInput[hK] || [];
+                const dK = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
+                if (hList.length) {
+                  const seqCur = hList.map((d) => d.rank).join(",");
+                  const pEntry = priorPending.get(hK);
+                  const pSeq = pEntry ? pEntry[0] : "";
+                  const pCnt = pEntry ? pEntry[1] : 0;
+                  const pArr = pSeq ? pSeq.split(",") : [];
+                  const pNorm = (pArr.length && sameBjValue(pArr[0], seedRk)) ? pSeq : (pArr.length ? [seedRk, ...pArr].join(",") : "");
+                  if (sameBjValue(hList[0].rank, seedRk) && pNorm === seqCur && pCnt > 0 && hList.length > 1) {
+                    dK.reanchor([seedRk], seqCur, pCnt);
+                  } else {
+                    dK.reanchor([seedRk]);
+                  }
                 } else {
-                  d1.reanchor([prevH0[1]]);
+                  dK.reanchor([seedRk]);
                 }
-              } else {
-                d1.reanchor([prevH0[1]]);
+                this.pDebouncers[hK] = dK;
               }
-              this.pDebouncers[1] = d1;
+            } else {
+              // Re-split (e.g., 2 -> 3 or 3 -> 4 hands): reanchor any newly added hand debouncer on its seed rank
+              for (const hK of inputKeys.slice(0, 4)) {
+                if (this.pDebouncers[hK]) continue;
+                const seed = this._splitSeedCards.get(hK);
+                if (!seed) continue;
+                const dK = new SequenceDebouncer(this.cfg.confirm_frames, this.cfg.clear_frames, false, Math.max(0.84, this.cfg.min_hud_confidence));
+                dK.reanchor([seed.rank]);
+                this.pDebouncers[hK] = dK;
+              }
             }
             this._splitPendingSeqs.clear();
           }
@@ -4471,6 +4704,8 @@
       }
       if (!["IDLE", "BETTING", "ROUND_OVER"].includes(this.state) && pCleared && dCleared) {
         events.push(...this._finalizeClearedRound(now));
+        this.state = "ROUND_OVER";
+        this._sawClearSinceRoundOver = false;
         return events;
       }
       if (!splitPending && !events.some((e) => e.type === "card" || e.type === "split")) {
@@ -4809,7 +5044,7 @@
           });
           return events;
         }
-        if (reloadDur >= (this.cfg.keepalive_reload_grace_sec || 14.0)) {
+        if (reloadDur >= (this.cfg.keepalive_reload_grace_sec || 12.0)) {
           this.state = "WARN";
           this._graceUntilTs = 0.0;
           this._lastCooldownEndTs = now + 90.0;
@@ -4861,8 +5096,8 @@
         this._watchElapsedSec += dt;
       }
 
-      const targetSec = Math.max(60, Number(this.cfg.keepalive_interval_sec) || 600);
-      const hardWarnSec = Math.max(targetSec + 60, Number(this.cfg.keepalive_hard_warn_sec) || 780);
+      const targetSec = Math.max(30, Number(this.cfg.keepalive_interval_sec) || 600);
+      const hardWarnSec = Math.max(targetSec + 60, Number(this.cfg.keepalive_hard_warn_sec) || 750);
 
       if (this._watchElapsedSec >= hardWarnSec && now - this._lastHardWarnTs >= 30.0) {
         this._lastHardWarnTs = now;
@@ -4922,16 +5157,17 @@
 
       const [ok, methodUsed] = triggerRefreshCb ? triggerRefreshCb() : [false, "none"];
       if (ok) {
+        const graceSec = this.cfg.keepalive_reload_grace_sec || 12.0;
         this._refreshCount++;
         this._refreshStartedTs = now;
-        this._graceUntilTs = now + (this.cfg.keepalive_reload_grace_sec || 14.0);
+        this._graceUntilTs = now + graceSec;
         this._manualArmed = false;
         this.state = "REFRESHING";
         events.push({
           type: "keepalive_status",
           event: "refreshing",
           method: methodUsed,
-          graceSec: this.cfg.keepalive_reload_grace_sec || 14.0,
+          graceSec,
           keepalive: this.getStatus(now),
         });
       } else if (now - this._lastAlertPlaceBetsTs >= 15.0) {
@@ -5310,7 +5546,7 @@
           } finally {
             done();
             if (scheduleFollowUp && this._loopTimer) {
-              setTimeout(pollOnce, 4);
+              setTimeout(pollOnce, 16);
             }
           }
         };
@@ -5403,7 +5639,7 @@
       }
       const payload = {
         action: "reloadLeftSafari",
-        allowActiveFallback: opts.allowActiveFallback !== false,
+        allowActiveFallback: opts.allowActiveFallback === true,
         testImmediate: !!opts.testImmediate,
       };
       if (Array.isArray(opts.keywords) && opts.keywords.length) {
@@ -5421,6 +5657,7 @@
       this._unrotatedRawFrame = frameBgr;
       const rot = normalizeRotationDeg(this.cfg.frame_rotation || 0);
       const procFrame = rot !== 0 ? rotateImage(frameBgr, rot) : frameBgr;
+      const wasBroadcastActive = this.broadcastActive;
       this.latestRawFrame = procFrame;
       this.latestFrameTs = now;
       this.broadcastActive = true;
@@ -5449,6 +5686,8 @@
         forceDealerScan,
       });
 
+      const prevSmState = this.sm.state;
+      const prevKaState = this.keepalive.state;
       const events = this.sm.step(obs);
       const kaEvents = this.keepalive.step({
         now,
@@ -5469,7 +5708,19 @@
       for (const ev of allEvents) {
         this.broadcast(ev);
       }
-      this.broadcast(this.buildStatusPayload(now));
+      const statusChanged =
+        allEvents.length > 0 ||
+        !wasBroadcastActive ||
+        this.sm.state !== prevSmState ||
+        this.keepalive.state !== prevKaState ||
+        obs.banner_state !== this._lastStatusBanner ||
+        !!obs.shuffle_active !== !!this._lastStatusShuffle;
+      if (statusChanged || !this._lastStatusBroadcastTs || (now - this._lastStatusBroadcastTs) >= 0.25) {
+        this._lastStatusBroadcastTs = now;
+        this._lastStatusBanner = obs.banner_state;
+        this._lastStatusShuffle = !!obs.shuffle_active;
+        this.broadcast(this.buildStatusPayload(now));
+      }
       return allEvents;
     }
 

@@ -45,9 +45,14 @@ assert(pack && pack.templates, "DEFAULT_COMPANION_PACK must be loaded");
 const cfg = Engine.defaultConfig(pack.config);
 const detector = new Engine.PlaytechDetector(cfg, pack);
 const counts = detector.listTemplateCounts();
-const totalTemplates = Object.values(detector.banks).reduce((acc, arr) => acc + arr.length, 0);
+const totalTemplates = Object.values(counts).reduce(
+  (acc, m) => acc + Object.values(m).reduce((a, b) => a + b, 0),
+  0
+);
 console.log("   Loaded templates:", totalTemplates, "across banks:", JSON.stringify(counts));
 assert(totalTemplates >= 70, `Expected >= 70 templates loaded, got ${totalTemplates}`);
+assert.strictEqual(detector.banks.felt.length, 0, "Expected felt bank to be lazy-decoded on startup");
+assert.strictEqual(detector.banks.ui.length, 0, "Expected ui bank to be lazy-decoded on startup");
 
 console.log("2. Testing iPad Split View Left-Pane 16:9 Viewport Isolation...");
 // Simulate a 1366x1024 iPad Pro screen in Split View:
@@ -972,12 +977,6 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   }
 
   console.log("   All iPad JS CV, Rotation, Cache, Worker & Loopback Polling checks PASSED!");
-})().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
-
-
 
 // Test 16: red face-up dealer cards (hearts/diamonds) abutting the upcard must not be mistaken for a face-down BACK
 {
@@ -2031,7 +2030,229 @@ console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks
   }
   console.log("   Test 30 PASSED");
 }
-console.log("\nALL 30 ENGINE TESTS PASSED SUCCESSFULLY!");
+
+// Test 31: Light Mode iPadOS Split View divider (#E5E5EA / #D1D1D6) detection
+{
+  console.log("31. Testing Light Mode iPadOS Split View divider detection...");
+  const sw = 1200, sh = 900;
+  const lightFrame = Engine.createImage(sw, sh, 3, 25);
+  // Left pane (0..594): dark browser/game area; Divider (595..604): iPadOS Light Mode #E5E5EA (BGR: 234, 229, 229); Right pane (605..1199): tracker UI
+  fillRect(lightFrame, 0, 0, 595, sh, 30, 55, 25);
+  fillRect(lightFrame, 595, 0, 10, sh, 234, 229, 229);
+  fillRect(lightFrame, 605, 0, sw - 605, sh, 28, 30, 36);
+  const splitRect = Engine.detectSplitViewLeftPane(lightFrame);
+  assert(Array.isArray(splitRect) && splitRect[2] >= 580 && splitRect[2] <= 605, `Expected Light Mode left pane width ~595, got ${JSON.stringify(splitRect)}`);
+  console.log("   Test 31 PASSED");
+}
+
+// Test 32: Saturated colored dealer badge (green win / red bust) & 3-digit soft X/Y badge parsing
+{
+  console.log("32. Testing colored dealer badge & 3-digit soft X/Y badge parsing...");
+  const D5X7 = {
+    "1": ["..1..", ".11..", "..1..", "..1..", "..1..", "..1..", ".111."],
+    "7": ["11111", "....1", "...1.", "..1..", ".1...", ".1...", ".1..."],
+    "2": [".111.", "1...1", "....1", "..11.", ".1...", "1....", "11111"],
+  };
+  const drawDigit = (img, ch, ox, oy, scale = 2) => {
+    const rows = D5X7[ch];
+    for (let r = 0; r < rows.length; r++) {
+      for (let c = 0; c < rows[r].length; c++) {
+        if (rows[r][c] === "1") {
+          fillRect(img, ox + c * scale, oy + r * scale, scale, scale, 250, 250, 250);
+        }
+      }
+    }
+  };
+  // Bright green win pill (BGR: 45, 210, 50 -> gray ~143 >= 135, so dark-only check would fail without chroma support)
+  const greenBadge = Engine.createImage(160, 60, 3, 25);
+  fillRect(greenBadge, 10, 14, 58, 30, 45, 210, 50);
+  drawDigit(greenBadge, "2", 18, 22, 2);
+  drawDigit(greenBadge, "1", 32, 22, 2);
+  const [gTot, gConf, gSoft] = Engine.detectDealerBadgeTotal(greenBadge, []);
+  assert.strictEqual(gTot, 21, `Expected colored win badge total 21, got ${gTot}`);
+  assert(gConf >= 0.56, `Expected badge confidence >= 0.56, got ${gConf}`);
+  assert(gSoft && gSoft.total === 21 && gSoft.tensDigit === 2 && gSoft.onesDigit === 1, `Expected softHint metadata for 21, got ${JSON.stringify(gSoft)}`);
+
+  // Soft 7/17 pill where '/' is dropped leaving 3 adjacent digits [7, 1, 7]
+  const softBadge = Engine.createImage(160, 60, 3, 25);
+  fillRect(softBadge, 6, 14, 72, 30, 20, 20, 20);
+  drawDigit(softBadge, "7", 12, 22, 2);
+  drawDigit(softBadge, "1", 26, 22, 2);
+  drawDigit(softBadge, "7", 40, 22, 2);
+  const [sTot, sConf, sSoft] = Engine.detectDealerBadgeTotal(softBadge, []);
+  assert.strictEqual(sTot, 17, `Expected soft 7/17 badge total 17, got ${sTot}`);
+  assert(sConf >= 0.56);
+  assert(sSoft && sSoft.total === 17, `Expected softHint metadata for 17, got ${JSON.stringify(sSoft)}`);
+  console.log("   Test 32 PASSED");
+}
+
+// Test 33: 10-value pair split (K, Q -> H0 draws 10, H1 has Q+5) and 3-hand re-split seeding
+{
+  console.log("33. Testing 10-value pair split & 3-hand re-split seeding...");
+  const sm33 = new Engine.CompanionStateMachine(Object.assign({}, cfg, { confirm_frames: 2, clear_frames: 2 }));
+  const mk33 = (rank, val, x, h = 0) => ({ rank, val, conf: 0.94, suit: "S", x, y: 10, w: 12, h: 16, hand_index: h });
+  sm33.step({ ts: 1.0, banner_state: "WAIT", player_cards: [], dealer_cards: [], player_hands: {} });
+  // Initial 10-value pair: K + Q
+  const initPair = [mk33("K", 0, 20), mk33("Q", 0, 42)];
+  const dUp = [mk33("6", 6, 10)];
+  for (let f = 0; f < 2; f++) {
+    sm33.step({ ts: 1.2 + f * 0.2, banner_state: "WAIT", player_cards: initPair, dealer_cards: dUp, player_hands: { 0: initPair } });
+  }
+  // Split into H0=[K, 10] and H1=[Q, 5] (H0 drew a 10-value card, must NOT be rejected by unseparatedOverlap!)
+  const h0Split = [mk33("K", 0, 15, 0), mk33("10", 0, 35, 0)];
+  const h1Split = [mk33("Q", 0, 120, 1), mk33("5", 5, 140, 1)];
+  let splitEvts33 = [];
+  for (let f = 0; f < 2; f++) {
+    splitEvts33.push(
+      ...sm33.step({
+        ts: 2.0 + f * 0.2,
+        banner_state: "WAIT",
+        player_cards: [...h0Split, ...h1Split],
+        dealer_cards: dUp,
+        player_hands: { 0: h0Split, 1: h1Split },
+        split_detected: true,
+      })
+    );
+  }
+  assert(splitEvts33.some((e) => e.type === "split" && e.handCount === 2), "10-value pair split (K+10, Q+5) must emit split");
+  // Re-split into 3 hands: H0=[K, 10], H1=[Q, 5], H2=[10, 4]
+  const h2Split = [mk33("10", 0, 210, 2), mk33("4", 4, 230, 2)];
+  let resplitEvts = [];
+  for (let f = 0; f < 2; f++) {
+    resplitEvts.push(
+      ...sm33.step({
+        ts: 3.0 + f * 0.2,
+        banner_state: "WAIT",
+        player_cards: [...h0Split, ...h1Split, ...h2Split],
+        dealer_cards: dUp,
+        player_hands: { 0: h0Split, 1: h1Split, 2: h2Split },
+        split_detected: true,
+      })
+    );
+  }
+  assert(resplitEvts.some((e) => e.type === "split" && e.handCount === 3), "3-hand re-split must emit split with handCount=3");
+  assert(sm33._splitSeedCards.has(2), "3-hand re-split must seed hand 2 in _splitSeedCards");
+  console.log("   Test 33 PASSED");
+}
+
+// Test 34: guessMissingDealerCard soft-hand intermediate draws, local shoe decrement & deterministic seed
+{
+  console.log("34. Testing guessMissingDealerCard soft-hand draw, local shoe decrement & deterministic seed...");
+  // Soft 15 (A+4) with only '10's remaining: isValidStep must allow intermediate draw '10' (soft 15 -> hard 15)
+  const onlyTens = [16, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  const softStep10 = Engine.guessMissingDealerCard(["A", "4"], { shoeRem: onlyTens, roundSeed: 101 });
+  assert(softStep10 && softStep10.rank === "10", `Expected soft A+4 with only 10s to allow intermediate "10", got ${JSON.stringify(softStep10)}`);
+  assert.strictEqual(onlyTens[0], 16, "guessMissingDealerCard must not mutate caller shoeRem");
+
+  // Soft 15 (A+4) with only '2's remaining -> draws '2' (soft 17)
+  const onlyTwos = [0, 0, 4, 0, 0, 0, 0, 0, 0, 0];
+  const softStep2 = Engine.guessMissingDealerCard(["A", "4"], { shoeRem: onlyTwos, roundSeed: 102 });
+  assert(softStep2 && softStep2.rank === "2", `Expected soft A+4 with only 2s to draw "2", got ${JSON.stringify(softStep2)}`);
+
+  // Deterministic reproducibility with identical roundSeed
+  const gA = Engine.guessMissingDealerCard(["6"], { roundSeed: 777 });
+  const gB = Engine.guessMissingDealerCard(["6"], { roundSeed: 777 });
+  assert.deepStrictEqual(gA, gB, "Same roundSeed must produce deterministic guess");
+
+  // State machine multi-card educated guess decrements local shoeRemCopy without mutating sync_shoe_rem
+  const sm34 = new Engine.CompanionStateMachine(Object.assign({}, cfg, { confirm_frames: 2, clear_frames: 2 }));
+  const scarceRem = [10, 0, 0, 0, 0, 1, 0, 0, 0, 0]; // 10 tens, only 1 five
+  sm34.setSyncState({ play_mode: "watch", shoe_rem: scarceRem });
+  const mk34 = (rank, val, x) => ({ rank, val, conf: 0.94, suit: "S", x, y: 10, w: 12, h: 16, hand_index: 0 });
+  const p34 = [mk34("10", 0, 20), mk34("8", 8, 42)];
+  const d34 = [mk34("2", 2, 10)];
+  sm34.step({ ts: 1.0, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {} });
+  for (let f = 0; f < 2; f++) {
+    sm34.step({ ts: 1.2 + f * 0.2, banner_state: "WAIT", player_cards: p34, dealer_cards: d34, player_hands: { 0: p34 } });
+  }
+  const pb34 = sm34.step({ ts: 2.0, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {} });
+  const guessed34 = pb34.filter((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess").map((e) => e.rankLabel);
+  assert(guessed34.length >= 2, `Expected >= 2 guessed cards from dealer '2', got ${JSON.stringify(guessed34)}`);
+  assert(guessed34.filter((r) => r === "5").length <= 1, `Scarce rank '5' (rem=1) must not be guessed twice: ${JSON.stringify(guessed34)}`);
+  assert.strictEqual(scarceRem[5], 1, "Caller shoe_rem must remain unmutated");
+  console.log("   Test 34 PASSED");
+}
+
+// Test 35: pCleared && dCleared transitions state machine to ROUND_OVER so WatchKeepaliveManager can trigger
+{
+  console.log("35. Testing pCleared && dCleared transitions state to ROUND_OVER...");
+  const sm35 = new Engine.CompanionStateMachine(Object.assign({}, cfg, { confirm_frames: 2, clear_frames: 2 }));
+  const mk35 = (rank, val, x) => ({ rank, val, conf: 0.94, suit: "S", x, y: 10, w: 12, h: 16, hand_index: 0 });
+  const p35 = [mk35("10", 0, 20), mk35("9", 9, 42)];
+  const d35 = [mk35("10", 0, 10), mk35("8", 8, 34)];
+  sm35.step({ ts: 1.0, banner_state: "WAIT", player_cards: [], dealer_cards: [], player_hands: {} });
+  for (let f = 0; f < 2; f++) {
+    sm35.step({ ts: 1.2 + f * 0.2, banner_state: "WAIT", player_cards: p35, dealer_cards: d35, player_hands: { 0: p35 } });
+  }
+  assert(sm35.state === "PLAYER_TURN" || sm35.state === "DEALER_TURN");
+  // Wipe both strips for clear_frames without PLACE_BETS banner
+  for (let f = 0; f < 2; f++) {
+    sm35.step({ ts: 2.0 + f * 0.2, banner_state: "WAIT", player_cards: [], dealer_cards: [], player_hands: {} });
+  }
+  assert.strictEqual(sm35.state, "ROUND_OVER", `Expected state === "ROUND_OVER" after pCleared && dCleared, got ${sm35.state}`);
+  console.log("   Test 35 PASSED");
+}
+
+// Test 36: companion_worker.js message round-trip (init -> worker_ready, ws_send -> ws_message_str, shutdown)
+{
+  console.log("36. Testing companion_worker.js message round-trip...");
+  const fs = require("fs");
+  const vm = require("vm");
+  const workerSrc = fs.readFileSync(path.join(__dirname, "companion_worker.js"), "utf8");
+  const workerPosted = [];
+  let workerClosed = false;
+  const workerSelf = {
+    postMessage(msg) { workerPosted.push(msg); },
+    close() { workerClosed = true; },
+    onmessage: null,
+  };
+  const workerCtx = vm.createContext({
+    self: workerSelf,
+    globalThis: workerSelf,
+    IpadCompanionEngine: Engine,
+    DEFAULT_COMPANION_PACK: pack,
+    importScripts: () => {},
+    console,
+    setTimeout,
+    clearTimeout,
+    Date,
+    Math,
+    Uint8Array,
+    Uint32Array,
+    Float32Array,
+    Int32Array,
+    ArrayBuffer,
+    JSON,
+    Object,
+    Array,
+    Map,
+    Set,
+    Number,
+    String,
+    Boolean,
+    Promise,
+  });
+  vm.runInContext(workerSrc, workerCtx);
+  assert.strictEqual(typeof workerSelf.onmessage, "function", "companion_worker.js must install self.onmessage");
+
+  workerSelf.onmessage({ data: { type: "init", isNativeHost: false } });
+  const readyEvt = workerPosted.find((m) => m.type === "worker_ready");
+  assert(readyEvt && readyEvt.status && readyEvt.status.ipadMode === true, "Worker init must post worker_ready with status");
+
+  workerSelf.onmessage({ data: { type: "ws_send", data: JSON.stringify({ type: "control", action: "pause" }) } });
+  const statusStr = workerPosted.filter((m) => m.type === "ws_message_str").map((m) => JSON.parse(m.data)).pop();
+  assert(statusStr && statusStr.type === "status" && statusStr.paused === true, "Worker ws_send pause must broadcast paused status");
+
+  workerSelf.onmessage({ data: { type: "shutdown" } });
+  assert.strictEqual(workerClosed, true, "Worker shutdown must call self.close()");
+  console.log("   Test 36 PASSED");
+}
+
+console.log("\nALL 36 ENGINE TESTS PASSED SUCCESSFULLY!");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
 
 
 

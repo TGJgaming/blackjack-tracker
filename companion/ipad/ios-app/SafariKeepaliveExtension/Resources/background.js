@@ -18,8 +18,7 @@ const DEFAULT_KEYWORDS = [
   "playtech",
   "newport",
   "blackjack",
-  "casino",
-  "live"
+  "casino"
 ];
 
 let ws = null;
@@ -153,7 +152,7 @@ async function handleReloadCommand(msg) {
       return;
     }
 
-    const allowFallback = !msg || msg.allowActiveFallback !== false;
+    const allowFallback = Boolean(msg && msg.allowActiveFallback === true);
     const targetTab = info.matchedTab || (allowFallback ? info.fallbackTab : null);
     if (!targetTab || typeof targetTab.id !== "number") {
       sendJson({

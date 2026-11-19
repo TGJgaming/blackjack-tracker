@@ -156,9 +156,15 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     last_center_img = empty
     ext_status_dirty = False
     bridge: CompanionBridge | None = None
+    cached_tpl_counts: dict[str, dict[str, int]] = list_template_counts()
+
+    def _refresh_tpl_counts() -> dict[str, dict[str, int]]:
+        nonlocal cached_tpl_counts
+        cached_tpl_counts = list_template_counts()
+        return cached_tpl_counts
 
     def build_status(win: WindowRect | None) -> dict[str, Any]:
-        counts = list_template_counts()
+        counts = cached_tpl_counts
         return {
             "type": "status",
             "state": sm.state,
@@ -331,6 +337,8 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 draft_dealer_manual=msg.get("draftDealerManual"),
                 has_prompt=msg.get("hasPrompt"),
                 bet_rounds_count=msg.get("betRoundsCount"),
+                shoe_rem=msg.get("shoeRem"),
+                dealer_guess_removed=msg.get("dealerGuessRemoved"),
             )
             return None
 
@@ -520,14 +528,17 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "rank": rank,
                 "filename": out_path.name,
                 "cropSize": [int(crop.shape[1]), int(crop.shape[0])],
-                "templates": list_template_counts(),
+                "templates": _refresh_tpl_counts(),
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
         if mtype == "calib_delete_rank":
             bank = str(msg.get("bank", "hud"))
             rank = str(msg.get("rank", "")).upper()
-            removed = delete_rank_templates(bank, rank)
+            try:
+                removed = delete_rank_templates(bank, rank)
+            except ValueError as exc:
+                return {"type": "calib_error", "error": str(exc)}
             if bank == "ui" and rank == "RELOAD_BTN":
                 cfg.keepalive.reload_btn_offset = None
                 save_config(cfg)
@@ -539,7 +550,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "bank": bank,
                 "rank": rank,
                 "removed": removed,
-                "templates": list_template_counts(),
+                "templates": _refresh_tpl_counts(),
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
@@ -559,7 +570,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "kind": "clear_bank",
                 "bank": bank,
                 "removed": removed,
-                "templates": list_template_counts(),
+                "templates": _refresh_tpl_counts(),
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
@@ -594,7 +605,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "imported": imported_cnt,
                 "anchorMode": cfg.anchor_mode,
                 "rois": {k: [round(x, 4) for x in v] for k, v in cfg.rois.items()},
-                "templates": list_template_counts(),
+                "templates": _refresh_tpl_counts(),
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 

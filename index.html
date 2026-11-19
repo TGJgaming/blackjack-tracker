@@ -257,8 +257,10 @@
   .tbl-wrap .pill{white-space:nowrap}
   .modal,.modal *{max-width:100%}
   @media (max-width:700px){ nav{flex-wrap:wrap} nav button{font-size:12px;padding:6px 8px} .grid.g4,.grid.g5{grid-template-columns:repeat(2,minmax(0,1fr))} h1{font-size:16px} }
+  @media (max-width:520px){ .comp-bar,.comp-controls{flex-wrap:wrap;gap:5px} .comp-bar .btn,.comp-controls .btn{font-size:11px;padding:5px 7px} header .row{gap:4px} }
   @media (max-width:440px){ .numpad{gap:4px} .numpad button{padding:9px 2px;font-size:14px} .numpad button .sub{font-size:9px;letter-spacing:-0.2px} .calib-modal{padding:10px} }
   @media (max-width:420px){ .grid.g3{grid-template-columns:repeat(2,minmax(0,1fr))} }
+  body.native-ipad-host .hdr-bacc-btn{display:none !important}
 
   /* Effective-width overrides when zoomed out in iPad Split View */
   body.eff-wide .split-layout{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(240px,0.92fr);gap:10px;align-items:start}
@@ -486,10 +488,23 @@ function save(){
   try{ localStorage.setItem(KEY, JSON.stringify(S)); _saveErr = false; }
   catch(e){ _saveErr = true; console.warn('Save failed', e); }
 }
+function escapeHtml(s){
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 const DRAFT_KEY = KEY + '.draft';
-function persistDraft(){
+let _persistDraftTimer = null;
+function _flushPersistDraft(){
+  if(_persistDraftTimer){
+    clearTimeout(_persistDraftTimer);
+    _persistDraftTimer = null;
+  }
   try{
-    const s = active(); if(!s) return;
+    const s = active(); if(!s || !draft) return;
     const d = draft;
     localStorage.setItem(DRAFT_KEY, JSON.stringify({
       sid: s.id, n: s.rounds.length, hands: d.hands, activeHand: d.activeHand,
@@ -501,6 +516,16 @@ function persistDraft(){
     }));
   }catch(e){}
 }
+function persistDraft(immediate = false){
+  if(immediate){
+    _flushPersistDraft();
+    return;
+  }
+  if(_persistDraftTimer) clearTimeout(_persistDraftTimer);
+  _persistDraftTimer = setTimeout(_flushPersistDraft, 250);
+}
+window.addEventListener('pagehide', _flushPersistDraft);
+window.addEventListener('beforeunload', _flushPersistDraft);
 function restoreDraft(){
   try{
     const s = active(); const raw = localStorage.getItem(DRAFT_KEY);
@@ -565,6 +590,7 @@ let _lastCleared = null;
 const _isNativeIpadHost = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ipadCompanion);
 const _isIpadUa = _isNativeIpadHost || (navigator.maxTouchPoints > 1 && /Macintosh|iPad/i.test(navigator.userAgent || ''));
 if(_isNativeIpadHost){
+  document.body.classList.add('native-ipad-host');
   const _postIpadJsErr = (msg, source, line) => {
     try{
       window.webkit.messageHandlers.ipadCompanion.postMessage({
@@ -1793,7 +1819,7 @@ function triggerAlert(kind, title, body = '', opts = {}){
   if(toastEl){
     const tierCls = kind === 'disconnect' ? 'tier-crit' : ((kind === 'wong' || kind === 'ins' || kind === 'sidebet') ? 'tier-high' : 'tier-med');
     toastEl.className = `alert-toast show ${tierCls}`;
-    toastEl.innerHTML = `<div style="font-weight:800;font-size:13px">${title}</div>${body ? `<div class="small" style="opacity:.92;margin-top:2px">${body}</div>` : ''}`;
+    toastEl.innerHTML = `<div style="font-weight:800;font-size:13px">${escapeHtml(title)}</div>${body ? `<div class="small" style="opacity:.92;margin-top:2px">${escapeHtml(body)}</div>` : ''}`;
     if(_alertState.toastTimer) clearTimeout(_alertState.toastTimer);
     _alertState.toastTimer = setTimeout(() => { toastEl.classList.remove('show'); }, opts.durationMs || 4200);
   }
@@ -4978,6 +5004,15 @@ function handleCompanionMessage(msg){
       _calib.templates = Object.assign({ hud: {}, suit: {}, felt: {}, banner: {}, ui: {} }, msg.templates || _calib.templates);
       if('reloadBtnOffset' in msg) _calib.reloadBtnOffset = msg.reloadBtnOffset;
       _calib.status = `🧹 Cleared ${msg.removed || 0} template(s) from ${msg.bank.toUpperCase()} bank.`;
+    } else if(msg.kind === 'import_pack'){
+      if(msg.rois) _calib.rois = msg.rois;
+      if(msg.anchorMode) _calib.anchorMode = msg.anchorMode;
+      if(typeof msg.frameRotation === 'number'){
+        _calib.rotation = msg.frameRotation;
+        _comp.frameRotation = msg.frameRotation;
+      }
+      if(msg.templates) _calib.templates = Object.assign({ hud: {}, suit: {}, felt: {}, banner: {}, ui: {} }, msg.templates);
+      _calib.status = '📥 Imported Companion Pack (.json) cleanly! ROIs and all template banks updated.';
     }
     renderCalibModal();
     return;
@@ -5261,8 +5296,8 @@ function renderCalibModal(){
         <button class="btn xs danger" id="calibCloseBtn">✕ Close</button>
       </div>
 
-      ${_calib.error ? `<div class="alert red" style="margin:6px 0">${_calib.error}</div>` : ''}
-      ${_calib.status ? `<div class="alert blue" style="margin:6px 0;font-size:12px">${_calib.status}</div>` : ''}
+      ${_calib.error ? `<div class="alert red" style="margin:6px 0">${escapeHtml(_calib.error)}</div>` : ''}
+      ${_calib.status ? `<div class="alert blue" style="margin:6px 0;font-size:12px">${escapeHtml(_calib.status)}</div>` : ''}
 
       <div class="calib-side">
         <div>
@@ -5543,6 +5578,11 @@ function connectCompanion(immediate = false){
         const kaMinM = Math.max(0.5, Math.min(14.5, +savedKa.minWatchMin || 9.5));
         const kaMaxM = Math.max(kaMinM, Math.min(14.8, +savedKa.maxWatchMin || kaMinM));
         _comp.suppressNextKaConfigToast = true;
+        if(_comp._kaToastResetTimer) clearTimeout(_comp._kaToastResetTimer);
+        _comp._kaToastResetTimer = setTimeout(() => {
+          _comp.suppressNextKaConfigToast = false;
+          _comp._kaToastResetTimer = null;
+        }, 3000);
         sendKeepaliveAction('set_config', {
           keepalive: {
             enabled: kaMode !== 'off',
@@ -5553,12 +5593,11 @@ function connectCompanion(immediate = false){
             reset_on_bet_round: savedKa.resetOnBetRound !== false
           }
         });
-        _comp.suppressNextKaConfigToast = false;
       }
       render();
     };
     ws.onmessage = (ev) => {
-      try{ handleCompanionMessage(JSON.parse(ev.data)); }catch(e){}
+      try{ handleCompanionMessage(JSON.parse(ev.data)); }catch(e){ console.warn('Companion message error:', e); }
     };
     ws.onerror = () => {};
     ws.onclose = () => {

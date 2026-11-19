@@ -142,6 +142,8 @@ class CompanionConfig:
             if isinstance(raw_btn_off, (list, tuple)) and len(raw_btn_off) >= 2
             else None
         )
+        pb_min = max(0.2, float(ka_raw.get("place_bets_min_delay_sec", 0.35)))
+        pb_max = max(pb_min, float(ka_raw.get("place_bets_max_delay_sec", 0.85)))
         ka = KeepaliveConfig(
             enabled=bool(ka_raw.get("enabled", True)) and ka_mode != "off",
             mode=ka_mode,
@@ -151,8 +153,8 @@ class CompanionConfig:
             max_watch_sec=max_w,
             hard_warn_sec=max(max_w, float(ka_raw.get("hard_warn_sec", 750.0))),
             round_over_delay_sec=max(0.2, float(ka_raw.get("round_over_delay_sec", 1.2))),
-            place_bets_min_delay_sec=max(0.2, float(ka_raw.get("place_bets_min_delay_sec", 0.35))),
-            place_bets_max_delay_sec=max(0.4, float(ka_raw.get("place_bets_max_delay_sec", 0.85))),
+            place_bets_min_delay_sec=pb_min,
+            place_bets_max_delay_sec=pb_max,
             place_bets_latest_sec=max(1.5, float(ka_raw.get("place_bets_latest_sec", 5.0))),
             reload_grace_sec=max(5.0, float(ka_raw.get("reload_grace_sec", 12.0))),
             reload_timeout_sec=max(10.0, float(ka_raw.get("reload_timeout_sec", 20.0))),
@@ -171,11 +173,18 @@ class CompanionConfig:
         if anchor not in ("game_viewport", "ipad_split_left", "window"):
             anchor = "game_viewport"
 
+        try:
+            ws_port = int(raw.get("ws_port", 8765))
+        except (TypeError, ValueError):
+            ws_port = 8765
+        if not (1 <= ws_port <= 65535):
+            ws_port = 8765
+
         return cls(
             window_titles=list(raw.get("window_titles", cls().window_titles)),
             anchor_mode=anchor,
             ws_host=str(raw.get("ws_host", "127.0.0.1")),
-            ws_port=int(raw.get("ws_port", 8765)),
+            ws_port=ws_port,
             fps=max(2.0, float(raw.get("fps", 7.5))),
             burst_fps=max(5.0, float(raw.get("burst_fps", 18.0))),
             confirm_frames=max(1, int(raw.get("confirm_frames", 3))),
@@ -250,18 +259,39 @@ class CompanionConfig:
 def load_config(path: Path | None = None) -> CompanionConfig:
     """Load config.json if present, else fall back to config.example.json or defaults."""
     target = path or DEFAULT_CONFIG_PATH
+    save_target = path or DEFAULT_CONFIG_PATH
     if not target.exists() and path is None and EXAMPLE_CONFIG_PATH.exists():
         target = EXAMPLE_CONFIG_PATH
     if not target.exists():
-        return CompanionConfig()
+        cfg = CompanionConfig()
+        setattr(cfg, "_config_path", save_target)
+        return cfg
     with target.open("r", encoding="utf-8") as fh:
-        return CompanionConfig.from_dict(json.load(fh))
+        cfg = CompanionConfig.from_dict(json.load(fh))
+        setattr(cfg, "_config_path", save_target)
+        return cfg
 
 
 def save_config(cfg: CompanionConfig, path: Path | None = None) -> Path:
-    """Write configuration atomically to disk."""
-    target = path or DEFAULT_CONFIG_PATH
+    """Write configuration atomically to disk via temp file + os.replace."""
+    import os
+    import tempfile
+
+    target = path or getattr(cfg, "_config_path", None) or DEFAULT_CONFIG_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8") as fh:
-        json.dump(cfg.to_dict(), fh, indent=2)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(cfg.to_dict(), fh, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, target)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    setattr(cfg, "_config_path", target)
     return target

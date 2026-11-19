@@ -187,13 +187,31 @@ def list_template_counts(templates_root: Path | None = None) -> dict[str, dict[s
 
 def delete_rank_templates(bank_name: str, rank: str, templates_root: Path | None = None) -> int:
     """Remove all saved templates for one rank/token in one bank; returns deleted count."""
+    if bank_name not in ("hud", "felt", "banner", "suit", "ui"):
+        raise ValueError(f"Unsupported template bank: {bank_name}")
+    tok = str(rank or "").strip().upper()
+    valid_tokens = (
+        BANNER_TOKENS
+        if bank_name == "banner"
+        else UI_TOKENS
+        if bank_name == "ui"
+        else SUIT_TOKENS
+        if bank_name == "suit"
+        else set(RANK_TO_VAL.keys())
+    )
+    if tok not in valid_tokens:
+        raise ValueError(f"Invalid template token {tok!r} for bank {bank_name!r}")
     root = templates_root or (COMPANION_DIR / "templates")
-    folder = root / bank_name
+    folder = (root / bank_name).resolve()
     if not folder.exists():
         return 0
-    tok = rank.strip().upper()
     removed = 0
     for png in list(folder.glob(f"{tok}_*.png")) + list(folder.glob(f"{tok}.png")):
+        try:
+            if png.resolve().parent != folder:
+                continue
+        except OSError:
+            continue
         png.unlink(missing_ok=True)
         removed += 1
     return removed
@@ -271,31 +289,42 @@ def import_companion_pack(
     tpls_raw = pack.get("templates")
     imported = 0
     safe_name_re = re.compile(r"^[A-Za-z0-9_.-]+\.png$")
+    png_magic = b"\x89PNG\r\n\x1a\n"
     if isinstance(tpls_raw, dict):
         for bank in ("hud", "felt", "banner", "suit", "ui"):
             entries = tpls_raw.get(bank)
             if not isinstance(entries, list):
+                continue
+            # Validate and decode all PNGs in this bank before touching existing files on disk
+            staged: list[tuple[str, bytes]] = []
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                fname = str(item.get("name") or "").strip()
+                b64 = str(item.get("dataB64") or "").strip()
+                if not safe_name_re.match(fname) or ".." in fname or not b64:
+                    continue
+                if "," in b64:
+                    b64 = b64.split(",", 1)[1]
+                try:
+                    raw_bytes = base64.b64decode(b64, validate=True)
+                except Exception:
+                    continue
+                if len(raw_bytes) < 24 or not raw_bytes.startswith(png_magic):
+                    continue
+                arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+                decoded = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+                if decoded is None or decoded.size == 0:
+                    continue
+                staged.append((fname, raw_bytes))
+            if not staged:
                 continue
             folder = root / bank
             folder.mkdir(parents=True, exist_ok=True)
             if replace_existing:
                 for old_png in list(folder.glob("*.png")):
                     old_png.unlink(missing_ok=True)
-            for item in entries:
-                if not isinstance(item, dict):
-                    continue
-                fname = str(item.get("name") or "").strip()
-                b64 = str(item.get("dataB64") or "").strip()
-                if not safe_name_re.match(fname) or not b64:
-                    continue
-                if "," in b64:
-                    b64 = b64.split(",", 1)[1]
-                try:
-                    raw_bytes = base64.b64decode(b64)
-                except Exception:
-                    continue
-                if len(raw_bytes) < 24:
-                    continue
+            for fname, raw_bytes in staged:
                 (folder / fname).write_bytes(raw_bytes)
                 imported += 1
     return cfg, imported
@@ -351,9 +380,20 @@ def harvest_templates(cfg: CompanionConfig, frame: np.ndarray, bank_name: str = 
     """Let user crop card corner / shuffle templates from frame and tag with a keystroke."""
     set_dpi_aware()
     disp, scale = _fit_for_display(frame)
+    banner_keymap = {
+        ord("w"): "WAIT",
+        ord("p"): "PLACE_BETS",
+        ord("l"): "LAST_BETS",
+        ord("n"): "NO_MORE_BETS",
+        ord("s"): "SHUFFLE",
+    }
     print(f"\n=== Template Harvester ({bank_name}) ===")
-    print("Drag a tight box around a card's TOP-LEFT rank+suit corner (or SHUFFLE banner), press ENTER.")
-    print("Then press rank key: A, 2-9, 0/T (10), J, Q, K, B (BACK), S (SHUFFLE). Press ESC in ROI box when done.\n")
+    if bank_name == "banner":
+        print("Drag a tight box around a banner, press ENTER.")
+        print("Then press key: W (WAIT), P (PLACE_BETS), L (LAST_BETS), N (NO_MORE_BETS), S (SHUFFLE). ESC when done.\n")
+    else:
+        print("Drag a tight box around a card's TOP-LEFT rank+suit corner (or SHUFFLE banner), press ENTER.")
+        print("Then press rank key: A, 2-9, 0/T (10), J, Q, K, B (BACK), S (SHUFFLE). Press ESC in ROI box when done.\n")
 
     win_name = f"Harvest [{bank_name}] - Drag tight rank corner (ESC=done)"
     while True:
@@ -371,14 +411,20 @@ def harvest_templates(cfg: CompanionConfig, frame: np.ndarray, bank_name: str = 
         oy1 = min(frame.shape[0], int(round((by + bh) / scale)))
         crop = frame[oy0:oy1, ox0:ox1]
         zoom = cv2.resize(crop, (max(160, (ox1 - ox0) * 4), max(160, (oy1 - oy0) * 4)), interpolation=cv2.INTER_NEAREST)
-        cv2.putText(zoom, "Key: A,2-9,0/T,J,Q,K,B=BACK,S=SHUF | ESC=skip", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+        hint_lbl = "Key: W=WAIT,P=PLACE,L=LAST,N=NO_MORE,S=SHUF | ESC=skip" if bank_name == "banner" else "Key: A,2-9,0/T,J,Q,K,B=BACK,S=SHUF | ESC=skip"
+        cv2.putText(zoom, hint_lbl, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
         cv2.imshow("Label Crop", zoom)
         key = cv2.waitKey(0) & 0xFF
         cv2.destroyWindow("Label Crop")
         if key == 27:
             continue
-        ch = HARVEST_KEYMAP.get(key)
-        if ch and ch in RANK_TO_VAL:
+        if bank_name == "banner":
+            ch = banner_keymap.get(key)
+            valid = ch in BANNER_TOKENS
+        else:
+            ch = HARVEST_KEYMAP.get(key)
+            valid = ch in RANK_TO_VAL
+        if ch and valid:
             try:
                 out = save_template_crop(bank_name, ch, crop)
                 print(f"  Saved template: {out.name} ({ox1 - ox0}x{oy1 - oy0})")

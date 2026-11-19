@@ -3,7 +3,7 @@ options:
   bundleIdPrefix: com.tgjgaming
   deploymentTarget:
     iOS: "16.0"
-  xcodeVersion: "15.0"
+  xcodeVersion: "16.0"
   generateEmptyDirectories: true
 
 settings:
@@ -11,9 +11,6 @@ settings:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "2" # iPad (1,2 for Universal if desired)
     SUPPORTS_MACCATALYST: NO
-    CODE_SIGNING_ALLOWED: NO
-    CODE_SIGNING_REQUIRED: NO
-    CODE_SIGN_IDENTITY: ""
 
 targets:
   BlackjackTracker:

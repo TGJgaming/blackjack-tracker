@@ -24,12 +24,13 @@ private final class LoopbackFrameSender {
     private var loggedConnected = false
 
     func prepareForFrameAndCheckCanRender() -> Bool {
-        let nowNs = DispatchTime.now().uptimeNanoseconds
         lock.lock()
+        let nowNs = DispatchTime.now().uptimeNanoseconds
         let isReady = ready
         let isSending = sending
         let elapsedSinceSend = nowNs >= sendStartNs ? (nowNs - sendStartNs) : 0
-        let shouldConnect = (connection == nil) && (lastAttemptNs == 0 || (nowNs - lastAttemptNs) > 350_000_000)
+        let elapsedSinceAttempt = nowNs >= lastAttemptNs ? (nowNs - lastAttemptNs) : 0
+        let shouldConnect = (connection == nil) && (lastAttemptNs == 0 || elapsedSinceAttempt > 350_000_000)
         if shouldConnect {
             lastAttemptNs = nowNs
         }
@@ -233,16 +234,19 @@ private final class LoopbackFrameSender {
 
 /// Lightweight ReplayKit Broadcast Upload Extension (`RPBroadcastSampleHandler`).
 /// Strictly engineered to stay well below iPadOS's 50 MB extension limit:
-/// - Throttles capture to 12 FPS and skips duplicate static frames between 0.45s heartbeats
+/// - Throttles capture to 20 FPS and skips duplicate static frames between 0.45s heartbeats
 /// - Remaps `RPVideoSampleOrientationKey` to EXIF `CIImage.oriented(_:)` (swapping `.left` <-> `.right`) and normalizes extent origin
-/// - Downscales incoming `CMSampleBuffer` to <= 1280x960 using hardware CIContext
+/// - Downscales incoming `CMSampleBuffer` to <= 1280x960 using 8-bit hardware CIContext
 /// - Writes RGBA bytes directly into `SharedFrameRing` (when App Group exists) OR
 ///   streams directly over loopback TCP (`127.0.0.1:8766`) when App Group is stripped
 final class BroadcastSampleHandler: RPBroadcastSampleHandler {
     private let logger = Logger(subsystem: "com.tgjgaming.blackjacktracker.BroadcastExtension", category: "Broadcast")
+    private let handlerLock = NSLock()
     private let ciContext = CIContext(options: [
         .useSoftwareRenderer: false,
-        .cacheIntermediates: false
+        .cacheIntermediates: false,
+        .workingFormat: CIFormat.RGBA8,
+        .workingColorSpace: NSNull()
     ])
     private let srgbColorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
@@ -284,18 +288,18 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
         let pixelCount = byteCount / 4
         guard pixelCount > 0, width > 0, height > 0 else { return 0 }
         var h: UInt64 = 14695981039346656037
-        // 1. Dense sample over the left Split View game viewport (x < 68% width, y in 12%..88% height)
-        // so a small 13x15 dealer rank glyph or 5x7 badge digit change never falls between sample points.
-        let xLim = max(1, min(width, Int(Double(width) * 0.68)))
+        // 1. Dense sample across the full vertical game band (x: full width, y: 12%..88% height)
+        // so small 13x15 dealer rank glyphs or 5x7 badge digits on either left or right Split View
+        // panes (or Stage Manager) never fall between sample points.
         let y0 = max(0, min(height - 1, Int(Double(height) * 0.12)))
         let y1 = max(y0 + 1, min(height, Int(Double(height) * 0.88)))
         let yStep = max(1, (y1 - y0) / 96)
-        let xStep = max(1, xLim / 96)
+        let xStep = max(1, width / 112)
         var y = y0
         while y < y1 {
             let rowBase = y * width
             var x = 0
-            while x < xLim {
+            while x < width {
                 let idx = rowBase + x
                 if idx < pixelCount {
                     let word = raw.loadUnaligned(fromByteOffset: idx * 4, as: UInt32.self)
@@ -306,7 +310,7 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
             }
             y += yStep
         }
-        // 2. Coarse full-frame sweep for overall screen changes
+        // 2. Coarse full-frame sweep for overall screen changes (banners/toolbars)
         let stride = max(1, pixelCount / 4096)
         var i = 0
         while i < pixelCount {
@@ -320,14 +324,10 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         logger.info("Broadcast started")
+        handlerLock.lock()
         attemptedRingInit = true
         ring = SharedFrameRing(isWriter: true)
-        if let ring = ring {
-            logger.info("Broadcast SharedFrameRing writer ready: \(ring.storageDescription, privacy: .public)")
-        } else {
-            logger.info("App Group unavailable; starting LoopbackFrameSender (127.0.0.1:\(FrameIPCConstants.loopbackPort))")
-            loopbackSender.connectIfNeeded()
-        }
+        let activeRing = ring
         let seed = UInt32(truncatingIfNeeded: DispatchTime.now().uptimeNanoseconds)
         seq = (seed == 0) ? 1 : seed
         frameCount = 0
@@ -338,6 +338,14 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
         lastSentFrameTs = 0
         lastMeta = nil
         loggedFirstFrame = false
+        handlerLock.unlock()
+
+        if let activeRing = activeRing {
+            logger.info("Broadcast SharedFrameRing writer ready: \(activeRing.storageDescription, privacy: .public)")
+        } else {
+            logger.info("App Group unavailable; starting LoopbackFrameSender (127.0.0.1:\(FrameIPCConstants.loopbackPort))")
+            loopbackSender.connectIfNeeded()
+        }
     }
 
     override func broadcastPaused() {
@@ -346,31 +354,43 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastResumed() {
         logger.info("Broadcast resumed")
-        if ring == nil {
+        handlerLock.lock()
+        let isLoopback = (ring == nil)
+        handlerLock.unlock()
+        if isLoopback {
             loopbackSender.sendControlIfReady(FrameIPCConstants.msgBroadcastStarted)
         }
     }
 
     override func broadcastFinished() {
-        logger.info("Broadcast finished after \(self.frameCount) rendered frame(s)")
-        if ring == nil {
-            loopbackSender.sendControlIfReady(FrameIPCConstants.msgBroadcastFinished, waitSeconds: 0.15)
-            loopbackSender.resetConnection()
-        } else {
-            ring?.clear()
-        }
-        ring = nil
+        handlerLock.lock()
+        let rendered = self.frameCount
+        let existingRing = self.ring
+        self.ring = nil
         attemptedRingInit = false
         hasSentFrame = false
         lastSentFrameHash = 0
         lastSentDims = (0, 0)
         lastSentFrameTs = 0
         lastMeta = nil
+        handlerLock.unlock()
+
+        logger.info("Broadcast finished after \(rendered) rendered frame(s)")
+        if existingRing == nil {
+            loopbackSender.sendControlIfReady(FrameIPCConstants.msgBroadcastFinished, waitSeconds: 0.15)
+            loopbackSender.resetConnection()
+        } else {
+            existingRing?.clear()
+        }
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
         guard sampleBufferType == .video else { return }
         let now = CACurrentMediaTime()
+
+        handlerLock.lock()
+        defer { handlerLock.unlock() }
+
         if now - lastFrameTs < minFrameInterval { return }
 
         if !attemptedRingInit {
