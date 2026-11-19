@@ -231,8 +231,7 @@ final class SharedFrameRing {
         }
 
         let prot = isWriter ? (PROT_READ | PROT_WRITE) : PROT_READ
-        let ptr = mmap(nil, Self.capacityBytes, prot, MAP_SHARED, fd, 0)
-        if ptr == MAP_FAILED {
+        guard let ptr = mmap(nil, Self.capacityBytes, prot, MAP_SHARED, fd, 0), ptr != MAP_FAILED else {
             let err = errno
             Self.logger.error("mmap failed on \(self.storageDescription, privacy: .public): errno=\(err)")
             close(fd)
