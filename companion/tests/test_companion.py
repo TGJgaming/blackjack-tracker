@@ -2752,3 +2752,200 @@ def test_place_bets_strict_dealer_recheck_start_and_3s() -> None:
     )
     evs_bust = sm5.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
     assert any(e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess" for e in evs_bust)
+
+
+def test_delete_rank_templates_rejects_path_traversal_and_globbing(tmp_path) -> None:
+    """delete_rank_templates must reject invalid banks, glob metacharacters, and path traversal tokens."""
+    import pytest
+    from calibrate import delete_rank_templates
+
+    tpl_root = tmp_path / "templates"
+    hud_dir = tpl_root / "hud"
+    hud_dir.mkdir(parents=True)
+    sentinel = hud_dir / "A_1.png"
+    sentinel.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    for bad_bank, bad_rank in [
+        ("hud", "../hud"),
+        ("hud", "*"),
+        ("hud", "A/../../etc"),
+        ("hud", ".."),
+        ("../etc", "A"),
+        ("unknown_bank", "A"),
+    ]:
+        with pytest.raises(ValueError):
+            delete_rank_templates(bad_bank, bad_rank, templates_root=tpl_root)
+
+    assert sentinel.exists(), "Sentinel template must not be deleted by rejected traversal attempts"
+
+
+def test_save_config_atomic_path_preservation_and_validation(tmp_path) -> None:
+    """load_config/save_config preserve custom _config_path atomically and clamp invalid ws_port & place_bets delays."""
+    from config import CompanionConfig, load_config, save_config
+
+    custom_path = tmp_path / "custom_companion.json"
+    cfg = CompanionConfig(ws_port=0)
+    cfg.keepalive.place_bets_min_delay_sec = 4.0
+    cfg.keepalive.place_bets_max_delay_sec = 1.5
+    save_config(cfg, path=custom_path)
+    assert custom_path.exists()
+
+    loaded = load_config(path=custom_path)
+    assert loaded.ws_port == 8765
+    assert loaded.keepalive.place_bets_max_delay_sec >= loaded.keepalive.place_bets_min_delay_sec
+    assert getattr(loaded, "_config_path", None) == custom_path
+
+    loaded.ws_port = 99999
+    loaded.confirm_frames = 5
+    # Saving without explicit path must write back to _config_path rather than default config.json
+    save_config(loaded)
+    reloaded = load_config(path=custom_path)
+    assert reloaded.ws_port == 8765
+    assert reloaded.confirm_frames == 5
+
+
+def test_import_companion_pack_rejects_corrupt_png_without_wiping_bank(tmp_path) -> None:
+    """import_companion_pack must pre-validate PNGs before wiping existing templates in the target bank."""
+    import base64
+    from calibrate import import_companion_pack
+    from config import CompanionConfig
+
+    tpl_root = tmp_path / "templates"
+    hud_dir = tpl_root / "hud"
+    hud_dir.mkdir(parents=True)
+    existing = hud_dir / "A_1.png"
+    existing.write_bytes(b"\x89PNG\r\n\x1a\nEXISTING")
+
+    bad_pack = {
+        "templates": {
+            "hud": [
+                {"name": "K_1.png", "dataB64": base64.b64encode(b"NOT_A_PNG_FILE").decode("ascii")},
+            ]
+        }
+    }
+    _, imported_count = import_companion_pack(bad_pack, CompanionConfig(), templates_root=tpl_root, replace_existing=True)
+    assert imported_count == 0
+    assert existing.exists(), "Existing bank templates must not be wiped when incoming pack has no valid PNGs"
+
+
+def test_soft_hand_dealer_guess_and_keepalive_user_idle_guard() -> None:
+    """guess_missing_dealer_card allows soft-hand intermediate draws and WatchKeepaliveManager defers OS reload while user is active."""
+    from config import CompanionConfig
+    from detector import FrameObservation
+    from state_machine import WatchKeepaliveManager, guess_missing_dealer_card
+
+    only_tens = [16, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    g10 = guess_missing_dealer_card(["A", "4"], {"shoe_rem": only_tens, "round_seed": 101})
+    assert g10 is not None and g10["rank"] == "10"
+    assert only_tens[0] == 16
+
+    g_a = guess_missing_dealer_card(["6"], {"round_seed": 777})
+    g_b = guess_missing_dealer_card(["6"], {"round_seed": 777})
+    assert g_a == g_b
+
+    cfg = CompanionConfig()
+    cfg.keepalive.enabled = True
+    cfg.keepalive.mode = "auto"
+    cfg.keepalive.method = "sendinput_ctrl_r"
+    cfg.keepalive.place_bets_min_delay_sec = 0.2
+    cfg.keepalive.place_bets_max_delay_sec = 0.25
+    ka = WatchKeepaliveManager(cfg.keepalive)
+    ka.watch_elapsed_sec = ka.target_sec + 1.0
+    # First tick enters PLACE_BETS window and schedules fire_ts
+    act0 = ka.tick(
+        100.0,
+        play_mode="watch",
+        paused=False,
+        window_found=True,
+        sm_state="BETTING",
+        banner_state="PLACE_BETS",
+        obs_has_cards=False,
+        has_unresolved_prompt=False,
+        user_idle_ms=200,
+    )
+    assert act0.trigger_refresh is False
+    # Past scheduled fire_ts, but user_idle_ms=200 < 1200 -> must defer OS-level sendinput_ctrl_r reload
+    act_active = ka.tick(
+        101.0,
+        play_mode="watch",
+        paused=False,
+        window_found=True,
+        sm_state="BETTING",
+        banner_state="PLACE_BETS",
+        obs_has_cards=False,
+        has_unresolved_prompt=False,
+        user_idle_ms=200,
+    )
+    assert act_active.trigger_refresh is False, "OS-level reload must be deferred while user_idle_ms < 1200"
+
+    # Once user is idle (user_idle_ms=2000 >= 1200), OS-level reload proceeds
+    act_idle = ka.tick(
+        101.5,
+        play_mode="watch",
+        paused=False,
+        window_found=True,
+        sm_state="BETTING",
+        banner_state="PLACE_BETS",
+        obs_has_cards=False,
+        has_unresolved_prompt=False,
+        user_idle_ms=2000,
+    )
+    assert act_idle.trigger_refresh is True
+    assert act_idle.preferred_method == "sendinput_ctrl_r"
+
+
+def test_red_back_signature_rejects_red_face_up_card() -> None:
+    """_has_red_back_signature requires red ink in both top and bottom halves so red face-up cards don't mimic BACK."""
+    import numpy as np
+    from detector import _has_red_back_signature
+
+    # Checkered red-and-dot card back spanning top & bottom halves -> True
+    back_patch = np.full((30, 20, 3), (30, 30, 200), dtype=np.uint8)
+    back_patch[::3, ::3] = (200, 200, 200)
+    assert _has_red_back_signature(back_patch) is True
+
+    # Red ink concentrated only in top half (like a Hearts/Diamonds corner) with dark/gray bottom -> False
+    top_only = np.full((30, 20, 3), (170, 170, 170), dtype=np.uint8)
+    top_only[:15, :] = (30, 30, 200)
+    assert _has_red_back_signature(top_only) is False
+
+
+def test_dealer_badge_colored_pill_and_soft_3digit_parsing() -> None:
+    """detect_dealer_badge_total reads white digits on bright green win pills and splits 3-digit soft X/Y runs (e.g. 7/17 -> 17)."""
+    import numpy as np
+    from detector import detect_dealer_badge_total
+
+    d5x7 = {
+        "1": ["..1..", ".11..", "..1..", "..1..", "..1..", "..1..", ".111."],
+        "2": [".111.", "1...1", "....1", "..11.", ".1...", "1....", "11111"],
+        "7": ["11111", "....1", "...1.", "..1..", ".1...", ".1...", ".1..."],
+    }
+
+    def _draw_digit(img: np.ndarray, ch: str, ox: int, oy: int, scale: int = 2) -> None:
+        for r, row in enumerate(d5x7[ch]):
+            for c, bit in enumerate(row):
+                if bit == "1":
+                    img[oy + r * scale : oy + (r + 1) * scale, ox + c * scale : ox + (c + 1) * scale] = (250, 250, 250)
+
+    # Bright green win pill (BGR: 45, 210, 50 -> gray ~143 >= 135)
+    green_badge = np.full((60, 160, 3), 25, dtype=np.uint8)
+    green_badge[14:44, 10:68] = (45, 210, 50)
+    _draw_digit(green_badge, "2", 18, 22, 2)
+    _draw_digit(green_badge, "1", 32, 22, 2)
+    g_tot, g_conf, g_hint = detect_dealer_badge_total(green_badge, [], return_hint=True)
+    assert g_tot == 21
+    assert g_conf >= 0.56
+    assert g_hint is not None and g_hint["total"] == 21
+
+    # Soft 7/17 pill where '/' is dropped leaving 3 adjacent digits [7, 1, 7]
+    soft_badge = np.full((60, 160, 3), 25, dtype=np.uint8)
+    soft_badge[14:44, 6:78] = (20, 20, 20)
+    _draw_digit(soft_badge, "7", 12, 22, 2)
+    _draw_digit(soft_badge, "1", 26, 22, 2)
+    _draw_digit(soft_badge, "7", 40, 22, 2)
+    s_tot, s_conf, s_hint = detect_dealer_badge_total(soft_badge, [], return_hint=True)
+    assert s_tot == 17
+    assert s_conf >= 0.56
+    assert s_hint is not None and s_hint["total"] == 17
+
+

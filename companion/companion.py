@@ -13,7 +13,14 @@ import cv2
 import numpy as np
 
 from bridge import CompanionBridge
-from calibrate import clear_bank_templates, delete_rank_templates, list_template_counts, save_template_crop
+from calibrate import (
+    clear_bank_templates,
+    delete_rank_templates,
+    export_companion_pack,
+    import_companion_pack,
+    list_template_counts,
+    save_template_crop,
+)
 from config import COMPANION_DIR, CompanionConfig, KeepaliveConfig, load_config, normalize_roi, save_config
 from detector import FrameObservation, PlaytechDetector
 from state_machine import CompanionStateMachine, WatchKeepaliveManager
@@ -144,9 +151,15 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     last_center_img = empty
     ext_status_dirty = False
     bridge: CompanionBridge | None = None
+    cached_tpl_counts: dict[str, dict[str, int]] = list_template_counts()
+
+    def _refresh_tpl_counts() -> dict[str, dict[str, int]]:
+        nonlocal cached_tpl_counts
+        cached_tpl_counts = list_template_counts()
+        return cached_tpl_counts
 
     def build_status(win: WindowRect | None) -> dict[str, Any]:
-        counts = list_template_counts()
+        counts = cached_tpl_counts
         return {
             "type": "status",
             "state": sm.state,
@@ -506,14 +519,17 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "rank": rank,
                 "filename": out_path.name,
                 "cropSize": [int(crop.shape[1]), int(crop.shape[0])],
-                "templates": list_template_counts(),
+                "templates": _refresh_tpl_counts(),
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
         if mtype == "calib_delete_rank":
             bank = str(msg.get("bank", "hud"))
             rank = str(msg.get("rank", "")).upper()
-            removed = delete_rank_templates(bank, rank)
+            try:
+                removed = delete_rank_templates(bank, rank)
+            except ValueError as exc:
+                return {"type": "calib_error", "error": str(exc)}
             if bank == "ui" and rank == "RELOAD_BTN":
                 cfg.keepalive.reload_btn_offset = None
                 save_config(cfg)
@@ -525,7 +541,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "bank": bank,
                 "rank": rank,
                 "removed": removed,
-                "templates": list_template_counts(),
+                "templates": _refresh_tpl_counts(),
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
@@ -545,12 +561,44 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "kind": "clear_bank",
                 "bank": bank,
                 "removed": removed,
-                "templates": list_template_counts(),
+                "templates": _refresh_tpl_counts(),
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
         if mtype == "calib_test_detect":
             return _run_calib_test(msg.get("rois"))
+
+        if mtype == "calib_export_pack":
+            pack = export_companion_pack(cfg)
+            return {"type": "calib_pack_exported", "pack": pack}
+
+        if mtype == "calib_import_pack":
+            pack_in = msg.get("pack")
+            if not isinstance(pack_in, dict):
+                return {"type": "calib_error", "error": "Invalid companion pack payload."}
+            try:
+                _, imported_cnt = import_companion_pack(
+                    pack_in,
+                    cfg,
+                    replace_existing=bool(msg.get("replaceExisting", True)),
+                )
+            except ValueError as exc:
+                return {"type": "calib_error", "error": str(exc)}
+            save_config(cfg)
+            vp_smoother.reset()
+            anchor_cache = None
+            last_vp_scan = 0.0
+            detector.reload_templates()
+            detector.invalidate_cache(reset_scale_hint=True)
+            return {
+                "type": "calib_saved",
+                "kind": "import_pack",
+                "imported": imported_cnt,
+                "anchorMode": cfg.anchor_mode,
+                "rois": {k: [round(x, 4) for x in v] for k, v in cfg.rois.items()},
+                "templates": _refresh_tpl_counts(),
+                "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
+            }
 
         return None
 

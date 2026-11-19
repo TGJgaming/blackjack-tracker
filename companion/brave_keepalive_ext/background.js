@@ -22,8 +22,12 @@ function setBadge(text, color) {
 
 function sendJson(payload) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(payload));
-    return true;
+    try {
+      ws.send(JSON.stringify(payload));
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
   return false;
 }
@@ -221,7 +225,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
 });
 
-chrome.alarms.create("companionReconnect", { periodInMinutes: 1 });
+chrome.alarms.get("companionReconnect", (existing) => {
+  if (!existing) {
+    chrome.alarms.create("companionReconnect", { periodInMinutes: 1 });
+  }
+});
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm && alarm.name === "companionReconnect") {
     connectCompanion();

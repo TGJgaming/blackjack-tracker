@@ -230,6 +230,13 @@
   .calib-ranks button.has{border-color:#22c55e;background:#0e2819;color:#bbf7d0}
   .calib-ranks button .cnt{font-size:10px;opacity:.8}
   .calib-loupe{border:1px solid var(--line);border-radius:8px;background:#090b10;image-rendering:pixelated;width:140px;height:140px;display:block}
+  .card,.mod-card,.row,.grid>*,.split-layout>*{min-width:0}
+  .btn,button{white-space:normal;overflow-wrap:anywhere;max-width:100%}
+  .card *,.mod-card *{overflow-wrap:anywhere}
+  .tbl-wrap,table{max-width:100%}
+  .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .tbl-wrap table *,.tbl-wrap th,.tbl-wrap td{overflow-wrap:normal;word-break:normal}
+  .tbl-wrap .pill{white-space:nowrap}
 </style>
 </head>
 <body>
@@ -423,10 +430,20 @@ function save(){
   try{ localStorage.setItem(KEY, JSON.stringify(S)); _saveErr = false; }
   catch(e){ _saveErr = true; console.warn('Save failed', e); }
 }
+function escapeHtml(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 const DRAFT_KEY = KEY + '.draft';
-function persistDraft(){
+let _persistDraftTimer = null;
+function _flushPersistDraft(){
+  if(_persistDraftTimer){ clearTimeout(_persistDraftTimer); _persistDraftTimer = null; }
   try{
-    const s = active(); if(!s) return;
+    const s = active(); if(!s || !draft) return;
     const d = draft;
     localStorage.setItem(DRAFT_KEY, JSON.stringify({
       sid: s.id, n: s.rounds.length, hands: d.hands, activeHand: d.activeHand,
@@ -437,6 +454,15 @@ function persistDraft(){
       tookIns: d.tookIns, insWon: d.insWon, sideStakes: d.sideStakes, sideBetPnl: d.sideBetPnl, log: d.log
     }));
   }catch(e){}
+}
+function persistDraft(immediate = false){
+  if(immediate){ _flushPersistDraft(); return; }
+  if(_persistDraftTimer) return;
+  _persistDraftTimer = setTimeout(_flushPersistDraft, 250);
+}
+if(typeof window !== 'undefined'){
+  window.addEventListener('pagehide', _flushPersistDraft);
+  window.addEventListener('beforeunload', _flushPersistDraft);
 }
 function restoreDraft(){
   try{
@@ -1546,6 +1572,33 @@ function playAlertTone(kind = 'plus'){
   }catch(e){}
 }
 
+let _speechPrimed = false;
+function primeSpeech(){
+  if(_speechPrimed || typeof window.speechSynthesis === 'undefined') return;
+  try{
+    const u = new SpeechSynthesisUtterance(' ');
+    u.volume = 0;
+    u.rate = 2.0;
+    window.speechSynthesis.speak(u);
+    _speechPrimed = true;
+  }catch(e){}
+}
+function speakAlertText(text){
+  if(!text || typeof window.speechSynthesis === 'undefined') return;
+  try{
+    const synth = window.speechSynthesis;
+    if(synth.paused) synth.resume();
+    if(synth.speaking || synth.pending) synth.cancel();
+    const u = new SpeechSynthesisUtterance(String(text));
+    u.rate = 1.12;
+    u.volume = 0.85;
+    synth.speak(u);
+  }catch(e){}
+}
+if(typeof document !== 'undefined'){
+  document.addEventListener('pointerdown', primeSpeech, { once: true, passive: true });
+}
+
 function triggerAlert(kind, title, body = '', opts = {}){
   const trig = (cfg().alertTriggers) || {};
   if(!opts.force && trig[kind] === false) return false;
@@ -1563,14 +1616,8 @@ function triggerAlert(kind, title, body = '', opts = {}){
   playAlertTone(kind);
 
   // 2. Optional Spoken Callout
-  if(cfg().alertVoice && opts.speak && typeof window.speechSynthesis !== 'undefined'){
-    try{
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(opts.speak);
-      u.rate = 1.12;
-      u.volume = 0.85;
-      window.speechSynthesis.speak(u);
-    }catch(e){}
+  if(cfg().alertVoice && opts.speak){
+    speakAlertText(opts.speak);
   }
 
   // 3. Visual Floating Toast
@@ -1578,7 +1625,7 @@ function triggerAlert(kind, title, body = '', opts = {}){
   if(toastEl){
     const tierCls = kind === 'disconnect' ? 'tier-crit' : ((kind === 'wong' || kind === 'ins' || kind === 'sidebet') ? 'tier-high' : 'tier-med');
     toastEl.className = `alert-toast show ${tierCls}`;
-    toastEl.innerHTML = `<div style="font-weight:800;font-size:13px">${title}</div>${body ? `<div class="small" style="opacity:.92;margin-top:2px">${body}</div>` : ''}`;
+    toastEl.innerHTML = `<div style="font-weight:800;font-size:13px">${escapeHtml(title)}</div>${body ? `<div class="small" style="opacity:.92;margin-top:2px">${escapeHtml(body)}</div>` : ''}`;
     if(_alertState.toastTimer) clearTimeout(_alertState.toastTimer);
     _alertState.toastTimer = setTimeout(() => { toastEl.classList.remove('show'); }, opts.durationMs || 4200);
   }
@@ -4505,8 +4552,30 @@ function handleCompanionMessage(msg){
       _calib.templates = Object.assign({ hud: {}, suit: {}, felt: {}, banner: {}, ui: {} }, msg.templates || _calib.templates);
       if('reloadBtnOffset' in msg) _calib.reloadBtnOffset = msg.reloadBtnOffset;
       _calib.status = `🧹 Cleared ${msg.removed || 0} template(s) from ${msg.bank.toUpperCase()} bank.`;
+    } else if(msg.kind === 'import_pack'){
+      _calib.rois = msg.rois || _calib.rois;
+      _calib.anchorMode = msg.anchorMode || _calib.anchorMode;
+      _calib.templates = Object.assign({ hud: {}, suit: {}, felt: {}, banner: {}, ui: {} }, msg.templates || _calib.templates);
+      if('reloadBtnOffset' in msg) _calib.reloadBtnOffset = msg.reloadBtnOffset;
+      _calib.status = `📥 Imported Companion Pack (${msg.imported || 0} template(s) & ROIs restored).`;
     }
     renderCalibModal();
+    return;
+  }
+  if(msg.type === 'calib_pack_exported'){
+    if(msg.pack){
+      const jsonStr = JSON.stringify(msg.pack, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `playtech-companion-pack-${new Date().toISOString().slice(0,10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 1000);
+      _calib.status = '📤 Exported Companion Pack JSON (ROIs + all templates).';
+      renderCalibModal();
+    }
     return;
   }
   if(msg.type === 'calib_test_result'){
@@ -4737,8 +4806,8 @@ function renderCalibModal(){
         <button class="btn xs danger" id="calibCloseBtn">✕ Close</button>
       </div>
 
-      ${_calib.error ? `<div class="alert red" style="margin:6px 0">${_calib.error}</div>` : ''}
-      ${_calib.status ? `<div class="alert blue" style="margin:6px 0;font-size:12px">${_calib.status}</div>` : ''}
+      ${_calib.error ? `<div class="alert red" style="margin:6px 0">${escapeHtml(_calib.error)}</div>` : ''}
+      ${_calib.status ? `<div class="alert blue" style="margin:6px 0;font-size:12px">${escapeHtml(_calib.status)}</div>` : ''}
 
       <div class="calib-side">
         <div>
@@ -4756,6 +4825,9 @@ function renderCalibModal(){
               </select>
             </label>
             <span class="sp"></span>
+            <button class="btn xs" id="calibExportPackBtn" title="Export ROIs & all templates to a portable JSON pack">📤 Export Pack</button>
+            <button class="btn xs" id="calibImportPackBtn" title="Import ROIs & templates from a portable JSON pack">📥 Import Pack</button>
+            <input type="file" id="calibImportPackFile" accept="application/json,.json" class="hide">
             <button class="btn xs" id="calibTestBtn">🧪 Test Match on Snapshot</button>
             <button class="btn xs primary" id="calibSaveRoisBtn" ${_calib.anchorMode==='toolbar'?'disabled title="Switch Anchor Frame back to Playtech Frame to save game ROIs"':''}>💾 Save ROIs to config.json</button>
           </div>
@@ -4853,6 +4925,35 @@ function renderCalibModal(){
       _comp.ws.send(JSON.stringify({ type: 'calib_test_detect', rois: _calib.rois }));
     }
   };
+  const expPackBtn = document.getElementById('calibExportPackBtn');
+  if(expPackBtn) expPackBtn.onclick = () => {
+    if(_comp.ws && _comp.ws.readyState === 1){
+      _comp.ws.send(JSON.stringify({ type: 'calib_export_pack' }));
+    }
+  };
+  const impPackBtn = document.getElementById('calibImportPackBtn');
+  const impPackFile = document.getElementById('calibImportPackFile');
+  if(impPackBtn && impPackFile){
+    impPackBtn.onclick = () => impPackFile.click();
+    impPackFile.onchange = (e) => {
+      const f = e.target.files && e.target.files[0];
+      if(!f) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try{
+          const pack = JSON.parse(String(reader.result || '{}'));
+          if(_comp.ws && _comp.ws.readyState === 1){
+            _comp.ws.send(JSON.stringify({ type: 'calib_import_pack', pack, replaceExisting: true }));
+          }
+        }catch(err){
+          _calib.error = 'Invalid JSON companion pack file.';
+          renderCalibModal();
+        }
+      };
+      reader.readAsText(f);
+      impPackFile.value = '';
+    };
+  }
 
   root.querySelectorAll('[data-sel-roi]').forEach(b => {
     b.onclick = () => { _calib.selectedRoi = b.dataset.selRoi; renderCalibModal(); };
@@ -4960,7 +5061,7 @@ function connectCompanion(immediate = false){
       render();
     };
     ws.onmessage = (ev) => {
-      try{ handleCompanionMessage(JSON.parse(ev.data)); }catch(e){}
+      try{ handleCompanionMessage(JSON.parse(ev.data)); }catch(e){ console.warn('Companion message error:', e); }
     };
     ws.onerror = () => {};
     ws.onclose = () => {

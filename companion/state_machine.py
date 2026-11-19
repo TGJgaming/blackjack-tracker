@@ -130,6 +130,16 @@ def guess_missing_dealer_card(
     must_reach_17 = context.get("must_reach_17", True)
     slot_idx = int(context.get("slot_idx", len(d_committed_ranks)))
 
+    def _is_valid_step(canon_rk: str) -> bool:
+        if not must_reach_17:
+            return True
+        new_tot, _, _ = _eval_bj_ranks([*d_committed_ranks, canon_rk])
+        if new_tot >= 17:
+            return True
+        if d_tot < 7 or (d_soft and d_tot < 17):
+            return True
+        return False
+
     # 1. Sub-threshold template runner-up peaks + visual width prior (rem_right)
     sub_cands_raw = context.get("sub_candidates")
     if isinstance(sub_cands_raw, dict):
@@ -152,8 +162,7 @@ def guess_missing_dealer_card(
             if val is None:
                 continue
             canon_rank = "10" if val == 0 else ("A" if val == 1 else str(val))
-            new_tot, _, _ = _eval_bj_ranks([*d_committed_ranks, canon_rank])
-            if must_reach_17 and d_tot >= 7 and new_tot < 17:
+            if not _is_valid_step(canon_rank):
                 continue
             score = float(sc.get("conf") or 0.0)
             rem_r = sc.get("rem_right")
@@ -215,8 +224,7 @@ def guess_missing_dealer_card(
             val = _RANK_TO_VAL.get(rk_raw) if rk_raw in _RANK_TO_VAL else fs.get("val")
             if val is not None:
                 canon_rank = "10" if val == 0 else ("A" if val == 1 else str(val))
-                new_tot, _, _ = _eval_bj_ranks([*d_committed_ranks, canon_rank])
-                if not must_reach_17 or d_tot < 7 or new_tot >= 17:
+                if _is_valid_step(canon_rank):
                     return {"rank": canon_rank, "val": int(val)}
 
     # 4. Live shoe depletion & stopping-rule Bayesian stratified selection across all 10 ranks
@@ -227,10 +235,7 @@ def guess_missing_dealer_card(
     else:
         shoe_rem = default_rem
 
-    valid_pool = [
-        c for c in _ALL_GUESS_RANKS
-        if not (must_reach_17 and d_tot >= 7 and _eval_bj_ranks([*d_committed_ranks, c["rank"]])[0] < 17)
-    ]
+    valid_pool = [c for c in _ALL_GUESS_RANKS if _is_valid_step(c["rank"])]
     if not valid_pool:
         valid_pool = list(_ALL_GUESS_RANKS)
 
@@ -1006,12 +1011,19 @@ class WatchKeepaliveManager:
                         # Timer finished mid-window within safe runway: trigger promptly
                         self._scheduled_fire_ts = now + self._rng.uniform(0.05, 0.25)
                 if self._scheduled_fire_ts is not None and now >= self._scheduled_fire_ts:
+                    preferred = self.choose_method()
+                    if (
+                        preferred != "ext_reload"
+                        and user_idle_ms < 1200
+                        and self.watch_elapsed_sec < self.cfg.hard_warn_sec
+                    ):
+                        return action
                     self.state = "REFRESHING"
                     self._scheduled_fire_ts = None
                     self._ctrl_r_tried_for_reload = False
                     action.flush_auto_watch = True
                     action.trigger_refresh = True
-                    action.preferred_method = self.choose_method()
+                    action.preferred_method = preferred
                     action.status_changed = True
                     return action
             elif self.cfg.mode == "alert_only" and not self._alert_sent_for_window:
@@ -1663,6 +1675,8 @@ class CompanionStateMachine:
         # Fallback E: multi-signal educated guess across all 10 ranks (A, 2..9, 10) so dealer reaches >= 17
         educated_guess_rank: str | None = None
         guess_count = 0
+        shoe_rem_copy = list(self.sync_shoe_rem) if isinstance(self.sync_shoe_rem, list) else None
+        active_badge_hint = self._last_dealer_badge_hint
         while _is_dealer_still_incomplete(include_ten_ace_back=True) and guess_count < 6:
             d_comm_before = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
             if "BACK" in self.d_debouncer.committed_ranks:
@@ -1674,10 +1688,10 @@ class CompanionStateMachine:
                 {
                     "slot_idx": slot_idx,
                     "sub_candidates": self._best_sub_dealer_tail,
-                    "badge_hint": self._last_dealer_badge_hint,
+                    "badge_hint": active_badge_hint,
                     "felt_sightings": self._round_felt_sightings,
-                    "shoe_rem": self.sync_shoe_rem,
-                    "round_seed": (self._round_seq + guess_count * 7) if self.sync_shoe_rem is not None else None,
+                    "shoe_rem": shoe_rem_copy,
+                    "round_seed": self._round_seq + guess_count * 7,
                     "must_reach_17": True,
                 },
             )
@@ -1687,6 +1701,9 @@ class CompanionStateMachine:
                 self.d_debouncer.committed_ranks[slot_idx] = guess["rank"]
             else:
                 self.d_debouncer.committed_ranks.append(guess["rank"])
+            if shoe_rem_copy is not None and 0 <= int(guess["val"]) < len(shoe_rem_copy) and shoe_rem_copy[int(guess["val"])] > 0:
+                shoe_rem_copy[int(guess["val"])] -= 1
+            active_badge_hint = None
             educated_guess_rank = f"{educated_guess_rank},{guess['rank']}" if educated_guess_rank else guess["rank"]
             guess_det = CardDetection(rank=guess["rank"], val=guess["val"], conf=0.50, x=0)
             self._emit_dealer_cards([(slot_idx, guess_det)], events, ts=now, source="educated_guess")
@@ -1827,9 +1844,12 @@ class CompanionStateMachine:
             if ui_hands:
                 p_hands_ranks = ui_hands
         d_ranks = list(self._review_dealer_ranks)
+        review_real_cnt = len([r for r in d_ranks if r != "BACK"])
         if self.sync_draft_dealer is not None and (self.sync_draft_count > 0 or not d_ranks):
             ui_d = ["10" if v == 0 else ("A" if v == 1 else str(v)) for v in self.sync_draft_dealer]
-            if stage == "3s" or len(ui_d) >= len([r for r in d_ranks if r != "BACK"]):
+            if self.sync_draft_dealer_manual and len(ui_d) < review_real_cnt:
+                return
+            if stage == "3s" or len(ui_d) >= review_real_cnt:
                 d_ranks = ui_d
 
         if not d_ranks and not p_hands_ranks:
@@ -1857,10 +1877,14 @@ class CompanionStateMachine:
         if not _rev_incomplete():
             return
 
-        # Check if late dealer cards appeared on the current frame during PLACE_BETS
+        # Check if late dealer cards appeared on the current frame during PLACE_BETS (verify prefix matches)
         if obs.dealer_cards:
             real_obs = [d for d in obs.dealer_cards if d.rank != "BACK" and d.val is not None and d.conf >= 0.72]
-            while len(real_obs) > len([r for r in d_ranks if r != "BACK"]):
+            existing_real = [r for r in d_ranks if r != "BACK"]
+            prefix_matches = len(real_obs) > len(existing_real) and all(
+                _same_bj_value(real_obs[k].rank, existing_real[k]) for k in range(len(existing_real))
+            )
+            while prefix_matches and len(real_obs) > len([r for r in d_ranks if r != "BACK"]):
                 nxt_idx = len([r for r in d_ranks if r != "BACK"])
                 det = real_obs[nxt_idx]
                 if "BACK" in d_ranks:
@@ -1886,6 +1910,8 @@ class CompanionStateMachine:
 
         guessed_ranks: list[str] = []
         guess_count = 0
+        shoe_rem_copy = list(self.sync_shoe_rem) if isinstance(self.sync_shoe_rem, list) else None
+        active_badge_hint = self._review_badge_hint
         while _rev_incomplete() and guess_count < 6:
             d_comm_before = [r for r in d_ranks if r != "BACK"]
             slot_idx = d_ranks.index("BACK") if "BACK" in d_ranks else len(d_ranks)
@@ -1894,12 +1920,10 @@ class CompanionStateMachine:
                 {
                     "slot_idx": slot_idx,
                     "sub_candidates": self._review_sub_dealer_tail,
-                    "badge_hint": self._review_badge_hint,
+                    "badge_hint": active_badge_hint,
                     "felt_sightings": self._review_felt_sightings,
-                    "shoe_rem": self.sync_shoe_rem,
-                    "round_seed": (self._round_seq + guess_count * 7 + (13 if stage == "3s" else 0))
-                    if self.sync_shoe_rem is not None
-                    else None,
+                    "shoe_rem": shoe_rem_copy,
+                    "round_seed": self._round_seq + guess_count * 7 + (13 if stage == "3s" else 0),
                     "must_reach_17": True,
                 },
             )
@@ -1909,6 +1933,9 @@ class CompanionStateMachine:
                 d_ranks[slot_idx] = guess["rank"]
             else:
                 d_ranks.append(guess["rank"])
+            if shoe_rem_copy is not None and 0 <= int(guess["val"]) < len(shoe_rem_copy) and shoe_rem_copy[int(guess["val"])] > 0:
+                shoe_rem_copy[int(guess["val"])] -= 1
+            active_badge_hint = None
             guessed_ranks.append(guess["rank"])
             self._review_emitted_d += 1
             events.append(
@@ -2195,6 +2222,7 @@ class CompanionStateMachine:
             prev_h0 = list(self.p_debouncers[0].committed_ranks)
             h0_list = hands_input.get(0, [])
             h1_list = hands_input.get(1, [])
+            h1_has_split_seed = bool(h1_list) and len(prev_h0) >= 2 and _same_bj_value(h1_list[0].rank, prev_h0[1])
             unseparated_overlap = (
                 self._emitted_split_hands == 1
                 and len(prev_h0) == 2
@@ -2202,6 +2230,7 @@ class CompanionStateMachine:
                 and len(h0_list) >= 2
                 and _same_bj_value(h0_list[0].rank, prev_h0[0])
                 and _same_bj_value(h0_list[1].rank, prev_h0[1])
+                and not h1_has_split_seed
             )
             if unseparated_overlap:
                 # Hold off split while H0 still renders the unsplit pair alongside emerging H1
@@ -2242,6 +2271,8 @@ class CompanionStateMachine:
                     inferred_seed_rk: str | None = None
                     if pair_can_reanchor:
                         inferred_seed_rk = prev_h0[0]
+                    elif 0 in self._split_seed_cards:
+                        inferred_seed_rk = self._split_seed_cards[0].rank
                     elif len(prev_h0) == 1 and prev_h0[0] != "BACK":
                         inferred_seed_rk = prev_h0[0]
                     elif h0_list and h1_list:
@@ -2253,7 +2284,7 @@ class CompanionStateMachine:
                             inferred_seed_rk = h0_list[0].rank
 
                     split_cards: list[dict[str, Any]] = []
-                    for h_k in sorted(hands_input.keys())[:2]:
+                    for h_k in sorted(hands_input.keys())[:4]:
                         c0 = hands_input[h_k][0]
                         rk0 = (
                             prev_h0[h_k]
@@ -2305,28 +2336,38 @@ class CompanionStateMachine:
                         else:
                             self.p_debouncers[0].reanchor([prev_h0[0]])
 
-                        # Always anchor H1 slot 0 to prev_h0[1] so temporary occlusion/misread cannot duplicate card 0
-                        d1 = SequenceDebouncer(self.cfg.confirm_frames, self.cfg.clear_frames)
-                        if h1_list:
-                            seq1_cur = tuple(d.rank for d in h1_list)
-                            p1_seq, p1_cnt = prior_pending_seqs.get(1, ((), 0))
-                            p1_seq_norm = (
-                                p1_seq
-                                if (p1_seq and _same_bj_value(p1_seq[0], prev_h0[1]))
-                                else ((prev_h0[1],) + p1_seq if p1_seq else ())
-                            )
-                            if (
-                                _same_bj_value(h1_list[0].rank, prev_h0[1])
-                                and p1_seq_norm == seq1_cur
-                                and p1_cnt > 0
-                                and len(seq1_cur) > 1
-                            ):
-                                d1.reanchor([prev_h0[1]], cand_ranks=seq1_cur, cand_count=p1_cnt)
+                        # Always anchor H1..H3 slot 0 to split seed rank so temporary occlusion/misread cannot duplicate card 0
+                        for h_k in sorted(hands_input.keys())[1:4]:
+                            seed_rk = prev_h0[1] if h_k < 2 else (inferred_seed_rk or prev_h0[0])
+                            h_list = hands_input.get(h_k, [])
+                            dk = SequenceDebouncer(self.cfg.confirm_frames, self.cfg.clear_frames)
+                            if h_list:
+                                seq_cur = tuple(d.rank for d in h_list)
+                                p_seq, p_cnt = prior_pending_seqs.get(h_k, ((), 0))
+                                p_seq_norm = (
+                                    p_seq
+                                    if (p_seq and _same_bj_value(p_seq[0], seed_rk))
+                                    else ((seed_rk,) + p_seq if p_seq else ())
+                                )
+                                if (
+                                    _same_bj_value(h_list[0].rank, seed_rk)
+                                    and p_seq_norm == seq_cur
+                                    and p_cnt > 0
+                                    and len(seq_cur) > 1
+                                ):
+                                    dk.reanchor([seed_rk], cand_ranks=seq_cur, cand_count=p_cnt)
+                                else:
+                                    dk.reanchor([seed_rk])
                             else:
-                                d1.reanchor([prev_h0[1]])
-                        else:
-                            d1.reanchor([prev_h0[1]])
-                        self.p_debouncers[1] = d1
+                                dk.reanchor([seed_rk])
+                            self.p_debouncers[h_k] = dk
+                    else:
+                        for h_k in sorted(hands_input.keys())[:4]:
+                            if h_k in self.p_debouncers or h_k not in self._split_seed_cards:
+                                continue
+                            dk = SequenceDebouncer(self.cfg.confirm_frames, self.cfg.clear_frames)
+                            dk.reanchor([self._split_seed_cards[h_k].rank])
+                            self.p_debouncers[h_k] = dk
         else:
             self._split_cand_count = 0
             self._split_cand_target = max(1, len(hands_input))
@@ -2391,6 +2432,8 @@ class CompanionStateMachine:
         # 5. Fallback end-of-round clear check (cards wiped from HUD)
         if self.state not in ("IDLE", "BETTING", "ROUND_OVER") and p_cleared and d_cleared:
             events.extend(self._finalize_cleared_round(obs.ts))
+            self.state = "ROUND_OVER"
+            self._saw_clear_since_round_over = False
             return events
 
         # 6. Auto-Resync fallback: reconcile drifted debouncer / UI cards against stably held crisp HUD snapshot
