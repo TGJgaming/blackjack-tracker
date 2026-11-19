@@ -909,33 +909,26 @@ class WatchKeepaliveManager:
         else:
             self._manual_blank_streak = 0
 
-        # Track safe early betting window: ROUND_OVER (cards wiped before LAST_BETS) OR explicit PLACE_BETS banner
-        in_fresh_place_bets = (
+        # Track safe early betting window: strictly explicit PLACE_BETS phase only
+        in_safe_bet_window = (
             window_found
-            and sm_state == "BETTING"
             and banner_state == "PLACE_BETS"
+            and sm_state in ("BETTING", "IDLE", "ROUND_OVER")
             and not obs_has_cards
         )
-        in_fresh_round_over = (
-            window_found
-            and sm_state == "ROUND_OVER"
-            and banner_state not in ("LAST_BETS", "NO_MORE_BETS", "WAIT")
-            and not obs_has_cards
-        )
-        in_safe_bet_window = in_fresh_place_bets or in_fresh_round_over
         hard_cancel_bet_window = (
             (not window_found)
             or obs_has_cards
-            or banner_state in ("LAST_BETS", "NO_MORE_BETS", "WAIT")
+            or banner_state in ("LAST_BETS", "NO_MORE_BETS", "WAIT", "SHUFFLING")
             or sm_state not in ("BETTING", "IDLE", "ROUND_OVER")
         )
         if in_safe_bet_window:
             self._place_bets_miss_streak = 0
             if self._place_bets_since is None:
                 self._place_bets_since = now
-                self._window_kind = "ROUND_OVER" if in_fresh_round_over else "PLACE_BETS"
+                self._window_kind = "PLACE_BETS"
                 self._alert_sent_for_window = False
-            elif in_fresh_place_bets and self._window_kind != "ROUND_OVER":
+            else:
                 self._window_kind = "PLACE_BETS"
         elif hard_cancel_bet_window:
             self._place_bets_miss_streak = 0
@@ -971,7 +964,7 @@ class WatchKeepaliveManager:
                 }
             return action
 
-        # Timer elapsed threshold reached: arm for any clean ROUND_OVER / PLACE_BETS window (no LAST_BETS)
+        # Timer elapsed threshold reached: arm strictly for PLACE_BETS phase only
         self._warn_retry_after_ts = None
         self.state = "ARMED_NEXT_BETS"
         if self.state != prev_state:
@@ -988,22 +981,10 @@ class WatchKeepaliveManager:
 
         if in_safe_bet_window and self._place_bets_since is not None:
             win_age = now - self._place_bets_since
-            win_kind = self._window_kind or ("ROUND_OVER" if in_fresh_round_over else "PLACE_BETS")
-            safe_max_age = max(self.cfg.place_bets_latest_sec, 6.5) if win_kind == "ROUND_OVER" else max(self.cfg.place_bets_latest_sec, 6.0)
-            too_late_for_window = (
-                win_kind == "ROUND_OVER"
-                and win_age > safe_max_age
-                and self.watch_elapsed_sec < self.cfg.hard_warn_sec
-            )
-            if self.cfg.mode == "auto" and not too_late_for_window:
+            if self.cfg.mode == "auto":
                 if self._scheduled_fire_ts is None:
-                    if win_kind == "ROUND_OVER":
-                        base_d = self.cfg.round_over_delay_sec
-                        min_d = max(0.25, base_d - 0.15)
-                        max_d = base_d + 0.15
-                    else:
-                        min_d = self.cfg.place_bets_min_delay_sec
-                        max_d = max(min_d, self.cfg.place_bets_max_delay_sec)
+                    min_d = self.cfg.place_bets_min_delay_sec
+                    max_d = max(min_d, self.cfg.place_bets_max_delay_sec)
                     if win_age <= min_d:
                         jitter = self._rng.uniform(min_d, max_d)
                         self._scheduled_fire_ts = max(now + 0.05, self._place_bets_since + jitter)
@@ -1034,20 +1015,6 @@ class WatchKeepaliveManager:
                     "elapsedSec": round(self.watch_elapsed_sec, 1),
                     "keepalive": self.to_status(now),
                 }
-        elif (
-            self.cfg.mode == "auto"
-            and self.watch_elapsed_sec >= self.cfg.hard_warn_sec
-            and window_found
-            and sm_state == "SHUFFLING"
-            and not obs_has_cards
-        ):
-            self.state = "REFRESHING"
-            self._scheduled_fire_ts = None
-            self._ctrl_r_tried_for_reload = False
-            action.flush_auto_watch = True
-            action.trigger_refresh = True
-            action.preferred_method = self.choose_method()
-            action.status_changed = True
 
         return action
 

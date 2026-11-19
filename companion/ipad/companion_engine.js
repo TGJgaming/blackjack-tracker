@@ -5125,19 +5125,21 @@
       const banner = obs && obs.banner_state ? obs.banner_state : "";
       const pbConf = obs && obs.place_bets_conf ? obs.place_bets_conf : 0.0;
       const hasLiveCards = Boolean(obs && ((obs.player_cards && obs.player_cards.length) || (obs.dealer_cards && obs.dealer_cards.length)));
-      const placeBetsReady = banner === "PLACE_BETS" || pbConf >= 0.66;
       const notInActivePlayOrCutoff =
         banner !== "NO_MORE_BETS" &&
         banner !== "LAST_BETS" &&
-        !["DEALING", "PLAYER_TURN", "DEALER_TURN"].includes(smState);
-      const stripsWiped =
+        banner !== "WAIT" &&
+        banner !== "SHUFFLING" &&
+        !["DEALING", "PLAYER_TURN", "DEALER_TURN", "SHUFFLING"].includes(smState);
+      const placeBetsReady =
+        (banner === "PLACE_BETS" || (banner === "" && pbConf >= 0.66)) &&
         !hasLiveCards &&
-        (smState === "ROUND_OVER" || smState === "BETTING" || (smState === "IDLE" && this._manualArmed));
+        notInActivePlayOrCutoff;
       const safeWindow =
         windowFound &&
         playMode === "watch" &&
         !hasPrompt &&
-        (placeBetsReady || (notInActivePlayOrCutoff && stripsWiped));
+        placeBetsReady;
 
       if (!safeWindow) return events;
 

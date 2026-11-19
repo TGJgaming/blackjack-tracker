@@ -1181,11 +1181,17 @@ console.log("7. Testing keepalive set_config, hostInfo, extConnected & native lo
   const kaEvPb = ka20a.step({ now: 162, windowFound: true, obs: { banner_state: "PLACE_BETS", place_bets_conf: 0.9, player_cards: [], dealer_cards: [] }, smState: "BETTING", playMode: "watch", draftCount: 4, hasPrompt: false, betRoundsCount: 0, triggerRefreshCb: () => [true, "safari_ext"] });
   assert(kaEvPb.some((e) => e.event === "refreshing"), "Keepalive must trigger immediately on PLACE_BETS even with draftCount > 0");
 
-  // Keepalive reload also triggers immediately when player & dealer strips are wiped in ROUND_OVER
+  // Keepalive reload must ONLY trigger during PLACE_BETS (never during ROUND_OVER without PLACE_BETS, SHUFFLING, or LAST_BETS)
   const ka20b = new Engine.WatchKeepaliveManager({ ...cfg, keepalive_interval_sec: 60 });
   ka20b._watchElapsedSec = 62;
   const kaEvWipe = ka20b.step({ now: 262, windowFound: true, obs: { banner_state: "", place_bets_conf: 0, player_cards: [], dealer_cards: [] }, smState: "ROUND_OVER", playMode: "watch", draftCount: 4, hasPrompt: false, betRoundsCount: 0, triggerRefreshCb: () => [true, "safari_ext"] });
-  assert(kaEvWipe.some((e) => e.event === "refreshing"), "Keepalive must trigger immediately when both strips are wiped in ROUND_OVER");
+  assert(!kaEvWipe.some((e) => e.event === "refreshing"), "Keepalive must NOT trigger in ROUND_OVER without PLACE_BETS");
+  const kaEvShuf = ka20b.step({ now: 263, windowFound: true, obs: { banner_state: "SHUFFLING", place_bets_conf: 0, player_cards: [], dealer_cards: [] }, smState: "SHUFFLING", playMode: "watch", draftCount: 0, hasPrompt: false, betRoundsCount: 0, triggerRefreshCb: () => [true, "safari_ext"] });
+  assert(!kaEvShuf.some((e) => e.event === "refreshing"), "Keepalive must NOT trigger during SHUFFLING");
+  const kaEvLb = ka20b.step({ now: 264, windowFound: true, obs: { banner_state: "LAST_BETS", place_bets_conf: 0.85, player_cards: [], dealer_cards: [] }, smState: "BETTING", playMode: "watch", draftCount: 0, hasPrompt: false, betRoundsCount: 0, triggerRefreshCb: () => [true, "safari_ext"] });
+  assert(!kaEvLb.some((e) => e.event === "refreshing"), "Keepalive must NOT trigger during LAST_BETS");
+  const kaEvPb2 = ka20b.step({ now: 265, windowFound: true, obs: { banner_state: "PLACE_BETS", place_bets_conf: 0.9, player_cards: [], dealer_cards: [] }, smState: "BETTING", playMode: "watch", draftCount: 0, hasPrompt: false, betRoundsCount: 0, triggerRefreshCb: () => [true, "safari_ext"] });
+  assert(kaEvPb2.some((e) => e.event === "refreshing"), "Keepalive must trigger once PLACE_BETS appears");
   console.log("   Test 20 PASSED");
 }
 

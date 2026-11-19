@@ -2013,20 +2013,25 @@ def test_watch_keepalive_hard_warn_shuffling_and_window_title_filter() -> None:
     assert _match_window_title("README.md - Visual Studio Code", titles) is None
     assert verify_target_hwnd(0, titles, prefer_left=True) is False
 
-    # Emergency SHUFFLING fallback when timer reaches hard_warn_sec
+    # SHUFFLING must NOT trigger reload; keepalive ONLY reloads during PLACE_BETS
     ka_cfg = KeepaliveConfig(
         mode="auto",
         method="sendinput_f5",
         min_watch_sec=10.0,
         max_watch_sec=10.0,
         hard_warn_sec=20.0,
+        place_bets_min_delay_sec=0.5,
+        place_bets_max_delay_sec=0.5,
     )
     mgr = WatchKeepaliveManager(ka_cfg, rng=random.Random(5))
     for t in [0.0, 5.0, 10.0, 15.0, 20.0]:
         mgr.tick(t, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="WAIT", obs_has_cards=False, has_unresolved_prompt=False)
     act_shuf = mgr.tick(21.0, play_mode="watch", paused=False, window_found=True, sm_state="SHUFFLING", banner_state="SHUFFLING", obs_has_cards=False, has_unresolved_prompt=False)
-    assert act_shuf.trigger_refresh is True
-    assert act_shuf.preferred_method == "sendinput_f5"
+    assert act_shuf.trigger_refresh is False
+    mgr.tick(22.0, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
+    act_pb = mgr.tick(22.6, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
+    assert act_pb.trigger_refresh is True
+    assert act_pb.preferred_method == "sendinput_f5"
 
     # Separate check: hard_warn alert emits once when crossing hard_warn_sec during active round
     mgr2 = WatchKeepaliveManager(ka_cfg, rng=random.Random(5))
@@ -2217,67 +2222,72 @@ def test_round_over_trigger_ext_bridge_and_escalation() -> None:
         )
         assert not act_bad.trigger_refresh
 
-    # Enter ROUND_OVER with banner='' and obs_has_cards=False at t=11.0 (pb=0.00 scenario)
+    # ROUND_OVER without PLACE_BETS must NOT trigger reload
     act_ro0 = mgr.tick(11.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
     assert not act_ro0.trigger_refresh
-    act_ro1 = mgr.tick(11.9, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    act_ro1 = mgr.tick(12.5, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
     assert not act_ro1.trigger_refresh
-    act_ro2 = mgr.tick(12.4, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
-    assert act_ro2.trigger_refresh is True
-    assert act_ro2.preferred_method == "ext_reload"
-    assert act_ro2.flush_auto_watch is True
+
+    # Enter PLACE_BETS at t=13.0 -> triggers after place_bets_min_delay_sec
+    act_pb0 = mgr.tick(13.0, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
+    assert not act_pb0.trigger_refresh
+    act_pb1 = mgr.tick(16.0, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
+    assert act_pb1.trigger_refresh is True
+    assert act_pb1.preferred_method == "ext_reload"
+    assert act_pb1.flush_auto_watch is True
 
     # Escalation order: ext_reload -> click_reload -> sendinput_f5 -> sendinput_ctrl_r
-    mgr.mark_refresh_dispatched(12.4, True, "ext_reload", epoch_ts=2000.0)
-    act_e1 = mgr.tick(13.5, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr.mark_refresh_dispatched(16.0, True, "ext_reload", epoch_ts=2000.0)
+    act_e1 = mgr.tick(17.1, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
     assert act_e1.trigger_refresh is True
     assert act_e1.preferred_method == "click_reload"
-    mgr.mark_refresh_dispatched(13.5, True, "click_reload", epoch_ts=2001.0)
-    act_e2 = mgr.tick(14.6, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr.mark_refresh_dispatched(17.1, True, "click_reload", epoch_ts=2001.0)
+    act_e2 = mgr.tick(18.2, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
     assert act_e2.trigger_refresh is True
     assert act_e2.preferred_method == "sendinput_f5"
-    mgr.mark_refresh_dispatched(14.6, True, "sendinput_f5", epoch_ts=2002.0)
-    act_e3 = mgr.tick(15.7, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr.mark_refresh_dispatched(18.2, True, "sendinput_f5", epoch_ts=2002.0)
+    act_e3 = mgr.tick(19.3, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
     assert act_e3.trigger_refresh is True
     assert act_e3.preferred_method == "sendinput_ctrl_r"
 
-    # 3. Cutoff guard: refuses firing when ROUND_OVER window age exceeds max(place_bets_latest_sec, 6.5) before hard_warn_sec
+    # 3. LAST_BETS / NO_MORE_BETS / ROUND_OVER never trigger reload
     mgr_late = WatchKeepaliveManager(ka_cfg, rng=random.Random(2))
     for t in (0.0, 5.0, 10.5):
         mgr_late.tick(t, play_mode="watch", paused=False, window_found=True, sm_state="DEALER_TURN", banner_state="WAIT", obs_has_cards=True, has_unresolved_prompt=False)
-    mgr_late.tick(11.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=True)
-    act_late = mgr_late.tick(18.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr_late.tick(11.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    act_late = mgr_late.tick(18.0, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="LAST_BETS", obs_has_cards=False, has_unresolved_prompt=False)
     assert not act_late.trigger_refresh
 
-    # 4. Empty-banner ROUND_OVER recovery: no false-positive recovery on empty banner, clean recovery via notify_tab_event
+    # 4. PLACE_BETS reload recovery: no false-positive recovery on empty banner, clean recovery via notify_tab_event
     ka_rec = KeepaliveConfig(
         mode="auto",
         method="ext_then_os",
         min_watch_sec=10.0,
         max_watch_sec=10.0,
         hard_warn_sec=30.0,
-        round_over_delay_sec=1.2,
+        place_bets_min_delay_sec=0.5,
+        place_bets_max_delay_sec=0.5,
         appcommand_verify_sec=5.0,
     )
     mgr_rec = WatchKeepaliveManager(ka_rec, rng=random.Random(4))
     for t in (0.0, 5.0, 10.5):
         mgr_rec.tick(t, play_mode="watch", paused=False, window_found=True, sm_state="DEALER_TURN", banner_state="WAIT", obs_has_cards=True, has_unresolved_prompt=False)
-    mgr_rec.tick(11.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
-    act_go = mgr_rec.tick(12.4, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr_rec.tick(11.0, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
+    act_go = mgr_rec.tick(11.6, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
     assert act_go.trigger_refresh is True and act_go.preferred_method == "ext_reload"
-    mgr_rec.mark_refresh_dispatched(12.4, True, "ext_reload", epoch_ts=3000.0)
+    mgr_rec.mark_refresh_dispatched(11.6, True, "ext_reload", epoch_ts=3000.0)
     # Without luma_shift / loading / tab_event, empty banner at 2.4s post-dispatch must NOT falsely recover
-    act_still_rec = mgr_rec.tick(14.8, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    act_still_rec = mgr_rec.tick(14.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
     assert act_still_rec.emit_alert is None
-    assert mgr_rec.to_status(14.8)["state"] == "RECOVERING"
+    assert mgr_rec.to_status(14.0)["state"] == "RECOVERING"
     # Tab loading -> complete events settle and mark recovered cleanly
-    mgr_rec.notify_tab_event("loading", now=14.9)
-    mgr_rec.notify_tab_event("complete", now=15.2)
-    act_done = mgr_rec.tick(15.3, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="WAIT", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr_rec.notify_tab_event("loading", now=14.1)
+    mgr_rec.notify_tab_event("complete", now=14.4)
+    act_done = mgr_rec.tick(14.5, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="WAIT", obs_has_cards=False, has_unresolved_prompt=False)
     assert act_done.emit_alert is not None
     assert act_done.emit_alert["event"] == "recovered"
-    assert mgr_rec.to_status(15.3)["elapsedSec"] == 0.0
-    assert mgr_rec.to_status(15.3)["refreshCount"] == 1
+    assert mgr_rec.to_status(14.5)["elapsedSec"] == 0.0
+    assert mgr_rec.to_status(14.5)["refreshCount"] == 1
 
     # 5. CompanionBridge accepts chrome-extension:// origin, skips ext clients on broadcast(), and completes ext_reload_tab RPC
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -2429,12 +2439,12 @@ def test_ipados_parity_badge_deduction_educated_guess_split_watch_and_warn_recov
     assert all(d.rank != "4" or d.conf >= 0.82 for d in p4)
 
     # 6. WatchKeepaliveManager WARN 90s cooldown + strips_visible_fallback recovery
-    ka_cfg = KeepaliveConfig(mode="auto", method="ext_then_os", min_watch_sec=10.0, max_watch_sec=10.0, reload_timeout_sec=12.0, round_over_delay_sec=0.5)
+    ka_cfg = KeepaliveConfig(mode="auto", method="ext_then_os", min_watch_sec=10.0, max_watch_sec=10.0, reload_timeout_sec=12.0, place_bets_min_delay_sec=0.5, place_bets_max_delay_sec=0.5)
     mgr = WatchKeepaliveManager(ka_cfg, rng=random.Random(9))
     for t in (0.0, 5.0, 10.0):
         mgr.tick(t, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
-    mgr.tick(10.5, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
-    act_fire = mgr.tick(11.2, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    mgr.tick(10.5, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
+    act_fire = mgr.tick(11.2, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
     assert act_fire.trigger_refresh is True
     mgr.mark_refresh_dispatched(11.2, True, "ext_reload")
     mgr.notify_tab_event("loading", now=12.0)
@@ -2442,8 +2452,8 @@ def test_ipados_parity_badge_deduction_educated_guess_split_watch_and_warn_recov
     act_to = mgr.tick(24.0, play_mode="watch", paused=False, window_found=True, sm_state="IDLE", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
     assert act_to.emit_alert and act_to.emit_alert["event"] == "timeout_warn"
     assert mgr.state == "WARN"
-    # Even when ROUND_OVER occurs 5s later while in WARN cooldown, must NOT re-trigger reload
-    act_no_re = mgr.tick(29.0, play_mode="watch", paused=False, window_found=True, sm_state="ROUND_OVER", banner_state="", obs_has_cards=False, has_unresolved_prompt=False)
+    # Even when PLACE_BETS occurs 5s later while in WARN cooldown, must NOT re-trigger reload
+    act_no_re = mgr.tick(29.0, play_mode="watch", paused=False, window_found=True, sm_state="BETTING", banner_state="PLACE_BETS", obs_has_cards=False, has_unresolved_prompt=False)
     assert not act_no_re.trigger_refresh
     # When cards return while in WARN with _pending_reload_recovery, recovers cleanly via strips_visible_fallback
     act_rec_strips = mgr.tick(30.0, play_mode="watch", paused=False, window_found=True, sm_state="DEALING", banner_state="", obs_has_cards=True, has_unresolved_prompt=False)
