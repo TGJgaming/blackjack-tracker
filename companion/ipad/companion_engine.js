@@ -1380,6 +1380,55 @@
     return res;
   }
 
+  function getScaledRankTplMasked(tpl, sc) {
+    const key = `rm|${sc.toFixed(3)}`;
+    if (tpl._scaleCache.has(key)) return tpl._scaleCache.get(key);
+    const base = getScaledTplGray(tpl, sc, true);
+    if (!base) {
+      tpl._scaleCache.set(key, null);
+      return null;
+    }
+    const { scaled, sw, sh } = base;
+    const maskW = (sh > 8 && sw > 7) ? Math.max(7, Math.round(sw * 0.48)) : 0;
+    const mask = new Uint8Array(sw * sh);
+    let mCount = 0;
+    for (let y = 0; y < sh; y++) {
+      const rowOff = y * sw;
+      for (let x = 0; x < sw; x++) {
+        if (y >= 8 && x < maskW) continue;
+        mask[rowOff + x] = 1;
+        mCount++;
+      }
+    }
+    if (mCount === 0) {
+      tpl._scaleCache.set(key, null);
+      return null;
+    }
+    const d = scaled.data;
+    let sum = 0;
+    for (let i = 0; i < mask.length; i++) {
+      if (mask[i]) sum += d[i];
+    }
+    const mean = sum / mCount;
+    const tmBase = new Float32Array(mCount);
+    let normSq = 0;
+    for (let i = 0, k = 0; i < mask.length; i++) {
+      if (mask[i]) {
+        const v = d[i] - mean;
+        tmBase[k++] = v;
+        normSq += v * v;
+      }
+    }
+    const tNorm = Math.sqrt(normSq);
+    if (tNorm < 1e-5) {
+      tpl._scaleCache.set(key, null);
+      return null;
+    }
+    const res = { scaled, sw, sh, mask, mCount, tmBase, tNorm };
+    tpl._scaleCache.set(key, res);
+    return res;
+  }
+
   function hasLocalContrast(patchGray, darkOnWhite = false) {
     const st = arrayStats(patchGray.data);
     if (st.max - st.min < 65) return false;
@@ -1436,10 +1485,26 @@
   function findWhiteCardClusters(roiBgr, isDealer = false) {
     if (!roiBgr || roiBgr.w === 0 || roiBgr.h === 0) return [];
     const mb = toMinGray(roiBgr);
+    let chroma = null;
+    if (roiBgr.c === 3) {
+      chroma = new Uint8Array(mb.data.length);
+      const sd = roiBgr.data;
+      for (let i = 0, j = 0; i < mb.data.length; i++, j += 3) {
+        const b = sd[j], g = sd[j + 1], r = sd[j + 2];
+        const mx = b > g ? (b > r ? b : r) : (g > r ? g : r);
+        chroma[i] = mx - mb.data[i];
+      }
+    }
 
-    const runPass = (maskThr, gt1, gt2) => {
+    const runPass = (maskThr, gt1, gt2, maxChroma = null) => {
       const mask = new Uint8Array(mb.data.length);
-      for (let i = 0; i < mb.data.length; i++) mask[i] = mb.data[i] > maskThr ? 1 : 0;
+      if (maxChroma !== null && chroma !== null) {
+        for (let i = 0; i < mb.data.length; i++) {
+          mask[i] = (mb.data[i] > maskThr && chroma[i] <= maxChroma) ? 1 : 0;
+        }
+      } else {
+        for (let i = 0; i < mb.data.length; i++) mask[i] = mb.data[i] > maskThr ? 1 : 0;
+      }
       const cc = connectedComponentsWithStats(mask, mb.w, mb.h);
       const raw = [];
       const caps = [];
@@ -1461,6 +1526,12 @@
         }
         if ((w / Math.max(1, h) > 4.0 && fill < 0.45) || fill < 0.19) continue;
         if (c2 / patch.data.length < 0.25) continue;
+        if (maxChroma !== null) {
+          const p95 = percentileU8(patch.data, 95);
+          const p5 = percentileU8(patch.data, 5);
+          const stP = arrayStats(patch.data);
+          if ((p95 - p5) < 55 || stP.min >= 55) continue;
+        }
         raw.push([x, y, w, h]);
       }
       if (!raw.length) return [];
@@ -1498,11 +1569,31 @@
       return merged;
     };
 
-    const primary = runPass(155, 160, 165);
-    if (!isDealer) return primary;
+    const primary = runPass(155, 160, 165, null);
+    if (!isDealer) {
+      const dimmed = runPass(80, 88, 92, 28);
+      if (!dimmed.length) return primary;
+      if (!primary.length) return dimmed;
+      const combined = primary.slice();
+      for (const [dx, dy, dw, dh] of dimmed) {
+        const dArea = Math.max(1, dw * dh);
+        let overlaps = false;
+        for (const [px, py, pw, ph] of primary) {
+          const ix = Math.max(0, Math.min(dx + dw, px + pw) - Math.max(dx, px));
+          const iy = Math.max(0, Math.min(dy + dh, py + ph) - Math.max(dy, py));
+          if ((ix * iy) / dArea >= 0.25) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (!overlaps) combined.push([dx, dy, dw, dh]);
+      }
+      combined.sort((a, b) => a[0] - b[0]);
+      return combined;
+    }
     const totalW = primary.reduce((s, c) => s + c[2], 0);
     if (!primary.length || totalW < roiBgr.w * 0.28) {
-      const relaxed = runPass(142, 145, 148);
+      const relaxed = runPass(142, 145, 148, null);
       const relW = relaxed.reduce((s, c) => s + c[2], 0);
       if (relW > totalW) return relaxed;
     }
@@ -1526,30 +1617,28 @@
     return redCnt / n >= 0.24 && dotCnt / n >= 0.10 && whiteCnt / n <= 0.42;
   }
 
-  function classifySuit(normBgr, rankX, rankW, cwNorm, suitTemplates) {
-    if (!normBgr || normBgr.c !== 3 || !suitTemplates || !suitTemplates.length) return [null, 0.0];
-    const ix0 = Math.max(0, rankX);
-    const ix1 = Math.min(cwNorm, rankX + Math.max(rankW, 12));
-    const x0 = Math.max(0, rankX - 3);
-    const x1 = Math.min(cwNorm, rankX + Math.max(rankW, 16) + 3);
-    const inkBot = cropImage(normBgr, ix0, 27, ix1 - ix0, 18);
-    const inkTop = cropImage(normBgr, ix0, 1, ix1 - ix0, 18);
-    const suitZone = cropImage(normBgr, x0, 26, x1 - x0, 19);
-    if (suitZone.w === 0 || inkBot.w === 0) return [null, 0.0];
+  function classifySuitZone(suitZone, inkZones, suitTemplates, paperHi = 250) {
+    if (!suitZone || suitZone.c !== 3 || suitZone.w === 0 || suitZone.h === 0 || !suitTemplates || !suitTemplates.length) {
+      return [null, 0.0];
+    }
+    const paperScale = Math.min(1.0, Math.max(0.45, paperHi / 220.0));
+    const redDiffThr = Math.max(18, Math.min(32, Math.round(32.0 * paperScale)));
+    const suitInkThr = Math.max(72, Math.min(175, Math.round(paperHi * 0.72)));
 
     function inkCounts(patch) {
+      if (!patch || patch.w === 0 || patch.h === 0) return [0, 0];
       const n = patch.w * patch.h;
       let redPx = 0, inkPx = 0;
       for (let i = 0, j = 0; i < n; i++, j += 3) {
         const b = patch.data[j], g = patch.data[j + 1], r = patch.data[j + 2];
-        if (r - Math.max(b, g) > 32) redPx++;
-        if (Math.min(b, g, r) < 175) inkPx++;
+        if (r - Math.max(b, g) > redDiffThr) redPx++;
+        if (Math.min(b, g, r) < suitInkThr) inkPx++;
       }
       return [redPx, inkPx];
     }
 
-    const [rb, ib] = inkCounts(inkBot);
-    const [rt, it] = inkCounts(inkTop);
+    const [rb, ib] = inkZones.length > 0 ? inkCounts(inkZones[0]) : [0, 0];
+    const [rt, it] = inkZones.length > 1 ? inkCounts(inkZones[1]) : [0, 0];
     const isRed = (rb >= 8 && rb / Math.max(1, ib) >= 0.42) || (rb + rt >= 12 && (rb + rt) / Math.max(1, ib + it) >= 0.42);
     const allowed = isRed ? new Set(["H", "D"]) : new Set(["S", "C"]);
     const filtered = suitTemplates.filter((t) => allowed.has(t.rank));
@@ -1572,6 +1661,26 @@
     return [bestConf >= 0.56 ? bestSuit : null, bestConf];
   }
 
+  function classifySuit(normBgr, rankX, rankW, cwNorm, suitTemplates, paperHi = 250) {
+    if (!normBgr || normBgr.c !== 3 || !suitTemplates || !suitTemplates.length) return [null, 0.0];
+    const ix0 = Math.max(0, rankX);
+    const ix1 = Math.min(cwNorm, rankX + Math.max(rankW, 12));
+    const x0 = Math.max(0, rankX - 3);
+    const x1 = Math.min(cwNorm, rankX + Math.max(rankW, 16) + 3);
+    const inkBot = cropImage(normBgr, ix0, 27, ix1 - ix0, 18);
+    const inkTop = cropImage(normBgr, ix0, 1, ix1 - ix0, 18);
+    const suitZone = cropImage(normBgr, x0, 26, x1 - x0, 19);
+    if (suitZone.w === 0 || inkBot.w === 0) return [null, 0.0];
+    return classifySuitZone(suitZone, [inkBot, inkTop], suitTemplates, paperHi);
+  }
+
+  function classifyTopRightSuit(normBgr, cwNorm, suitTemplates, paperHi = 250) {
+    if (!normBgr || normBgr.c !== 3 || !suitTemplates || !suitTemplates.length || cwNorm < 24) return [null, 0.0];
+    const x0 = Math.max(0, cwNorm - 19);
+    const trZone = rotate180(cropImage(normBgr, x0, 1, cwNorm - x0, 19));
+    return classifySuitZone(trZone, [trZone], suitTemplates, paperHi);
+  }
+
   function detectClusterCards(roiBgr, cluster, rankTemplates, suitTemplates, floorConf, isDealer, minHudConf = 0.84, refCh = null) {
     let [cx, cy, cw, ch] = cluster;
     if (refCh !== null && ch < 0.85 * refCh) {
@@ -1581,8 +1690,19 @@
     let clusterBgr = cropImage(roiBgr, cx, cy, cw, ch);
     if (clusterBgr.w === 0 || clusterBgr.h === 0 || !rankTemplates.length) return [[], false];
 
-    const rowWhThr = isDealer ? 142 : 155;
     const clMb = toMinGray(clusterBgr);
+    const paperHi = percentileU8(clMb.data, 92);
+    const paperScale = Math.min(1.0, Math.max(0.45, paperHi / 220.0));
+    const rowWhThr = isDealer ? 142 : Math.max(92, Math.min(155, Math.round(paperHi * 0.72)));
+    const paperThr = Math.max(92, Math.min(158, Math.round(paperHi * 0.74)));
+    const inkThr = Math.max(62, Math.min(120, Math.round(paperHi * 0.55)));
+    const minContrast = Math.max(48, Math.round(70.0 * paperScale));
+    const pipPaperThr = Math.max(92, Math.min(155, Math.round(paperHi * 0.72)));
+    const pipInkThr = Math.max(68, Math.min(145, Math.round(paperHi * 0.62)));
+    const badgeDarkThr = Math.max(55, Math.min(140, Math.round(paperHi * 0.56)));
+    const isDimmedCl = !isDealer && paperHi < 175;
+    const dimMaxInk = Math.max(55, Math.round(paperHi * 0.42));
+
     const whiteRows = [];
     for (let y = 0; y < clMb.h; y++) {
       let wCnt = 0;
@@ -1638,7 +1758,7 @@
           for (let xPos = 0; xPos <= xLim; xPos++) {
             const conf = m.data[yPos * m.w + xPos];
             if (conf < subFloor || !Number.isFinite(conf)) continue;
-            let pMin = 255, pMax = 0, gt158 = 0, lt120 = 0;
+            let pMin = 255, pMax = 0, gtPaper = 0, ltInk = 0;
             const pData = normTop.data;
             const ntW = normTop.w;
             for (let py = 0; py < sh; py++) {
@@ -1647,22 +1767,23 @@
                 const v = pData[pOff];
                 if (v < pMin) pMin = v;
                 if (v > pMax) pMax = v;
-                if (v > 158) gt158++;
-                if (v < 120) lt120++;
+                if (v > paperThr) gtPaper++;
+                if (v < inkThr) ltInk++;
               }
             }
             const isDealerTail = isDealer && xPos >= cwNorm - 24;
             const contrastSpan = pMax - pMin;
             const nPatch = sw * sh;
             if (conf >= floorConf) {
-              if (contrastSpan < (isDealerTail ? 58 : 70)) continue;
-              if (gt158 / nPatch < (isDealerTail ? 0.20 : 0.26) || lt120 / nPatch < (isDealerTail ? 0.06 : 0.07)) continue;
+              if (contrastSpan < (isDealerTail ? 58 : minContrast)) continue;
+              if (gtPaper / nPatch < (isDealerTail ? 0.20 : 0.26) || ltInk / nPatch < (isDealerTail ? 0.06 : 0.07)) continue;
+              if (isDimmedCl && pMin >= dimMaxInk) continue;
               const prio = conf + (tpl.rank === "10" ? 0.015 : 0.0);
               peaks.push([
                 prio,
                 { rank: tpl.rank, val: tpl.val, conf, x: xPos, y: yPos, w: sw, h: sh, suit: null, hand_index: 0, cwNorm },
               ]);
-            } else if (isDealer && contrastSpan >= 36 && gt158 / nPatch >= 0.14 && lt120 / nPatch >= 0.04) {
+            } else if (isDealer && contrastSpan >= 36 && gtPaper / nPatch >= 0.14 && ltInk / nPatch >= 0.04) {
               subPeaks.push([
                 conf,
                 { rank: tpl.rank, val: tpl.val, conf, x: xPos, y: yPos, w: sw, h: sh, suit: null, hand_index: 0, cwNorm },
@@ -1676,35 +1797,168 @@
     peaks.sort((a, b) => b[0] - a[0]);
     const kept = [];
     for (const [, cand] of peaks) {
-      if (kept.some((k) => Math.abs(cand.x - k.x) < 11 || (cand.x < k.x + k.w && k.x < cand.x + cand.w))) continue;
+      if (kept.some((k) => Math.abs(cand.x - k.x) < 11)) continue;
       kept.push(cand);
     }
     kept.sort((a, b) => a.x - b.x);
 
+    // Locate Card 0's true left paper edge above the circular badge (badge ring can shift cluster left by 4-6px)
+    let firstCardX = 0;
+    const topBandH = Math.min(8, normTop.h);
+    if (topBandH > 1) {
+      for (let x = 0; x < cwNorm; x++) {
+        let wc = 0;
+        for (let y = 1; y < topBandH; y++) {
+          if (normTop.data[y * normTop.w + x] > paperThr) wc++;
+        }
+        if (wc / (topBandH - 1) >= 0.45) {
+          firstCardX = Math.min(Math.max(0, cwNorm - 12), Math.min(10, x));
+          break;
+        }
+      }
+    }
+    let topPaperCnt = 0, topPaperTot = 0;
+    const tpEnd = Math.min(cwNorm, firstCardX + 14);
+    for (let y = 1; y < topBandH; y++) {
+      for (let x = firstCardX; x < tpEnd; x++) {
+        topPaperTot++;
+        if (normTop.data[y * normTop.w + x] > paperThr) topPaperCnt++;
+      }
+    }
+    const topPaper = topPaperTot > 0 ? topPaperCnt / topPaperTot : 0;
+    let badgeProbe = cropImage(normTop, Math.max(0, firstCardX), 14, Math.min(10, cwNorm - Math.max(0, firstCardX)), 9);
+    if (normBgr.h >= 38) {
+      const bx0 = Math.max(0, firstCardX - 2);
+      const bx1 = Math.min(cwNorm, firstCardX + 10);
+      badgeProbe = toMinGray(cropImage(normBgr, bx0, 18, bx1 - bx0, 20));
+    }
+    let badgeDarkCnt = 0;
+    for (let i = 0; i < badgeProbe.data.length; i++) {
+      if (badgeProbe.data[i] < badgeDarkThr) badgeDarkCnt++;
+    }
+    const leftBadgeIntrusion = !isDealer && topPaper >= 0.25 && badgeProbe.data.length > 0 && (badgeDarkCnt / badgeProbe.data.length) >= 0.25;
+
+    // Masked left-badge recovery when Card 0's bottom-left corner is clipped or weakened by a circular score badge
+    const card0Missing = (kept.length > 0 && kept[0].x >= firstCardX + 10) || (kept.length === 0 && cwNorm >= 12);
+    const card0WeakUnderBadge = leftBadgeIntrusion && kept.length > 0 && kept[0].x <= firstCardX + 6 && kept[0].conf < 0.88;
+    if (card0Missing || card0WeakUnderBadge) {
+      const gapW = (card0Missing && kept.length > 0) ? kept[0].x : Math.min(firstCardX + 22, cwNorm);
+      let twCnt = 0, twTot = 0;
+      const twEnd = Math.min(cwNorm, Math.max(firstCardX + 12, gapW));
+      const twH = Math.min(11, normTop.h);
+      for (let y = 1; y < twH; y++) {
+        for (let x = firstCardX; x < twEnd; x++) {
+          twTot++;
+          if (normTop.data[y * normTop.w + x] > paperThr) twCnt++;
+        }
+      }
+      if (twTot > 0 && twCnt / twTot >= 0.20) {
+        let bestLeft = null;
+        const maskThr = Math.max(0.75, floorConf);
+        const maskPaperThr = Math.max(88, Math.round(paperThr * 0.96));
+        const maskInkThr = Math.min(135, inkThr + 5);
+        const maskMinContrast = Math.max(44, minContrast - 5);
+        for (const tpl of rankTemplates) {
+          for (const tsc of [0.90, 0.96, 1.0, 1.05]) {
+            const entry = getScaledRankTplMasked(tpl, tsc);
+            if (!entry) continue;
+            const { sw, sh, mask, mCount, tmBase, tNorm } = entry;
+            if (sw > normTop.w || sh > normTop.h) continue;
+            const minLx = Math.max(0, firstCardX - 1);
+            const maxLx = Math.min(firstCardX + 6, Math.max(minLx + 1, gapW - 10), normTop.w - sw + 1);
+            const maxY0 = Math.min(6, normTop.h - sh + 1);
+            for (let y0 = 0; y0 < maxY0; y0++) {
+              for (let x0 = minLx; x0 < maxLx; x0++) {
+                if (card0Missing && kept.length > 0 && Math.abs(x0 - kept[0].x) < 11) continue;
+                let pMin = 255, pMax = 0, gtP = 0, ltI = 0, sumP = 0;
+                for (let py = 0; py < sh; py++) {
+                  const sRow = (y0 + py) * normTop.w + x0;
+                  const mRow = py * sw;
+                  for (let px = 0; px < sw; px++) {
+                    if (!mask[mRow + px]) continue;
+                    const v = normTop.data[sRow + px];
+                    sumP += v;
+                    if (v < pMin) pMin = v;
+                    if (v > pMax) pMax = v;
+                    if (v > maskPaperThr) gtP++;
+                    if (v < maskInkThr) ltI++;
+                  }
+                }
+                if (
+                  gtP / mCount < 0.24 ||
+                  (pMax - pMin) < maskMinContrast ||
+                  ltI / mCount < 0.07 ||
+                  (isDimmedCl && pMin >= dimMaxInk)
+                ) {
+                  continue;
+                }
+                const pMean = sumP / mCount;
+                let dot = 0, pNormSq = 0;
+                for (let py = 0, k = 0; py < sh; py++) {
+                  const sRow = (y0 + py) * normTop.w + x0;
+                  const mRow = py * sw;
+                  for (let px = 0; px < sw; px++) {
+                    if (!mask[mRow + px]) continue;
+                    const dv = normTop.data[sRow + px] - pMean;
+                    dot += dv * tmBase[k];
+                    pNormSq += dv * dv;
+                    k++;
+                  }
+                }
+                const denom = Math.sqrt(pNormSq) * tNorm;
+                const scMasked = denom > 1e-5 ? dot / denom : 0.0;
+                const prio = scMasked + (tpl.rank === "10" ? 0.015 : 0.0);
+                if (scMasked >= maskThr && (!bestLeft || prio > bestLeft[0])) {
+                  bestLeft = [
+                    prio,
+                    { rank: tpl.rank, val: tpl.val, conf: scMasked, x: x0, y: y0, w: sw, h: sh, suit: null, hand_index: 0, cwNorm },
+                  ];
+                }
+              }
+            }
+          }
+        }
+        if (bestLeft) {
+          if (card0Missing) {
+            kept.unshift(bestLeft[1]);
+          } else if (bestLeft[1].conf >= Math.max(0.78, kept[0].conf + 0.03)) {
+            kept[0] = bestLeft[1];
+          }
+        }
+      }
+    }
+
     const out = [];
     const rejectedCands = [];
     for (const d of kept) {
-      const [suit, suitConf] = classifySuit(normBgr, d.x, d.w, cwNorm, suitTemplates);
+      let [suit, suitConf] = classifySuit(normBgr, d.x, d.w, cwNorm, suitTemplates, paperHi);
       let hasPipBody = false;
       if (suitTemplates && suitTemplates.length) {
         const sx0 = Math.max(0, d.x - 2);
         const sx1 = Math.min(cwNorm, d.x + Math.max(d.w, 14) + 2);
         const sz = toMinGray(cropImage(normBgr, sx0, 26, sx1 - sx0, 19));
-        let gt155 = 0, lt145 = 0, lt140 = 0;
+        let gtPaperPip = 0, ltInkPip = 0, ltBadge = 0;
         for (let k = 0; k < sz.data.length; k++) {
-          if (sz.data[k] > 155) gt155++;
-          if (sz.data[k] < 145) lt145++;
-          if (sz.data[k] < 140) lt140++;
+          if (sz.data[k] > pipPaperThr) gtPaperPip++;
+          if (sz.data[k] < pipInkThr) ltInkPip++;
+          if (sz.data[k] < badgeDarkThr) ltBadge++;
         }
-        hasPipBody = sz.data.length > 0 && gt155 / sz.data.length >= 0.30 && lt145 >= 5;
-        const hasBadgeOcclusion = !isDealer && d.x <= 9 && sz.data.length > 0 && lt140 / sz.data.length >= 0.25 && d.conf >= Math.max(0.75, floorConf);
+        hasPipBody = sz.data.length > 0 && gtPaperPip / sz.data.length >= 0.30 && ltInkPip >= 5;
+        const hasBadgeOcclusion = !isDealer && d.x <= firstCardX + 6 && sz.data.length > 0 && ltBadge / sz.data.length >= 0.25 && d.conf >= Math.max(0.75, floorConf);
+        if (!suit && hasBadgeOcclusion && cwNorm <= 44) {
+          const [trSuit, trConf] = classifyTopRightSuit(normBgr, cwNorm, suitTemplates, paperHi);
+          if (trSuit) {
+            suit = trSuit;
+            suitConf = trConf;
+          }
+        }
         if (!clusterHasBack && !edgeClipped && !hasBadgeOcclusion) {
           const remRight = effRight - d.x;
           if (remRight < 15 && (d.conf < Math.max(isDealer ? 0.74 : 0.84, isDealer ? minHudConf - 0.10 : minHudConf) || (!suit && !hasPipBody))) {
             if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
             continue;
           }
-          if (remRight < 22 && d.conf < Math.max(isDealer ? 0.72 : 0.75, minHudConf - (isDealer ? 0.12 : 0.09))) {
+          if (remRight < 22 && d.conf < Math.max(isDealer ? 0.72 : 0.82, minHudConf - (isDealer ? 0.12 : 0.02))) {
             if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
             continue;
           }

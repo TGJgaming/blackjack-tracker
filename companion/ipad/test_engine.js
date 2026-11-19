@@ -1929,7 +1929,109 @@ console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks
 
   console.log("   Test 29 PASSED");
 }
-console.log("\nALL 29 ENGINE TESTS PASSED SUCCESSFULLY!");
+
+// 30. Dimmed split hands, 13-rank badge occlusion & top-right suit fallback
+{
+  console.log("30. Testing dimmed split hands, 13-rank badge occlusion & top-right suit fallback...");
+  const rankTpls30 = detector.banks.hud;
+  const suitTpls30 = detector.banks.suit;
+  const findTpl = (bank, rank) => {
+    const t = bank.find((x) => x.rank === rank);
+    assert(t, `Missing template for ${rank}`);
+    return t;
+  };
+  const pasteCard45 = (dst, x0, y0, rank, suit, withBadge, topRightSuit) => {
+    const cw = topRightSuit ? 37 : 31;
+    fillRect(dst, x0, y0, cw, 45, 252, 252, 252);
+    const rt = findTpl(rankTpls30, rank).bgr;
+    for (let y = 0; y < Math.min(rt.h, 20); y++) {
+      for (let x = 0; x < Math.min(rt.w, 17); x++) {
+        const si = (y * rt.w + x) * 3;
+        const di = ((y0 + 2 + y) * dst.w + (x0 + 2 + x)) * 3;
+        dst.data[di] = rt.data[si];
+        dst.data[di + 1] = rt.data[si + 1];
+        dst.data[di + 2] = rt.data[si + 2];
+      }
+    }
+    const st = findTpl(suitTpls30, suit).bgr;
+    const isRed = suit === "H" || suit === "D";
+    for (let y = 0; y < Math.min(st.h, 18); y++) {
+      for (let x = 0; x < Math.min(st.w, 15); x++) {
+        const si = (y * st.w + x) * 3;
+        const mn = Math.min(st.data[si], st.data[si + 1], st.data[si + 2]);
+        const b = isRed && mn < 160 ? 40 : st.data[si];
+        const g = isRed && mn < 160 ? 40 : st.data[si + 1];
+        const r = isRed && mn < 160 ? 210 : st.data[si + 2];
+        const di = ((y0 + 26 + y) * dst.w + (x0 + 3 + x)) * 3;
+        dst.data[di] = b;
+        dst.data[di + 1] = g;
+        dst.data[di + 2] = r;
+      }
+    }
+    if (topRightSuit) {
+      const tw = Math.min(st.w, 15), th = Math.min(st.h, 17);
+      for (let y = 0; y < th; y++) {
+        for (let x = 0; x < tw; x++) {
+          const si = (y * st.w + x) * 3;
+          const mn = Math.min(st.data[si], st.data[si + 1], st.data[si + 2]);
+          const di = ((y0 + 2 + (th - 1 - y)) * dst.w + (x0 + cw - tw - 2 + (tw - 1 - x))) * 3;
+          dst.data[di] = isRed && mn < 160 ? 40 : st.data[si];
+          dst.data[di + 1] = isRed && mn < 160 ? 40 : st.data[si + 1];
+          dst.data[di + 2] = isRed && mn < 160 ? 210 : st.data[si + 2];
+        }
+      }
+    }
+    if (withBadge) {
+      for (let y = 0; y < 45; y++) {
+        for (let x = 0; x < cw; x++) {
+          if ((x + 1) * (x + 1) + (y - 33) * (y - 33) <= 121) {
+            const di = ((y0 + y) * dst.w + (x0 + x)) * 3;
+            dst.data[di] = 18;
+            dst.data[di + 1] = 22;
+            dst.data[di + 2] = 18;
+          }
+        }
+      }
+    }
+  };
+
+  const roi45 = Engine.createImage(220, 60, 3, 22);
+  fillRect(roi45, 0, 0, 220, 60, 18, 52, 22);
+  pasteCard45(roi45, 16, 7, "Q", "C", true, true);
+  pasteCard45(roi45, 100, 7, "10", "C", true, false);
+  pasteCard45(roi45, 131, 7, "3", "D", false, true);
+  for (let y = 0; y < roi45.h; y++) {
+    for (let x = 90; x < roi45.w; x++) {
+      const idx = (y * roi45.w + x) * 3;
+      roi45.data[idx] = Math.floor(roi45.data[idx] * 0.5);
+      roi45.data[idx + 1] = Math.floor(roi45.data[idx + 1] * 0.5);
+      roi45.data[idx + 2] = Math.floor(roi45.data[idx + 2] * 0.5);
+    }
+  }
+  const roi55 = Engine.resizeImage(roi45, Math.round(220 * 55 / 45), Math.round(60 * 55 / 45));
+  const dealerCls = Engine.findWhiteCardClusters(roi55, true);
+  assert.strictEqual(dealerCls.length, 1, "Dealer pass must ignore dimmed split hand");
+  const playerCls = Engine.findWhiteCardClusters(roi55, false);
+  assert.strictEqual(playerCls.length, 2, "Player pass must detect both bright and dimmed split hands");
+  const [h0] = Engine.detectClusterCards(roi55, playerCls[0], rankTpls30, suitTpls30, 0.78, false, 0.84);
+  const [h1] = Engine.detectClusterCards(roi55, playerCls[1], rankTpls30, suitTpls30, 0.78, false, 0.84);
+  assert.deepStrictEqual(h0.map((c) => [c.rank, c.suit]), [["Q", "C"]]);
+  assert.deepStrictEqual(h1.map((c) => [c.rank, c.suit]), [["10", "C"], ["3", "D"]]);
+
+  for (const rk of ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]) {
+    const r45 = Engine.createImage(100, 60, 3, 22);
+    fillRect(r45, 0, 0, 100, 60, 18, 52, 22);
+    pasteCard45(r45, 14, 7, rk, "S", true, false);
+    pasteCard45(r45, 45, 7, "3", "D", false, false);
+    const r55 = Engine.resizeImage(r45, Math.round(100 * 55 / 45), Math.round(60 * 55 / 45));
+    const cls = Engine.findWhiteCardClusters(r55, false);
+    assert.strictEqual(cls.length, 1, `Rank ${rk}: expected 1 cluster`);
+    const [cards] = Engine.detectClusterCards(r55, cls[0], rankTpls30, suitTpls30, 0.78, false, 0.84);
+    assert(cards.length >= 2 && cards[0].rank === rk, `Rank ${rk} failed under badge occlusion`);
+  }
+  console.log("   Test 30 PASSED");
+}
+console.log("\nALL 30 ENGINE TESTS PASSED SUCCESSFULLY!");
 
 
 

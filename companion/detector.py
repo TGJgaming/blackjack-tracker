@@ -791,58 +791,100 @@ class FeltBurstMonitor:
         return None
 
 
-def _find_white_card_clusters(roi_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """Locate connected white Playtech card clusters inside an ROI, filtering non-card table text."""
+def _find_white_card_clusters(
+    roi_bgr: np.ndarray, allow_dimmed: bool = False
+) -> list[tuple[int, int, int, int]]:
+    """Locate connected Playtech card clusters inside an ROI, including dimmed split hands when allowed."""
     if roi_bgr.size == 0:
         return []
     mb = _to_min_gray(roi_bgr)
-    mask = (mb > 155).astype(np.uint8)
-    num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
-    raw: list[tuple[int, int, int, int]] = []
-    caps: list[tuple[int, int, int, int]] = []
-    for i in range(1, num):
-        x, y, w, h, area = [int(v) for v in stats[i]]
-        fill = area / float(max(1, w * h))
-        patch_mb = mb[y : y + h, x : x + w]
-        if h < 13 or area < 105:
-            if 8 <= h <= 24 and w >= 5 and area >= 36 and fill >= 0.25 and float(np.mean(patch_mb > 160)) >= 0.25:
-                caps.append((x, y, w, h))
-            continue
-        if (w / max(1.0, float(h)) > 4.0 and fill < 0.45) or fill < 0.19:
-            continue
-        if float(np.mean(patch_mb > 165)) < 0.25:
-            continue
-        raw.append((x, y, w, h))
-    if not raw:
-        return []
-    raw.sort(key=lambda b: b[0])
-    merged: list[tuple[int, int, int, int]] = [raw[0]]
-    for x, y, w, h in raw[1:]:
-        px, py, pw, ph = merged[-1]
-        gap = x - (px + pw)
-        v_ov = min(py + ph, y + h) - max(py, y)
-        if gap <= 2 and v_ov >= int(round(0.55 * min(ph, h))):
-            nx = min(px, x)
-            ny = min(py, y)
-            nr = max(px + pw, x + w)
-            nb = max(py + ph, y + h)
-            merged[-1] = (nx, ny, nr - nx, nb - ny)
-        else:
-            merged.append((x, y, w, h))
+    chroma = (
+        (roi_bgr.max(axis=2).astype(np.int16) - mb.astype(np.int16))
+        if roi_bgr.ndim == 3
+        else np.zeros_like(mb, dtype=np.int16)
+    )
 
-    # Merge any top-left white corner cap (where score badge severed the bottom of Card 0) into its right neighbor
-    if caps:
-        for cx, cy, cw, ch in caps:
-            for idx, (px, py, pw, ph) in enumerate(merged):
-                gap = px - (cx + cw)
-                if -2 <= gap <= 4 and abs(cy - py) <= 5 and ch < ph:
-                    nx = min(cx, px)
-                    ny = min(cy, py)
-                    nr = max(cx + cw, px + pw)
-                    nb = max(cy + ch, py + ph)
-                    merged[idx] = (nx, ny, nr - nx, nb - ny)
-                    break
-    return merged
+    def _run_pass(
+        mask_thr: int, cap_thr: int, mean_thr: int, max_chroma: int | None = None
+    ) -> list[tuple[int, int, int, int]]:
+        mask = (mb > mask_thr) & (chroma <= max_chroma) if max_chroma is not None else (mb > mask_thr)
+        num, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
+        raw: list[tuple[int, int, int, int]] = []
+        caps: list[tuple[int, int, int, int]] = []
+        for i in range(1, num):
+            x, y, w, h, area = [int(v) for v in stats[i]]
+            fill = area / float(max(1, w * h))
+            patch_mb = mb[y : y + h, x : x + w]
+            if h < 13 or area < 105:
+                if 8 <= h <= 24 and w >= 5 and area >= 36 and fill >= 0.25 and float(np.mean(patch_mb > cap_thr)) >= 0.25:
+                    caps.append((x, y, w, h))
+                continue
+            if (w / max(1.0, float(h)) > 4.0 and fill < 0.45) or fill < 0.19:
+                continue
+            if float(np.mean(patch_mb > mean_thr)) < 0.25:
+                continue
+            if max_chroma is not None:
+                # Dimmed inactive cards still have crisp paper-vs-ink contrast (unlike flat gray UI/felt)
+                p95 = float(np.percentile(patch_mb, 95))
+                p5 = float(np.percentile(patch_mb, 5))
+                if (p95 - p5) < 55.0 or int(patch_mb.min()) >= 55:
+                    continue
+            raw.append((x, y, w, h))
+        if not raw:
+            return []
+        raw.sort(key=lambda b: b[0])
+        merged: list[tuple[int, int, int, int]] = [raw[0]]
+        for x, y, w, h in raw[1:]:
+            px, py, pw, ph = merged[-1]
+            gap = x - (px + pw)
+            v_ov = min(py + ph, y + h) - max(py, y)
+            if gap <= 2 and v_ov >= int(round(0.55 * min(ph, h))):
+                nx = min(px, x)
+                ny = min(py, y)
+                nr = max(px + pw, x + w)
+                nb = max(py + ph, y + h)
+                merged[-1] = (nx, ny, nr - nx, nb - ny)
+            else:
+                merged.append((x, y, w, h))
+
+        # Merge any top-left white corner cap (where score badge severed the bottom of Card 0) into its right neighbor
+        if caps:
+            for cx, cy, cw, ch in caps:
+                for idx, (px, py, pw, ph) in enumerate(merged):
+                    gap = px - (cx + cw)
+                    if -2 <= gap <= 4 and abs(cy - py) <= 5 and ch < ph:
+                        nx = min(cx, px)
+                        ny = min(cy, py)
+                        nr = max(cx + cw, px + pw)
+                        nb = max(cy + ch, py + ph)
+                        merged[idx] = (nx, ny, nr - nx, nb - ny)
+                        break
+        return merged
+
+    primary = _run_pass(155, 160, 165, max_chroma=None)
+    if not allow_dimmed:
+        return primary
+
+    dimmed = _run_pass(80, 88, 92, max_chroma=28)
+    if not dimmed:
+        return primary
+    if not primary:
+        return dimmed
+
+    combined = list(primary)
+    for dx, dy, dw, dh in dimmed:
+        d_area = max(1, dw * dh)
+        overlaps = False
+        for px, py, pw, ph in primary:
+            ix = max(0, min(dx + dw, px + pw) - max(dx, px))
+            iy = max(0, min(dy + dh, py + ph) - max(dy, py))
+            if (ix * iy) / float(d_area) >= 0.25:
+                overlaps = True
+                break
+        if not overlaps:
+            combined.append((dx, dy, dw, dh))
+    combined.sort(key=lambda b: b[0])
+    return combined
 
 
 def _has_red_back_signature(bgr_patch: np.ndarray) -> bool:
@@ -857,39 +899,31 @@ def _has_red_back_signature(bgr_patch: np.ndarray) -> bool:
     return red_ratio >= 0.24 and dot_ratio >= 0.10
 
 
-def _classify_suit(
-    norm_bgr: np.ndarray,
-    rank_x: int,
-    rank_w: int,
-    cw_norm: int,
+def _classify_suit_zone(
+    suit_zone: np.ndarray,
+    ink_zones: list[np.ndarray],
     suit_templates: list[TemplateEntry],
+    paper_hi: float = 250.0,
 ) -> tuple[str | None, float]:
-    """Classify card suit (S, H, C, D) from canonical H=45 bottom pip slice directly below rank."""
-    if norm_bgr.ndim != 3 or not suit_templates:
+    """Classify card suit (S, H, C, D) on a canonical H=45 pip zone with adaptive luminance thresholds."""
+    if suit_zone.size == 0 or suit_zone.ndim != 3 or not suit_templates:
         return None, 0.0
-    ix0 = max(0, rank_x)
-    ix1 = min(cw_norm, rank_x + max(rank_w, 12))
-    x0 = max(0, rank_x - 3)
-    x1 = min(cw_norm, rank_x + max(rank_w, 16) + 3)
-    ink_zone_bot = norm_bgr[27:45, ix0:ix1]
-    ink_zone_top = norm_bgr[1:19, ix0:ix1]
-    suit_zone = norm_bgr[26:45, x0:x1]
-    if suit_zone.size == 0 or ink_zone_bot.size == 0:
-        return None, 0.0
+    paper_scale = min(1.0, max(0.45, paper_hi / 220.0))
+    red_diff_thr = max(18, min(32, int(round(32.0 * paper_scale))))
+    suit_ink_thr = max(72, min(175, int(round(paper_hi * 0.72))))
 
-    # Classify red (H/D) vs black (S/C) strictly by red fraction of ink pixels directly inside card slice
     def _ink_counts(patch: np.ndarray) -> tuple[int, int]:
         if patch.size == 0 or patch.ndim != 3:
             return 0, 0
         b = patch[:, :, 0].astype(np.int16)
         g = patch[:, :, 1].astype(np.int16)
         r = patch[:, :, 2].astype(np.int16)
-        red_px = int(np.sum((r - np.maximum(b, g)) > 32))
-        ink_px = int(np.sum(patch.min(axis=2) < 175))
+        red_px = int(np.sum((r - np.maximum(b, g)) > red_diff_thr))
+        ink_px = int(np.sum(patch.min(axis=2) < suit_ink_thr))
         return red_px, ink_px
 
-    rb, ib = _ink_counts(ink_zone_bot)
-    rt, it = _ink_counts(ink_zone_top)
+    rb, ib = _ink_counts(ink_zones[0]) if ink_zones else (0, 0)
+    rt, it = _ink_counts(ink_zones[1]) if len(ink_zones) > 1 else (0, 0)
     red_frac_bot = rb / max(1, ib)
     red_frac_all = (rb + rt) / max(1, ib + it)
     is_red = (rb >= 8 and red_frac_bot >= 0.42) or ((rb + rt) >= 12 and red_frac_all >= 0.42)
@@ -919,6 +953,43 @@ def _classify_suit(
     return None, best_conf
 
 
+def _classify_suit(
+    norm_bgr: np.ndarray,
+    rank_x: int,
+    rank_w: int,
+    cw_norm: int,
+    suit_templates: list[TemplateEntry],
+    paper_hi: float = 250.0,
+) -> tuple[str | None, float]:
+    """Classify card suit (S, H, C, D) from canonical H=45 bottom pip slice directly below rank."""
+    if norm_bgr.ndim != 3 or not suit_templates:
+        return None, 0.0
+    ix0 = max(0, rank_x)
+    ix1 = min(cw_norm, rank_x + max(rank_w, 12))
+    x0 = max(0, rank_x - 3)
+    x1 = min(cw_norm, rank_x + max(rank_w, 16) + 3)
+    ink_zone_bot = norm_bgr[27:45, ix0:ix1]
+    ink_zone_top = norm_bgr[1:19, ix0:ix1]
+    suit_zone = norm_bgr[26:45, x0:x1]
+    if suit_zone.size == 0 or ink_zone_bot.size == 0:
+        return None, 0.0
+    return _classify_suit_zone(suit_zone, [ink_zone_bot, ink_zone_top], suit_templates, paper_hi=paper_hi)
+
+
+def _classify_top_right_suit(
+    norm_bgr: np.ndarray,
+    cw_norm: int,
+    suit_templates: list[TemplateEntry],
+    paper_hi: float = 250.0,
+) -> tuple[str | None, float]:
+    """Fallback suit check on the top-right upright pip (rotated 180 deg) for single badge-occluded cards."""
+    if norm_bgr.ndim != 3 or not suit_templates or cw_norm < 24:
+        return None, 0.0
+    x0 = max(0, cw_norm - 19)
+    tr_zone = cv2.rotate(norm_bgr[1:20, x0:cw_norm], cv2.ROTATE_180)
+    return _classify_suit_zone(tr_zone, [tr_zone], suit_templates, paper_hi=paper_hi)
+
+
 def _detect_cluster_cards(
     roi_bgr: np.ndarray,
     cluster: tuple[int, int, int, int],
@@ -940,7 +1011,19 @@ def _detect_cluster_cards(
 
     # Trim outer dark border rows before vertical normalization without cropping badge-occluded lower rows
     cl_mb = _to_min_gray(cluster_bgr)
-    white_rows = np.where(np.mean(cl_mb > 155, axis=1) >= 0.12)[0]
+    paper_hi = float(np.percentile(cl_mb, 92))
+    paper_scale = min(1.0, max(0.45, paper_hi / 220.0))
+    row_wh_thr = max(92.0, min(155.0, paper_hi * 0.72))
+    paper_thr = max(92, min(158, int(round(paper_hi * 0.74))))
+    ink_thr = max(62, min(120, int(round(paper_hi * 0.55))))
+    min_contrast = max(48, int(round(70.0 * paper_scale)))
+    pip_paper_thr = max(92, min(155, int(round(paper_hi * 0.72))))
+    pip_ink_thr = max(68, min(145, int(round(paper_hi * 0.62))))
+    badge_dark_thr = max(55, min(140, int(round(paper_hi * 0.56))))
+    is_dimmed_cl = paper_hi < 175.0
+    dim_max_ink = max(55, int(round(paper_hi * 0.42)))
+
+    white_rows = np.where(np.mean(cl_mb > row_wh_thr, axis=1) >= 0.12)[0]
     if len(white_rows) >= 13 and (int(white_rows[-1]) + 1 - int(white_rows[0])) >= int(round(ch * 0.82)):
         y_off = int(white_rows[0])
         y_end = int(white_rows[-1]) + 1
@@ -1019,9 +1102,10 @@ def _detect_cluster_cards(
                 # Reject dark/red score badges, fade frames, and dark borders lacking crisp paper+ink contrast
                 patch = norm_top[y_pos : y_pos + sh, x_pos : x_pos + sw]
                 if (
-                    float(np.mean(patch > 158)) < 0.26
-                    or (int(patch.max()) - int(patch.min())) < 70
-                    or float(np.mean(patch < 120)) < 0.07
+                    float(np.mean(patch > paper_thr)) < 0.26
+                    or (int(patch.max()) - int(patch.min())) < min_contrast
+                    or float(np.mean(patch < ink_thr)) < 0.07
+                    or (is_dimmed_cl and int(patch.min()) >= dim_max_ink)
                 ):
                     continue
                 if _is_back_column(x_pos, sw):
@@ -1054,13 +1138,32 @@ def _detect_cluster_cards(
             kept.append(cand)
         kept.sort(key=lambda d: d.x)
 
-    # Masked left-badge recovery when card 0's bottom-left corner is clipped by a circular score badge
-    if (kept and kept[0].x >= 11) or (not kept and cw_norm >= 12):
-        gap_w = kept[0].x if kept else min(20, cw_norm)
-        top_white = float(np.mean(norm_top[1:11, : min(18, gap_w)] > 158))
+    # Locate Card 0's true left paper edge above the circular badge (badge ring can shift cluster left by 4-6px)
+    top_white_cols = np.where(np.mean(norm_top[1:8, :] > paper_thr, axis=0) >= 0.45)[0]
+    first_card_x = min(max(0, cw_norm - 12), min(10, int(top_white_cols[0]))) if len(top_white_cols) else 0
+    badge_probe = norm_top[14:23, max(0, first_card_x) : min(cw_norm, first_card_x + 10)]
+    if norm_bgr.shape[0] >= 38:
+        badge_probe = _to_min_gray(norm_bgr[18:38, max(0, first_card_x - 2) : min(cw_norm, first_card_x + 10)])
+    top_paper = float(np.mean(norm_top[1:8, first_card_x : min(cw_norm, first_card_x + 14)] > paper_thr))
+    left_badge_intrusion = (
+        not is_dealer
+        and top_paper >= 0.25
+        and badge_probe.size > 0
+        and float(np.mean(badge_probe < badge_dark_thr)) >= 0.25
+    )
+
+    # Masked left-badge recovery when card 0's bottom-left corner is clipped or weakened by a circular score badge
+    card0_missing = (kept and kept[0].x >= first_card_x + 10) or (not kept and cw_norm >= 12)
+    card0_weak_under_badge = left_badge_intrusion and kept and kept[0].x <= first_card_x + 6 and kept[0].conf < 0.88
+    if card0_missing or card0_weak_under_badge:
+        gap_w = kept[0].x if card0_missing and kept else min(first_card_x + 22, cw_norm)
+        top_white = float(np.mean(norm_top[1:11, first_card_x : min(cw_norm, max(first_card_x + 12, gap_w))] > paper_thr))
         if top_white >= 0.20:
             best_left: tuple[float, CardDetection] | None = None
             mask_thr = max(0.75, floor_conf)
+            mask_paper_thr = max(88, int(round(paper_thr * 0.96)))
+            mask_ink_thr = min(135, ink_thr + 5)
+            mask_min_contrast = max(44, min_contrast - 5)
             for tpl in rank_templates:
                 for tsc in (0.90, 0.96, 1.0, 1.05):
                     entry = _get_scaled_rank_tpl_entry(tpl, tsc, masked=True)
@@ -1069,18 +1172,20 @@ def _detect_cluster_cards(
                     _, sw, sh, tm_base, t_norm, mask = entry
                     if sw > norm_top.shape[1] or sh > norm_top.shape[0] or tm_base is None or mask is None:
                         continue
-                    max_lx = min(8, max(1, gap_w - 10), norm_top.shape[1] - sw + 1)
+                    min_lx = max(0, first_card_x - 1)
+                    max_lx = min(first_card_x + 6, max(min_lx + 1, gap_w - 10), norm_top.shape[1] - sw + 1)
                     for y0 in range(0, min(6, norm_top.shape[0] - sh + 1)):
-                        for x0 in range(0, max_lx):
-                            if kept and abs(x0 - kept[0].x) < 11:
+                        for x0 in range(min_lx, max_lx):
+                            if card0_missing and kept and abs(x0 - kept[0].x) < 11:
                                 continue
                             p = norm_top[y0 : y0 + sh, x0 : x0 + sw]
                             pm_raw = p[mask]
                             if (
                                 pm_raw.size == 0
-                                or float(np.mean(pm_raw > 155)) < 0.24
-                                or (int(pm_raw.max()) - int(pm_raw.min())) < 65
-                                or float(np.mean(pm_raw < 125)) < 0.07
+                                or float(np.mean(pm_raw > mask_paper_thr)) < 0.24
+                                or (int(pm_raw.max()) - int(pm_raw.min())) < mask_min_contrast
+                                or float(np.mean(pm_raw < mask_ink_thr)) < 0.07
+                                or (is_dimmed_cl and int(pm_raw.min()) >= dim_max_ink)
                                 or _is_back_column(x0, sw)
                             ):
                                 continue
@@ -1103,38 +1208,45 @@ def _detect_cluster_cards(
                                     ),
                                 )
             if best_left is not None:
-                kept.insert(0, best_left[1])
+                if card0_missing:
+                    kept.insert(0, best_left[1])
+                elif best_left[1].conf >= max(0.78, kept[0].conf + 0.03):
+                    kept[0] = best_left[1]
 
     if not kept:
         return [], cluster_has_back
 
     out: list[CardDetection] = []
     for d in kept:
-        suit, suit_conf = _classify_suit(norm_bgr, d.x, d.w, cw_norm, suit_templates)
+        suit, suit_conf = _classify_suit(norm_bgr, d.x, d.w, cw_norm, suit_templates, paper_hi=paper_hi)
         if suit_templates:
             sx0 = max(0, d.x - 2)
             sx1 = min(cw_norm, d.x + max(d.w, 14) + 2)
             sz = _to_min_gray(norm_bgr[26:45, sx0:sx1]) if norm_bgr.shape[0] >= 40 else np.empty((0, 0), dtype=np.uint8)
             has_pip_body = (
                 sz.size > 0
-                and float(np.mean(sz > 155)) >= 0.30
-                and int(np.sum(sz < 145)) >= 5
+                and float(np.mean(sz > pip_paper_thr)) >= 0.30
+                and int(np.sum(sz < pip_ink_thr)) >= 5
             )
             # Score badge on player Card 0 covers lower-left (rows 26:45) with dark badge pixels
             has_badge_occlusion = (
                 not is_dealer
-                and d.x <= 9
+                and d.x <= first_card_x + 6
                 and sz.size > 0
-                and float(np.mean(sz < 140)) >= 0.25
+                and float(np.mean(sz < badge_dark_thr)) >= 0.25
                 and d.conf >= max(0.75, floor_conf)
             )
+            if suit is None and has_badge_occlusion and cw_norm <= 44:
+                tr_suit, tr_conf = _classify_top_right_suit(norm_bgr, cw_norm, suit_templates, paper_hi=paper_hi)
+                if tr_suit is not None:
+                    suit, suit_conf = tr_suit, tr_conf
             if (not cluster_has_back and not edge_clipped) and not has_badge_occlusion:
                 rem_right = eff_right - d.x
                 if rem_right < 15:
                     if d.conf < max(0.84, min_hud_conf) or (suit is None and not has_pip_body):
                         continue
                 elif rem_right < 22:
-                    if d.conf < max(0.78, min_hud_conf - 0.06):
+                    if d.conf < max(0.82, min_hud_conf - 0.02):
                         continue
                     if suit is None and (not has_pip_body or d.conf < max(0.82, min_hud_conf - 0.02)):
                         continue
@@ -1142,6 +1254,8 @@ def _detect_cluster_cards(
                 if not has_pip_body or suit_conf < 0.42 or d.conf < max(0.82, min_hud_conf - 0.02):
                     continue
             elif suit is not None and d.conf < max(0.78, min_hud_conf - 0.06) and suit_conf < 0.60:
+                continue
+            if d.rank == "4" and not has_badge_occlusion and d.conf < max(0.82, min_hud_conf - 0.02):
                 continue
         out.append(
             CardDetection(
@@ -1184,7 +1298,7 @@ def _get_scaled_rank_tpl_entry(
         return val
     mask = np.ones((sh, sw), dtype=bool)
     if sh > 8 and sw > 7:
-        mask[8:, :7] = False
+        mask[8:, : max(7, int(round(sw * 0.48)))] = False
     tm_base = scaled[mask].astype(np.float32)
     tm_base -= float(tm_base.mean())
     t_norm = float(np.linalg.norm(tm_base))
@@ -1377,7 +1491,7 @@ class PlaytechDetector:
         floor_conf = max(0.68, self.cfg.min_hud_confidence - 0.10)
         rank_tpls = [t for t in self.hud_bank.card_templates if t.rank != "BACK"]
         med_tpl_h = float(np.median([t.gray.shape[0] for t in rank_tpls])) if rank_tpls else 20.0
-        clusters = _find_white_card_clusters(roi_img) if med_tpl_h <= 23.0 else []
+        clusters = _find_white_card_clusters(roi_img, allow_dimmed=(not is_dealer)) if med_tpl_h <= 23.0 else []
 
         if clusters:
             cluster_hits: list[tuple[tuple[int, int, int, int], list[CardDetection]]] = []

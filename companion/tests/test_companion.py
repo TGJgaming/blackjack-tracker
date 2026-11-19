@@ -2347,6 +2347,85 @@ def test_ipad_split_view_viewport_and_companion_pack_roundtrip(tmp_path: Path) -
     assert counts["banner"].get("WAIT") == 1
 
 
+def test_dimmed_split_hand_and_13_rank_badge_occlusion() -> None:
+    """Dimmed inactive split hands, circular score-badge occlusion across all 13 ranks, and top-right suit fallback work cleanly."""
+    from config import load_config
+    from detector import PlaytechDetector, _detect_cluster_cards, _find_white_card_clusters
+
+    det = PlaytechDetector(load_config())
+    rank_tpls = det.hud_bank.card_templates
+    suit_tpls = det.suit_bank.suit_templates
+    assert len(rank_tpls) >= 13 and len(suit_tpls) >= 4
+
+    def _find_tpl(bank: list, rank: str) -> np.ndarray:
+        for t in bank:
+            if t.rank == rank:
+                return t.bgr
+        raise AssertionError(f"Missing template {rank}")
+
+    def _make_card_h45(rank: str, suit: str, with_badge: bool = False, top_right_suit: bool = False) -> np.ndarray:
+        cw = 37 if top_right_suit else 31
+        card = np.full((45, cw, 3), 252, dtype=np.uint8)
+        rt = _find_tpl(rank_tpls, rank)
+        rh, rw = rt.shape[:2]
+        card[2 : 2 + min(rh, 20), 2 : 2 + min(rw, 17)] = rt[: min(rh, 20), : min(rw, 17)]
+        st = _find_tpl(suit_tpls, suit)
+        sh, sw = st.shape[:2]
+        if suit in ("H", "D"):
+            # Tint dark ink red for red suits
+            st_col = st.copy()
+            dark = st_col.min(axis=2) < 160
+            st_col[dark] = (40, 40, 210)
+        else:
+            st_col = st
+        card[26 : 26 + min(sh, 18), 3 : 3 + min(sw, 15)] = st_col[: min(sh, 18), : min(sw, 15)]
+        if top_right_suit:
+            tr = cv2.rotate(st_col[: min(sh, 17), : min(sw, 15)], cv2.ROTATE_180)
+            th, tw = tr.shape[:2]
+            card[2 : 2 + th, cw - tw - 2 : cw - 2] = tr
+        if with_badge:
+            cv2.circle(card, (-1, 33), 11, (18, 22, 18), -1)
+        return card
+
+    # 1. Dimmed split hand + badge occlusion + top-right suit fallback (scaled to H=55)
+    roi45 = np.full((60, 220, 3), (18, 52, 22), dtype=np.uint8)
+    left_qc = _make_card_h45("Q", "C", with_badge=True, top_right_suit=True)
+    right_10c = _make_card_h45("10", "C", with_badge=True)
+    right_3d = _make_card_h45("3", "D", with_badge=False, top_right_suit=True)
+    roi45[7:52, 16 : 16 + left_qc.shape[1]] = left_qc
+    roi45[7:52, 100:131] = right_10c
+    roi45[7:52, 131 : 131 + right_3d.shape[1]] = right_3d
+    # Dim right split hand to 50%
+    roi45[:, 90:] = (roi45[:, 90:].astype(np.float32) * 0.5).astype(np.uint8)
+    roi55 = cv2.resize(roi45, (int(round(220 * 55 / 45)), int(round(60 * 55 / 45))), interpolation=cv2.INTER_CUBIC)
+
+    # Dealer pass (allow_dimmed=False) must ignore the dimmed right hand
+    dealer_cls = _find_white_card_clusters(roi55, allow_dimmed=False)
+    assert len(dealer_cls) == 1
+
+    # Player pass (allow_dimmed=True) must detect BOTH hands accurately and emit no spurious '4' on right edge
+    player_cls = _find_white_card_clusters(roi55, allow_dimmed=True)
+    assert len(player_cls) == 2
+    hands = []
+    for cl in player_cls:
+        cards, _ = _detect_cluster_cards(roi55, cl, rank_tpls, suit_tpls, 0.78, is_dealer=False, min_hud_conf=0.84)
+        hands.append([(c.rank, c.suit) for c in cards])
+    assert hands[0] == [("Q", "C")], f"Expected [('Q', 'C')], got {hands[0]}"
+    assert hands[1] == [("10", "C"), ("3", "D")], f"Expected [('10', 'C'), ('3', 'D')], got {hands[1]}"
+
+    # 2. 13-rank badge-occlusion matrix (every rank A..K under bottom-left badge occlusion)
+    for rank in ("A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"):
+        r45 = np.full((60, 100, 3), (18, 52, 22), dtype=np.uint8)
+        r45[7:52, 14:45] = _make_card_h45(rank, "S", with_badge=True)
+        r45[7:52, 45:76] = _make_card_h45("3", "D", with_badge=False)
+        r55 = cv2.resize(r45, (int(round(100 * 55 / 45)), int(round(60 * 55 / 45))), interpolation=cv2.INTER_CUBIC)
+        cls = _find_white_card_clusters(r55, allow_dimmed=True)
+        assert len(cls) == 1, f"Rank {rank}: expected 1 cluster, got {cls}"
+        cards, _ = _detect_cluster_cards(r55, cls[0], rank_tpls, suit_tpls, 0.78, is_dealer=False, min_hud_conf=0.84)
+        assert len(cards) >= 2 and cards[0].rank == rank, f"Rank {rank} failed under badge occlusion: {[(c.rank, c.suit, round(c.conf, 3)) for c in cards]}"
+
+
+
 
 
 
