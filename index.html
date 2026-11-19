@@ -1833,7 +1833,7 @@ function pushCardExplicit(targetBox, val, opts = {}){
     syncHandResultState(curH, isSplit);
   } else if(box === 'D'){
     if(!Array.isArray(draft.dMeta)) draft.dMeta = [];
-    if(typeof opts.slot === 'number' && opts.slot >= 0 && opts.slot < draft.dCards.length && draft.dCards[opts.slot] === val){
+    if(opts.source !== 'educated_guess' && typeof opts.slot === 'number' && opts.slot >= 0 && opts.slot < draft.dCards.length && draft.dCards[opts.slot] === val){
       draft.dMeta[opts.slot] = _enrichCardMeta(draft.dMeta[opts.slot], val, opts);
       render();
       return;
@@ -4044,16 +4044,32 @@ function _clearPlaceBetsRecheckTimers(){
   while(_placeBetsRecheckTimers.length){
     clearTimeout(_placeBetsRecheckTimers.pop());
   }
+  if(draft) draft._placeBetsRecheckArmed = false;
+}
+
+function _armPlaceBetsRecheckTimers(){
+  if(!draft || draft._placeBetsRecheckArmed) return;
+  draft._placeBetsRecheckArmed = true;
+  syncCompanionState(true);
+  _placeBetsRecheckTimers.push(setTimeout(() => {
+    if(draft && (draft.phaseBanner === 'PLACE_BETS' || draft.phaseBanner === 'LAST_BETS' || _comp.state === 'BETTING')){
+      _completeDealerIfIncompleteClient('0s');
+    }
+  }, 250));
+  _placeBetsRecheckTimers.push(setTimeout(() => {
+    if(draft && (draft.phaseBanner === 'PLACE_BETS' || draft.phaseBanner === 'LAST_BETS' || _comp.state === 'BETTING')){
+      _completeDealerIfIncompleteClient('3s');
+    }
+  }, 3000));
 }
 
 function _completeDealerIfIncompleteClient(stage = 'recheck'){
   if(!draft || draft.dealerGuessRemoved) return false;
   const hands = Array.isArray(draft.hands) ? draft.hands : [];
   const totalP = hands.reduce((a, h) => a + (h.cards ? h.cards.length : 0), 0);
-  if(totalP < 2 || !Array.isArray(draft.dCards) || draft.dCards.length === 0) return false;
+  if(totalP < 2 || !Array.isArray(draft.dCards)) return false;
+  if(draft.dCards.length === 0 && stage !== '3s' && stage !== 'auto_watch') return false;
   const isSplit = hands.length > 1;
-  const anyPlayerAlive = hands.some(h => h.cards && h.cards.length > 0 && !evalHand(h.cards, isSplit).isBust);
-  if(!anyPlayerAlive) return false;
   const allPlayersNaturalBJ = hands.length > 0 && hands.every(h => h.cards && h.cards.length === 2 && evalHand(h.cards, isSplit).isBJ);
   const sAct = active();
   let guessCount = 0;
@@ -4061,7 +4077,7 @@ function _completeDealerIfIncompleteClient(stage = 'recheck'){
   while(guessCount < 6){
     const dLen = draft.dCards.length;
     const dEval = evalHand(draft.dCards, false);
-    const needMore = (dLen === 1 && !allPlayersNaturalBJ) || (dLen >= 2 && dEval.sum < 17);
+    const needMore = (dLen === 0) || (dLen === 1 && !allPlayersNaturalBJ) || (dLen >= 2 && dEval.sum < 17);
     if(!needMore) break;
     let chosenVal = 0;
     const rem = sAct ? buildShoeState(sAct, true).rem : null;
@@ -4232,6 +4248,10 @@ function handleCompanionMessage(msg){
       });
     }
     const nextKey = `${_comp.connected}|${_comp.windowFound}|${_comp.paused}|${_comp.state}|${(_comp.keepalive || {}).mode}|${(_comp.keepalive || {}).enabled}|${!!_comp.extConnected}`;
+    if(_comp.state === 'BETTING' && draft && !draft._placeBetsRecheckArmed && draft.phaseBanner !== 'NO_MORE_BETS'){
+      const revP = (draft.hands || []).reduce((a, h) => a + (h.cards ? h.cards.length : 0), 0);
+      if(revP >= 2 || (draft.dCards && draft.dCards.length > 0)) _armPlaceBetsRecheckTimers();
+    }
     if(prevKey !== nextKey) render();
     else updateKeepaliveBadge();
     return;
@@ -4263,15 +4283,8 @@ function handleCompanionMessage(msg){
         draft.lastMsg = '🕒 Reviewing recorded cards — auto-logs at No More Bets (or press Enter to log now).';
       }
     }
-    if(msg.phase === 'PLACE_BETS'){
-      _clearPlaceBetsRecheckTimers();
-      syncCompanionState(true);
-      _placeBetsRecheckTimers.push(setTimeout(() => {
-        if(draft && draft.phaseBanner === 'PLACE_BETS') _completeDealerIfIncompleteClient('0s');
-      }, 250));
-      _placeBetsRecheckTimers.push(setTimeout(() => {
-        if(draft && (draft.phaseBanner === 'PLACE_BETS' || draft.phaseBanner === 'LAST_BETS')) _completeDealerIfIncompleteClient('3s');
-      }, 3250));
+    if(msg.phase === 'PLACE_BETS' || msg.phase === 'LAST_BETS'){
+      _armPlaceBetsRecheckTimers();
     } else if(msg.phase === 'NO_MORE_BETS' || msg.phase === 'WAIT' || msg.phase === 'DEALING'){
       _clearPlaceBetsRecheckTimers();
     }

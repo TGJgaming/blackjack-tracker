@@ -2631,3 +2631,45 @@ def test_place_bets_strict_dealer_recheck_start_and_3s() -> None:
     )
     evs_pb3_removed = sm3.step(FrameObservation(ts=6.2, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
     assert not any(e.get("type") == "card" and e.get("source") == "educated_guess" for e in evs_pb3_removed)
+
+    # 4. BET mode preserves _review_* snapshot AND fires +3s recheck even when banner flickers blank ("")
+    sm4 = CompanionStateMachine(cfg)
+    sm4.set_sync_state(play_mode="bet")
+    sm4.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm4.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("8", 8, 0.94, 30)],
+            dealer_cards=[CardDetection("6", 6, 0.94, 10), CardDetection("10", 0, 0.94, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("8", 8, 0.94, 30)]},
+        )
+    )
+    sm4.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm4.set_sync_state(
+        play_mode="bet",
+        draft_count=4,
+        draft_hands=[[0, 8]],
+        draft_dealer=[6, 0],
+        dealer_guess_removed=False,
+    )
+    evs_bet_3s = sm4.step(FrameObservation(ts=6.1, banner_state="", player_cards=[], dealer_cards=[], player_hands={}))
+    bet_guesses = [e for e in evs_bet_3s if e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess"]
+    assert len(bet_guesses) >= 1
+    assert _bj_total(["6", "10"] + [g["rankLabel"] for g in bet_guesses]) >= 17
+
+    # 5. Busted community player hand [10, 6, 8] still completes dealer [6, 10]
+    sm5 = CompanionStateMachine(cfg)
+    sm5.set_sync_state(play_mode="watch")
+    sm5.step(FrameObservation(ts=1.0, banner_state="NO_MORE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    sm5.step(
+        FrameObservation(
+            ts=2.0,
+            banner_state="WAIT",
+            player_cards=[CardDetection("10", 0, 0.94, 10), CardDetection("6", 6, 0.94, 30), CardDetection("8", 8, 0.94, 50)],
+            dealer_cards=[CardDetection("6", 6, 0.94, 10), CardDetection("10", 0, 0.94, 30)],
+            player_hands={0: [CardDetection("10", 0, 0.94, 10), CardDetection("6", 6, 0.94, 30), CardDetection("8", 8, 0.94, 50)]},
+        )
+    )
+    evs_bust = sm5.step(FrameObservation(ts=3.0, banner_state="PLACE_BETS", player_cards=[], dealer_cards=[], player_hands={}))
+    assert any(e.get("type") == "card" and e.get("target") == "D" and e.get("source") == "educated_guess" for e in evs_bust)

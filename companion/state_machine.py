@@ -1305,14 +1305,20 @@ class CompanionStateMachine:
         self._place_bets_recheck_3_done = False
         self.sync_dealer_guess_removed = False
 
-    def resync_round(self, clear_pending: bool = True) -> None:
+    def resync_round(self, clear_pending: bool = True, clear_review: bool | None = None) -> None:
         """Reset transient round accumulators without changing shoe/sync settings."""
+        if clear_review is None:
+            clear_review = clear_pending
         if clear_pending:
             self._pending_auto_watch = None
+        if clear_review:
             self._clear_review_snapshot()
         self._reset_round_accumulators()
         self._last_banner_emitted = ""
         self._saw_clear_since_round_over = True
+        self._place_bets_entered_ts = None
+        self._place_bets_recheck_0_done = False
+        self._place_bets_recheck_3_done = False
         self.state = "IDLE"
 
     def _flush_pending_auto_watch(self, events: list[dict[str, Any]]) -> None:
@@ -1580,7 +1586,6 @@ class CompanionStateMachine:
             )
             return (
                 total_effective_p >= 2
-                and any_player_alive
                 and (
                     (len(d_comm) >= 2 and d_tot < 17)
                     or back_incomplete
@@ -1792,7 +1797,7 @@ class CompanionStateMachine:
             )
 
         self.sync_track_felt = False
-        self.resync_round(clear_pending=not (can_auto_watch or auto_on_no_more_bets))
+        self.resync_round(clear_pending=not (can_auto_watch or auto_on_no_more_bets), clear_review=False)
         return events
 
     def _recheck_dealer_in_place_bets(
@@ -1805,7 +1810,7 @@ class CompanionStateMachine:
         """Verify dealer hand completeness at PLACE_BETS start (0s) and +3s; complete via educated guess if needed."""
         if self.sync_dealer_guess_removed:
             return
-        target_round_id = self._review_round_id or (self.sync_round_id if self.sync_draft_count > 0 else "")
+        target_round_id = self._review_round_id or ((self.sync_round_id or self.round_id) if self.sync_draft_count > 0 else "")
         if not target_round_id:
             return
         if self.sync_round_id == target_round_id and self.sync_draft_count == 0 and self._pending_auto_watch is None:
@@ -1813,14 +1818,16 @@ class CompanionStateMachine:
 
         # Reconcile player & dealer ranks with UI sync state if available
         p_hands_ranks = list(self._review_player_ranks)
-        if (self.sync_round_id == target_round_id or not self.sync_round_id) and self.sync_draft_hands:
-            p_hands_ranks = [
+        if self.sync_draft_hands and (self.sync_draft_count > 0 or not p_hands_ranks):
+            ui_hands = [
                 ["10" if v == 0 else ("A" if v == 1 else str(v)) for v in h]
                 for h in self.sync_draft_hands
                 if h
             ]
+            if ui_hands:
+                p_hands_ranks = ui_hands
         d_ranks = list(self._review_dealer_ranks)
-        if (self.sync_round_id == target_round_id or not self.sync_round_id) and self.sync_draft_dealer is not None:
+        if self.sync_draft_dealer is not None and (self.sync_draft_count > 0 or not d_ranks):
             ui_d = ["10" if v == 0 else ("A" if v == 1 else str(v)) for v in self.sync_draft_dealer]
             if stage == "3s" or len(ui_d) >= len([r for r in d_ranks if r != "BACK"]):
                 d_ranks = ui_d
@@ -1828,7 +1835,6 @@ class CompanionStateMachine:
         if not d_ranks and not p_hands_ranks:
             return
 
-        any_player_alive = any(not _eval_bj_ranks(hr)[2] for hr in p_hands_ranks) if p_hands_ranks else True
         all_players_natural_bj = bool(p_hands_ranks) and all(
             len(hr) == 2 and _eval_bj_ranks(hr)[0] == 21 for hr in p_hands_ranks
         )
@@ -1840,11 +1846,11 @@ class CompanionStateMachine:
             has_back = "BACK" in d_ranks
             return (
                 total_p >= 2
-                and any_player_alive
                 and (
                     (len(d_comm) >= 2 and d_tot < 17)
                     or (has_back and len(d_comm) >= 1)
                     or (len(d_comm) == 1 and not has_back and not all_players_natural_bj)
+                    or (stage == "3s" and len(d_comm) == 0)
                 )
             )
 
@@ -2037,7 +2043,7 @@ class CompanionStateMachine:
             self.sync_track_felt = False
             self._last_bet_banner = banner
             self._saw_empty_hud_in_betting = was_empty_in_betting
-            if banner == "PLACE_BETS":
+            if banner in ("PLACE_BETS", "LAST_BETS"):
                 if self._place_bets_entered_ts is None:
                     self._place_bets_entered_ts = obs.ts
                     self._place_bets_recheck_0_done = False
@@ -2045,17 +2051,25 @@ class CompanionStateMachine:
                 if not self._place_bets_recheck_0_done:
                     self._place_bets_recheck_0_done = True
                     self._recheck_dealer_in_place_bets(obs, events, obs.ts, "0s")
-            if (
-                banner in ("PLACE_BETS", "LAST_BETS")
-                and self._place_bets_entered_ts is not None
-                and not self._place_bets_recheck_3_done
-                and (obs.ts - self._place_bets_entered_ts) >= 3.0
-            ):
-                self._place_bets_recheck_3_done = True
-                self._recheck_dealer_in_place_bets(obs, events, obs.ts, "3s")
+                if (
+                    not self._place_bets_recheck_3_done
+                    and (obs.ts - self._place_bets_entered_ts) >= 3.0
+                ):
+                    self._place_bets_recheck_3_done = True
+                    self._recheck_dealer_in_place_bets(obs, events, obs.ts, "3s")
             if banner == "NO_MORE_BETS" and was_empty_in_betting and has_obs_cards:
                 self._predeal_obs = obs
             return events
+
+        if (
+            self.state == "BETTING"
+            and self._place_bets_entered_ts is not None
+            and not self._place_bets_recheck_3_done
+            and (obs.ts - self._place_bets_entered_ts) >= 3.0
+            and self._last_bet_banner in ("PLACE_BETS", "LAST_BETS")
+        ):
+            self._place_bets_recheck_3_done = True
+            self._recheck_dealer_in_place_bets(obs, events, obs.ts, "3s")
 
         if banner == "WAIT":
             self._wait_absent_frames = 0
