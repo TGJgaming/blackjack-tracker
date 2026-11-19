@@ -3236,9 +3236,11 @@
       this._reviewEmittedSplitHands = 1;
     }
 
-    resyncRound(clearPending = true) {
+    resyncRound(clearPending = true, clearReview = clearPending) {
       if (clearPending) {
         this._pendingAutoWatch = null;
+      }
+      if (clearReview) {
         this._clearReviewSnapshot();
       }
       this._resetRoundAccumulators();
@@ -3466,7 +3468,6 @@
         }
       }
       const totalEffectiveP = Math.max(this._emittedP, pHandsRanks.reduce((a, h) => a + h.length, 0));
-      const anyPlayerAlive = pHandsRanks.length ? pHandsRanks.some((hr) => !evalBjRanks(hr)[2]) : true;
       const allPlayersNaturalBJ =
         pHandsRanks.length > 0 &&
         pHandsRanks.every((hr) => hr.length === 2 && evalBjRanks(hr)[0] === 21);
@@ -3477,7 +3478,6 @@
         const hasBack = this.dDebouncer.committedRanks.includes("BACK");
         return (
           totalEffectiveP >= 2 &&
-          anyPlayerAlive &&
           (
             (dComm.length >= 2 && dTot < 17) ||
             (hasBack && dComm.length >= 1) ||
@@ -3686,26 +3686,27 @@
       this._reviewEmittedB = this._emittedB;
       this._reviewEmittedSplitHands = this._emittedSplitHands;
 
-      this.resyncRound(!(canAutoWatch || autoOnNoMoreBets));
+      this.resyncRound(!(canAutoWatch || autoOnNoMoreBets), false);
       return events;
     }
 
     _recheckDealerInPlaceBets(obs, events, now, stage) {
       if (this.sync_dealer_guess_removed) return;
-      const targetRoundId = this._reviewRoundId || (this.sync_draft_count > 0 ? this.sync_round_id : "");
+      const targetRoundId = this._reviewRoundId || (this.sync_draft_count > 0 ? (this.sync_round_id || this.round_id) : "");
       if (!targetRoundId) return;
       if (this.sync_round_id === targetRoundId && this.sync_draft_count === 0 && !this._pendingAutoWatch) {
         return;
       }
 
       let pHandsRanks = this._reviewPlayerRanks.map((hr) => hr.slice());
-      if ((this.sync_round_id === targetRoundId || !this.sync_round_id) && Array.isArray(this.sync_draft_hands) && this.sync_draft_hands.length) {
-        pHandsRanks = this.sync_draft_hands
+      if (Array.isArray(this.sync_draft_hands) && this.sync_draft_hands.length && (this.sync_draft_count > 0 || !pHandsRanks.length)) {
+        const uiHands = this.sync_draft_hands
           .filter((h) => Array.isArray(h) && h.length > 0)
           .map((h) => h.map((v) => (v === 0 ? "10" : v === 1 ? "A" : String(v))));
+        if (uiHands.length) pHandsRanks = uiHands;
       }
       let dRanks = this._reviewDealerRanks.slice();
-      if ((this.sync_round_id === targetRoundId || !this.sync_round_id) && Array.isArray(this.sync_draft_dealer)) {
+      if (Array.isArray(this.sync_draft_dealer) && (this.sync_draft_count > 0 || !dRanks.length)) {
         const uiD = this.sync_draft_dealer.map((v) => (v === 0 ? "10" : v === 1 ? "A" : String(v)));
         if (stage === "3s" || uiD.length >= dRanks.filter((r) => r !== "BACK").length) {
           dRanks = uiD;
@@ -3714,7 +3715,6 @@
 
       if (!dRanks.length && !pHandsRanks.length) return;
 
-      const anyPlayerAlive = pHandsRanks.length ? pHandsRanks.some((hr) => !evalBjRanks(hr)[2]) : true;
       const allPlayersNaturalBJ =
         pHandsRanks.length > 0 &&
         pHandsRanks.every((hr) => hr.length === 2 && evalBjRanks(hr)[0] === 21);
@@ -3726,11 +3726,11 @@
         const hasBack = dRanks.includes("BACK");
         return (
           totalP >= 2 &&
-          anyPlayerAlive &&
           (
             (dComm.length >= 2 && dTot < 17) ||
             (hasBack && dComm.length >= 1) ||
-            (dComm.length === 1 && !hasBack && !allPlayersNaturalBJ)
+            (dComm.length === 1 && !hasBack && !allPlayersNaturalBJ) ||
+            (stage === "3s" && dComm.length === 0)
           )
         );
       };
@@ -3870,7 +3870,7 @@
         this._resetRoundAccumulators();
         this._lastBetBanner = banner;
         this._sawEmptyHudInBetting = wasEmptyInBetting;
-        if (banner === "PLACE_BETS") {
+        if (banner === "PLACE_BETS" || banner === "LAST_BETS") {
           if (this._placeBetsEnteredTs === null) {
             this._placeBetsEnteredTs = now;
             this._placeBetsRecheck0Done = false;
@@ -3880,20 +3880,29 @@
             this._placeBetsRecheck0Done = true;
             this._recheckDealerInPlaceBets(obs, events, now, "0s");
           }
-        }
-        if (
-          (banner === "PLACE_BETS" || banner === "LAST_BETS") &&
-          this._placeBetsEnteredTs !== null &&
-          !this._placeBetsRecheck3Done &&
-          (now - this._placeBetsEnteredTs) >= 3.0
-        ) {
-          this._placeBetsRecheck3Done = true;
-          this._recheckDealerInPlaceBets(obs, events, now, "3s");
+          if (
+            !this._placeBetsRecheck3Done &&
+            (now - this._placeBetsEnteredTs) >= 3.0
+          ) {
+            this._placeBetsRecheck3Done = true;
+            this._recheckDealerInPlaceBets(obs, events, now, "3s");
+          }
         }
         if (banner === "NO_MORE_BETS" && wasEmptyInBetting && hasObsCards) {
           this._predealObs = obs;
         }
         return events;
+      }
+
+      if (
+        this.state === "BETTING" &&
+        this._placeBetsEnteredTs !== null &&
+        !this._placeBetsRecheck3Done &&
+        (now - this._placeBetsEnteredTs) >= 3.0 &&
+        (this._lastBetBanner === "PLACE_BETS" || this._lastBetBanner === "LAST_BETS")
+      ) {
+        this._placeBetsRecheck3Done = true;
+        this._recheckDealerInPlaceBets(obs, events, now, "3s");
       }
 
       if (banner === "WAIT") {

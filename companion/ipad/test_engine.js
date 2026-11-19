@@ -1886,6 +1886,47 @@ console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks
   const evsRemoved = sm3.step({ ts: 6.2, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
   assert(!evsRemoved.some((e) => e.type === "card" && e.source === "educated_guess"), "dealerGuessRemoved=true must block +3s re-insertion");
 
+  // 4. BET mode preserves _review* snapshot AND fires +3s recheck even when banner flickers blank ("")
+  const sm4 = new Engine.CompanionStateMachine(cfg29);
+  sm4.setSyncState({ playMode: "bet" });
+  sm4.step({ ts: 1, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm4.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mkC("10", 0), mkC("8", 8)],
+    dealer_cards: [mkC("6", 6), mkC("10", 0)],
+    player_hands: { 0: [mkC("10", 0), mkC("8", 8)] },
+    hud_refreshed: true,
+  });
+  sm4.step({ ts: 3, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm4.setSyncState({
+    playMode: "bet",
+    draftCount: 4,
+    draftHands: [[0, 8]],
+    draftDealer: [6, 0],
+    dealerGuessRemoved: false,
+  });
+  // Banner flickers to "" at +3.1s while state === BETTING
+  const evsBet3s = sm4.step({ ts: 6.1, banner_state: "", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  const betGuesses = evsBet3s.filter((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess");
+  assert(betGuesses.length >= 1, "BET mode +3s recheck must still fire on blank frame and complete dealer [6, 10]");
+  assert(_bjTotal(["6", "10", ...betGuesses.map((g) => g.rankLabel)]) >= 17, "BET mode +3s completed dealer total must be >= 17");
+
+  // 5. Busted community player hand [10, 6, 8] still completes dealer [6, 10] in Playtech All Bets BJ
+  const sm5 = new Engine.CompanionStateMachine(cfg29);
+  sm5.setSyncState({ playMode: "watch" });
+  sm5.step({ ts: 1, banner_state: "NO_MORE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  sm5.step({
+    ts: 2,
+    banner_state: "",
+    player_cards: [mkC("10", 0), mkC("6", 6), mkC("8", 8)],
+    dealer_cards: [mkC("6", 6), mkC("10", 0)],
+    player_hands: { 0: [mkC("10", 0), mkC("6", 6), mkC("8", 8)] },
+    hud_refreshed: true,
+  });
+  const evsBust = sm5.step({ ts: 3, banner_state: "PLACE_BETS", player_cards: [], dealer_cards: [], player_hands: {}, hud_refreshed: true });
+  assert(evsBust.some((e) => e.type === "card" && e.target === "D" && e.source === "educated_guess"), "Busted community player must still complete dealer [6, 10]");
+
   console.log("   Test 29 PASSED");
 }
 console.log("\nALL 29 ENGINE TESTS PASSED SUCCESSFULLY!");
