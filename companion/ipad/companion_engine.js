@@ -1536,6 +1536,128 @@
     return [null, bestConf, null];
   }
 
+  function detectLoadingScreen(anchorBgr) {
+    if (!anchorBgr || anchorBgr.c !== 3 || anchorBgr.w < 40 || anchorBgr.h < 40) return false;
+    const th = 140;
+    const tw = Math.max(48, Math.min(260, Math.round(anchorBgr.w * (th / anchorBgr.h))));
+    const sm = resizeImage(anchorBgr, tw, th);
+    const gray = toGray(sm);
+
+    // 1. Uniform blank/dark/white reload flash (ignore bottom 14% in case Safari bottom bar is inside anchor)
+    const coreH = Math.floor(th * 0.86);
+    const coreN = coreH * tw;
+    let gSum = 0;
+    for (let i = 0; i < coreN; i++) gSum += gray.data[i];
+    const gMean = gSum / Math.max(1, coreN);
+    let gVar = 0;
+    for (let i = 0; i < coreN; i++) {
+      const d = gray.data[i] - gMean;
+      gVar += d * d;
+    }
+    if (Math.sqrt(gVar / Math.max(1, coreN)) < 8.5) return true;
+
+    // 2. Playtech blurred-blue loading splash: cool blue wash (B > G, B - R > 14, B >= 45) + blurred top + splash sig
+    const blueMask = new Uint8Array(coreN);
+    let blueCnt = 0;
+    for (let i = 0, j = 0; i < coreN; i++, j += 3) {
+      const b = sm.data[j], g = sm.data[j + 1], r = sm.data[j + 2];
+      if (b > g && (b - r) > 14 && b >= 45) {
+        blueMask[i] = 1;
+        blueCnt++;
+      }
+    }
+    if (blueCnt / Math.max(1, coreN) < 0.60) return false;
+
+    const topH = Math.max(4, Math.floor(th * 0.24));
+    let dxSum = 0, dxCnt = 0, dySum = 0, dyCnt = 0;
+    for (let y = 0; y < topH; y++) {
+      const rowOff = y * tw;
+      for (let x = 0; x < tw - 1; x++) {
+        dxSum += Math.abs(gray.data[rowOff + x + 1] - gray.data[rowOff + x]);
+        dxCnt++;
+      }
+      if (y < topH - 1) {
+        for (let x = 0; x < tw; x++) {
+          dySum += Math.abs(gray.data[rowOff + tw + x] - gray.data[rowOff + x]);
+          dyCnt++;
+        }
+      }
+    }
+    const topGrad = (dxSum / Math.max(1, dxCnt)) + (dySum / Math.max(1, dyCnt));
+    if (topGrad > 8.5) return false;
+
+    const mW = Math.max(4, Math.floor(tw * 0.16));
+    let leftB = 0, rightB = 0;
+    for (let y = 0; y < coreH; y++) {
+      const rowOff = y * tw;
+      for (let x = 0; x < mW; x++) {
+        leftB += blueMask[rowOff + x];
+        rightB += blueMask[rowOff + tw - mW + x];
+      }
+    }
+    const marginBlue = 0.5 * ((leftB / (coreH * mW)) + (rightB / (coreH * mW)));
+    if (marginBlue < 0.65) return false;
+
+    // (a) Playtech LIVE circular white badge in lower-center [y=0.50..0.82, x=0.48..0.76] with white text to its left
+    const y0 = Math.floor(th * 0.50), y1 = Math.floor(th * 0.82);
+    const x0 = Math.floor(tw * 0.48), x1 = Math.floor(tw * 0.76);
+    const subW = Math.max(1, x1 - x0), subH = Math.max(1, y1 - y0);
+    const subMask = new Uint8Array(subW * subH);
+    for (let y = 0; y < subH; y++) {
+      for (let x = 0; x < subW; x++) {
+        const idx = ((y0 + y) * tw + (x0 + x)) * 3;
+        const mn = Math.min(sm.data[idx], sm.data[idx + 1], sm.data[idx + 2]);
+        subMask[y * subW + x] = mn > 165 ? 1 : 0;
+      }
+    }
+    const cc = connectedComponentsWithStats(subMask, subW, subH);
+    for (let i = 1; i < cc.count; i++) {
+      const [cx, cy, cw, ch, area] = cc.stats[i];
+      if (cw >= 4 && cw <= 20 && ch >= 4 && ch <= 20) {
+        const aspect = cw / Math.max(1, ch);
+        const fill = area / Math.max(1, cw * ch);
+        if (aspect >= 0.72 && aspect <= 1.38 && fill >= 0.48 && fill <= 0.94) {
+          const lx0 = Math.max(0, x0 + cx - Math.floor(cw * 4.2));
+          const lx1 = Math.max(lx0 + 1, x0 + cx - 1);
+          const ly0 = Math.max(0, y0 + cy);
+          const ly1 = Math.min(th, y0 + cy + ch);
+          let whiteCnt = 0, totalCnt = 0;
+          for (let py = ly0; py < ly1; py++) {
+            for (let px = lx0; px < lx1; px++) {
+              const pIdx = (py * tw + px) * 3;
+              if (Math.min(sm.data[pIdx], sm.data[pIdx + 1], sm.data[pIdx + 2]) > 155) whiteCnt++;
+              totalCnt++;
+            }
+          }
+          if (totalCnt > 0 && whiteCnt / totalCnt >= 0.06) return true;
+        }
+      }
+    }
+
+    // (b) Thin horizontal loading progress bar in [y=0.44..0.68, x=0.25..0.75]
+    const bx0 = Math.floor(tw * 0.25), bx1 = Math.floor(tw * 0.75);
+    const bw = Math.max(1, bx1 - bx0);
+    for (let y = Math.floor(th * 0.44); y < Math.floor(th * 0.68); y++) {
+      let barPx = 0, darkPx = 0;
+      for (let x = bx0; x < bx1; x++) {
+        const v = gray.data[y * tw + x];
+        if (v < 35) { barPx++; darkPx++; }
+        else if (v > 190) barPx++;
+      }
+      if (barPx / bw >= 0.22 && darkPx / bw >= 0.08) {
+        let abSum = 0, abCnt = 0, blSum = 0, blCnt = 0;
+        for (let ry = Math.max(0, y - 4); ry < Math.max(1, y - 1); ry++) {
+          for (let x = bx0; x < bx1; x++) { abSum += gray.data[ry * tw + x]; abCnt++; }
+        }
+        for (let ry = Math.min(th - 1, y + 2); ry < Math.min(th, y + 5); ry++) {
+          for (let x = bx0; x < bx1; x++) { blSum += gray.data[ry * tw + x]; blCnt++; }
+        }
+        if (abCnt > 0 && blCnt > 0 && abSum / abCnt > 45 && blSum / blCnt > 45) return true;
+      }
+    }
+    return false;
+  }
+
   function findWhiteCardClusters(roiBgr, isDealer = false) {
     if (!roiBgr || roiBgr.w === 0 || roiBgr.h === 0) return [];
     const mb = toMinGray(roiBgr);
@@ -5023,9 +5145,14 @@
 
       if (["REFRESHING", "RECOVERING"].includes(this.state)) {
         const reloadDur = now - this._refreshStartedTs;
+        const isLoading = Boolean(obs && obs.loading_screen);
+        if (isLoading && this.state === "REFRESHING") {
+          this.state = "RECOVERING";
+        }
         const recovered =
           windowFound &&
           obs !== null &&
+          !isLoading &&
           reloadDur >= 2.0 &&
           (Boolean(obs.banner_state) || (obs.player_cards && obs.player_cards.length > 0) || (obs.dealer_cards && obs.dealer_cards.length > 0));
         if (recovered) {
@@ -5678,19 +5805,41 @@
         this.sm.state === "DEALER_TURN" ||
         (this.sm.dDebouncer && this.sm.dDebouncer.committedRanks.includes("BACK"));
 
-      const obs = this.detector.processCrops({
-        playerImg,
-        dealerImg,
-        shuffleImg,
-        bannerImg,
-        placeBetsImg,
-        ts: now,
-        forceDealerScan,
-      });
+      const isLoading = detectLoadingScreen(anchorImg);
+      this._lastLoadingScreen = isLoading;
+      const inKaReload = Boolean(this.keepalive && ["REFRESHING", "RECOVERING"].includes(this.keepalive.state));
 
       const prevSmState = this.sm.state;
       const prevKaState = this.keepalive.state;
-      const events = this.sm.step(obs);
+      const obs = isLoading
+        ? {
+            ts: now,
+            player_cards: [],
+            dealer_cards: [],
+            player_hands: {},
+            split_detected: false,
+            banner_state: "",
+            banner_conf: 0.0,
+            banner_source: "",
+            place_bets_conf: 0.0,
+            shuffle_active: false,
+            loading_screen: true,
+            hud_refreshed: true,
+          }
+        : Object.assign(
+            this.detector.processCrops({
+              playerImg,
+              dealerImg,
+              shuffleImg,
+              bannerImg,
+              placeBetsImg,
+              ts: now,
+              forceDealerScan,
+            }),
+            { loading_screen: false }
+          );
+
+      const events = !isLoading && !inKaReload ? this.sm.step(obs) : [];
       const kaEvents = this.keepalive.step({
         now,
         windowFound: true,
@@ -5702,6 +5851,15 @@
         betRoundsCount: this.sm.sync_bet_rounds_count,
         triggerRefreshCb: () => this.triggerSafariReload(),
       });
+
+      if (inKaReload && !["REFRESHING", "RECOVERING"].includes(this.keepalive.state)) {
+        this.sm.resyncRound();
+        this.detector.invalidateCaches();
+        if (!isLoading && obs.banner_state) {
+          const recEvents = this.sm.step(obs);
+          if (recEvents && recEvents.length) events.push(...recEvents);
+        }
+      }
 
       if (kaEvents.some((e) => e.event === "refreshing")) {
         this.sm._flushPendingAutoWatch(events);
@@ -6515,6 +6673,7 @@
     extractFeltCardRect,
     extractFeltRankViews,
     trimCardGlyph,
+    detectLoadingScreen,
     findWhiteCardClusters,
     detectClusterCards,
     detectDealerBadgeTotal,

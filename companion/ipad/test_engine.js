@@ -2254,7 +2254,51 @@ console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks
   console.log("   Test 36 PASSED");
 }
 
-console.log("\nALL 36 ENGINE TESTS PASSED SUCCESSFULLY!");
+// 37. Playtech loading screen detection, phantom card/split suppression & keepalive RECOVERING gate
+{
+  console.log("37. Testing Playtech loading screen detection & reload phantom-split suppression...");
+  const full37 = Engine.createImage(1024, 711, 3, 18);
+  fillRect(full37, 0, 0, 334, 76, 30, 30, 32);
+  fillRect(full37, 0, 632, 334, 79, 28, 28, 30);
+  fillRect(full37, 0, 76, 334, 556, 105, 70, 38);
+  fillRect(full37, 105, 390, 120, 5, 12, 12, 12);
+  fillRect(full37, 105, 390, 38, 5, 195, 215, 235);
+  fillRect(full37, 96, 434, 86, 10, 240, 240, 240);
+  for (let y = 426; y <= 452; y++) {
+    for (let x = 192; x <= 218; x++) {
+      if ((x - 205) * (x - 205) + (y - 439) * (y - 439) <= 169) {
+        const di = (y * 1024 + x) * 3;
+        full37.data[di] = 248; full37.data[di + 1] = 248; full37.data[di + 2] = 248;
+      }
+    }
+  }
+  fillRect(full37, 334, 0, 10, 711, 4, 4, 4);
+  fillRect(full37, 344, 0, 680, 711, 24, 28, 36);
+
+  const [vx37, vy37, vw37, vh37] = Engine.detectSplitViewLeftPane(full37);
+  const vp37 = Engine.cropImage(full37, vx37, vy37, vw37, vh37);
+  assert.strictEqual(Engine.detectLoadingScreen(vp37), true, "Must detect Playtech blurred-blue loading splash");
+  assert.strictEqual(Engine.detectLoadingScreen(Engine.createImage(300, 400, 3, 245)), true, "Must detect uniform blank white flash");
+
+  const live37 = Engine.createImage(600, 400, 3, 24);
+  fillRect(live37, 0, 0, 600, 400, 24, 82, 30);
+  fillRect(live37, 220, 260, 140, 60, 250, 250, 250);
+  assert.strictEqual(Engine.detectLoadingScreen(live37), false, "Must NOT trigger on live green felt table");
+
+  const prevHostHook = globalThis.__ipadCompanionSetHostInfo;
+  const prevExtHook = globalThis.__ipadCompanionSetExtConnected;
+  const rt37 = new Engine.IpadCompanionRuntime();
+  globalThis.__ipadCompanionSetHostInfo = prevHostHook;
+  globalThis.__ipadCompanionSetExtConnected = prevExtHook;
+  rt37.keepalive.state = "REFRESHING";
+  rt37.keepalive._refreshStartedTs = 100.0;
+  const evs37 = rt37.ingestFrameBgr(full37, 104.0);
+  assert(!evs37.some((e) => e.type === "card" || e.type === "split"), "Loading screen must not emit card or split events");
+  assert.strictEqual(rt37.keepalive.state, "RECOVERING", "Keepalive must transition to RECOVERING and not falsely recover on loading screen");
+  console.log("   Test 37 PASSED");
+}
+
+console.log("\nALL 37 ENGINE TESTS PASSED SUCCESSFULLY!");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

@@ -24,7 +24,7 @@ from calibrate import (
     save_template_crop,
 )
 from config import COMPANION_DIR, CompanionConfig, KeepaliveConfig, load_config, normalize_roi, save_config
-from detector import FrameObservation, PlaytechDetector
+from detector import FrameObservation, PlaytechDetector, detect_loading_screen, detect_loading_screen_crops
 from state_machine import CompanionStateMachine, WatchKeepaliveManager
 from win_anchor import (
     ViewportSmoother,
@@ -856,34 +856,45 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 continue
 
             if hud_due or dealer_only_tick or comm_img.size or dealer_felt_img.size:
-                obs = detector.process_crops(
-                    player_img=last_player_img,
-                    dealer_img=last_dealer_img,
-                    community_img=comm_img,
-                    shuffle_img=last_shuffle_img,
-                    banner_img=last_banner_img,
-                    ts=now,
-                    hud_refreshed=hud_due,
-                    center_img=last_center_img,
-                    place_bets_img=last_pb_img,
-                    player_refreshed=hud_due,
-                    dealer_refreshed=(hud_due or dealer_only_tick),
-                    banner_refreshed=hud_due,
-                    dealer_only=dealer_only_tick,
-                    dealer_felt_img=dealer_felt_img,
+                is_loading_screen = bool(
+                    detect_loading_screen(full_img)
+                    if full_img.size
+                    else detect_loading_screen_crops(last_shuffle_img, last_player_img, last_dealer_img)
                 )
+                if is_loading_screen:
+                    obs = FrameObservation(ts=now, hud_refreshed=hud_due, loading_screen=True)
+                else:
+                    obs = detector.process_crops(
+                        player_img=last_player_img,
+                        dealer_img=last_dealer_img,
+                        community_img=comm_img,
+                        shuffle_img=last_shuffle_img,
+                        banner_img=last_banner_img,
+                        ts=now,
+                        hud_refreshed=hud_due,
+                        center_img=last_center_img,
+                        place_bets_img=last_pb_img,
+                        player_refreshed=hud_due,
+                        dealer_refreshed=(hud_due or dealer_only_tick),
+                        banner_refreshed=hud_due,
+                        dealer_only=dealer_only_tick,
+                        dealer_felt_img=dealer_felt_img,
+                    )
                 in_ka_reload = keepalive.state in ("REFRESHING", "RECOVERING")
-                if not in_ka_reload:
+                if not in_ka_reload and not is_loading_screen:
                     events = sm.step(obs)
                     if events:
                         await bridge.broadcast_many(events)
 
                 if hud_due:
                     uniform_loading = bool(
-                        last_shuffle_img.size
-                        and last_player_img.size
-                        and float(np.std(last_shuffle_img)) < 8.0
-                        and float(np.std(last_player_img)) < 8.0
+                        is_loading_screen
+                        or (
+                            last_shuffle_img.size
+                            and last_player_img.size
+                            and float(np.std(last_shuffle_img)) < 8.0
+                            and float(np.std(last_player_img)) < 8.0
+                        )
                     )
                     luma_shift = False
                     if reload_probe_baseline is not None and last_shuffle_img.size:
@@ -892,7 +903,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         p_mean = float(np.mean(last_player_img)) if last_player_img.size else cur_mean
                         shuf_diff = abs(cur_mean - reload_probe_baseline[0])
                         p_diff = abs(p_mean - reload_probe_baseline[2]) if len(reload_probe_baseline) >= 3 else 0.0
-                        luma_shift = shuf_diff >= 14.0 or p_diff >= 14.0 or cur_std < 10.0
+                        luma_shift = is_loading_screen or shuf_diff >= 14.0 or p_diff >= 14.0 or cur_std < 10.0
                     idle_ms = (
                         get_user_idle_ms()
                         if (not in_ka_reload and keepalive.watch_elapsed_sec >= keepalive.target_sec)

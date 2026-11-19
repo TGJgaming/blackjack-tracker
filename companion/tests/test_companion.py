@@ -2621,6 +2621,41 @@ def test_dimmed_split_hand_and_13_rank_badge_occlusion() -> None:
         assert len(cards) >= 2 and cards[0].rank == rank, f"Rank {rank} failed under badge occlusion: {[(c.rank, c.suit, round(c.conf, 3)) for c in cards]}"
 
 
+def test_playtech_loading_screen_detection_and_crop_fallback() -> None:
+    """Playtech blurred-blue loading splash and uniform blank reload frames are detected while live tables return False."""
+    from detector import detect_loading_screen, detect_loading_screen_crops
+
+    # 1. Synthetic Playtech blurred-blue loading screen (334x612 iPad left-pane style)
+    splash = np.full((612, 334, 3), (105, 70, 38), dtype=np.uint8)
+    # Center title text + thin black/gold progress bar + playtech LIVE white circle
+    cv2.putText(splash, "BLACKJACK", (68, 250), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (245, 245, 245), 2)
+    splash[312:317, 105:225] = (12, 12, 12)
+    splash[312:317, 105:142] = (195, 215, 235)
+    cv2.putText(splash, "playtech", (96, 368), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 2)
+    cv2.circle(splash, (205, 362), 14, (248, 248, 248), -1)
+    assert detect_loading_screen(splash) is True
+
+    # Crop fallback (shuffle top + player bottom + dealer mid)
+    assert detect_loading_screen_crops(splash[0:70, 60:260], splash[410:520, 60:260], splash[160:260, 10:120]) is True
+
+    # 2. Uniform blank reload flash (dark or white)
+    assert detect_loading_screen(np.full((400, 600, 3), 245, dtype=np.uint8)) is True
+    assert detect_loading_screen(np.full((400, 600, 3), 15, dtype=np.uint8)) is True
+
+    # 3. Live green felt table with white cards must NOT trigger loading screen
+    live = np.full((400, 600, 3), (24, 82, 30), dtype=np.uint8)
+    live[260:320, 220:360] = 250
+    assert detect_loading_screen(live) is False
+    assert detect_loading_screen_crops(live[0:50, 150:450], live[260:340, 200:400], live[120:200, 120:240]) is False
+
+    # 4. Sharp blue-tinted live studio frame must NOT trigger loading screen
+    sharp_blue = np.full((400, 600, 3), (105, 70, 38), dtype=np.uint8)
+    rng = np.random.default_rng(7)
+    sharp_blue[:140, :] = rng.integers(30, 225, size=(140, 600, 3), dtype=np.uint8)
+    assert detect_loading_screen(sharp_blue) is False
+
+
+
 
 
 def test_place_bets_strict_dealer_recheck_start_and_3s() -> None:
