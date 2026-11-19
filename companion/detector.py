@@ -62,6 +62,7 @@ class FrameObservation:
     dealer_badge_conf: float = 0.0
     dealer_sub_cards: list[dict[str, Any]] = field(default_factory=list)
     dealer_badge_hint: dict[str, Any] | None = None
+    loading_screen: bool = False
 
 
 @dataclass
@@ -803,6 +804,107 @@ class FeltBurstMonitor:
         if self._active:
             return self._finalize(now, settled_in_place=True)
         return None
+
+
+def detect_loading_screen(anchor_bgr: np.ndarray) -> bool:
+    """Detect Playtech reload/loading splash screens (uniform blank flash or blurred-blue splash + logo/bar)."""
+    if anchor_bgr is None or anchor_bgr.size == 0 or anchor_bgr.ndim != 3:
+        return False
+    h, w = anchor_bgr.shape[:2]
+    if h < 40 or w < 40:
+        return False
+    th = 140
+    tw = max(48, min(260, int(round(w * (th / float(h))))))
+    sm = cv2.resize(anchor_bgr, (tw, th), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY)
+
+    # 1. Uniform blank/dark/white reload flash (ignore bottom 14% in case a browser bottom toolbar is inside anchor)
+    core_h = int(th * 0.86)
+    if float(np.std(gray[:core_h, :])) < 8.5:
+        return True
+
+    # 2. Playtech blurred-blue loading splash: cool blue wash (B > G, B - R > 14, B >= 45) + heavily blurred top + splash sig
+    core = sm[:core_h, :]
+    cb = core[:, :, 0].astype(np.int16)
+    cg = core[:, :, 1].astype(np.int16)
+    cr = core[:, :, 2].astype(np.int16)
+    blue_mask = (cb > cg) & ((cb - cr) > 14) & (cb >= 45)
+    if float(np.mean(blue_mask)) < 0.60:
+        return False
+
+    top_gray = gray[: int(th * 0.24), :].astype(np.float32)
+    top_grad = float(np.mean(np.abs(np.diff(top_gray, axis=1))) + np.mean(np.abs(np.diff(top_gray, axis=0))))
+    if top_grad > 8.5:
+        return False
+
+    m_w = max(4, int(tw * 0.16))
+    margin_blue = 0.5 * (float(np.mean(blue_mask[:, :m_w])) + float(np.mean(blue_mask[:, tw - m_w :])))
+    if margin_blue < 0.65:
+        return False
+
+    # (a) Playtech LIVE circular white badge in lower-center [y=0.50..0.82, x=0.48..0.76] with white text to its left
+    y0, y1 = int(th * 0.50), int(th * 0.82)
+    x0, x1 = int(tw * 0.48), int(tw * 0.76)
+    sub_mb = sm[y0:y1, x0:x1].min(axis=2)
+    num, _, stats, _ = cv2.connectedComponentsWithStats((sub_mb > 165).astype(np.uint8))
+    for i in range(1, num):
+        cx, cy, cw, ch, area = [int(v) for v in stats[i]]
+        if 4 <= cw <= 20 and 4 <= ch <= 20 and 0.72 <= (cw / max(1.0, float(ch))) <= 1.38:
+            fill = area / float(cw * ch)
+            if 0.48 <= fill <= 0.94:
+                lx0 = max(0, x0 + cx - int(cw * 4.2))
+                lx1 = max(lx0 + 1, x0 + cx - 1)
+                ly0 = max(0, y0 + cy)
+                ly1 = min(th, y0 + cy + ch)
+                left_mb = sm[ly0:ly1, lx0:lx1].min(axis=2)
+                if left_mb.size > 0 and float(np.mean(left_mb > 155)) >= 0.06:
+                    return True
+
+    # (b) Thin horizontal loading progress bar in [y=0.44..0.68, x=0.25..0.75]
+    bx0, bx1 = int(tw * 0.25), int(tw * 0.75)
+    for y in range(int(th * 0.44), int(th * 0.68)):
+        row = gray[y, bx0:bx1]
+        above = gray[max(0, y - 4) : max(1, y - 1), bx0:bx1]
+        below = gray[min(th - 1, y + 2) : min(th, y + 5), bx0:bx1]
+        if above.size and below.size:
+            bar_px = float(np.mean((row < 35) | (row > 190)))
+            if bar_px >= 0.22 and float(np.mean(row < 35)) >= 0.08 and float(np.mean(above)) > 45 and float(np.mean(below)) > 45:
+                return True
+    return False
+
+
+def detect_loading_screen_crops(
+    shuffle_img: np.ndarray, player_img: np.ndarray, dealer_img: np.ndarray | None = None
+) -> bool:
+    """Lightweight loading-screen check from tight ROI crops when full anchor image is not captured."""
+    if shuffle_img is None or shuffle_img.size == 0 or player_img is None or player_img.size == 0:
+        return False
+    if float(np.std(shuffle_img)) < 8.5 and float(np.std(player_img)) < 8.5:
+        return True
+    if shuffle_img.ndim != 3 or player_img.ndim != 3:
+        return False
+
+    def _blue_blur_ok(patch: np.ndarray) -> bool:
+        b = patch[:, :, 0].astype(np.int16)
+        g = patch[:, :, 1].astype(np.int16)
+        r = patch[:, :, 2].astype(np.int16)
+        blue_frac = float(np.mean((b > g) & ((b - r) > 14) & (b >= 45)))
+        if blue_frac < 0.72:
+            return False
+        sm = cv2.resize(patch, (min(80, max(16, patch.shape[1])), min(32, max(12, patch.shape[0]))), interpolation=cv2.INTER_AREA)
+        gr = cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        grad = float(np.mean(np.abs(np.diff(gr, axis=1))) + np.mean(np.abs(np.diff(gr, axis=0))))
+        return grad <= 7.5
+
+    if not (_blue_blur_ok(shuffle_img) and _blue_blur_ok(player_img)):
+        return False
+    if dealer_img is not None and dealer_img.size and dealer_img.ndim == 3:
+        db = dealer_img[:, :, 0].astype(np.int16)
+        dg = dealer_img[:, :, 1].astype(np.int16)
+        dr = dealer_img[:, :, 2].astype(np.int16)
+        if float(np.mean((db > dg) & ((db - dr) > 14) & (db >= 45))) < 0.50:
+            return False
+    return True
 
 
 def _find_white_card_clusters(
