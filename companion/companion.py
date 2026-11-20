@@ -736,6 +736,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
             dealer_only_tick = False
             comm_img = empty
             dealer_felt_img = empty
+            full_img = empty
 
             try:
                 if preview:
@@ -749,6 +750,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         if cfg.anchor_mode == "game_viewport"
                         else full_win
                     )
+                    full_img = base_img
                     last_player_img = _crop_norm(base_img, cfg.rois["player_strip"])
                     last_dealer_img = _crop_norm(base_img, cfg.rois["dealer_strip"])
                     last_shuffle_img = _crop_norm(base_img, cfg.rois["shuffle_roi"])
