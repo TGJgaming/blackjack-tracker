@@ -86,6 +86,8 @@
       banner_roi: [0.35, 0.00, 0.30, 0.06],
       place_bets_roi: [0.20, 0.36, 0.60, 0.18],
       shuffle_roi: [0.30, 0.24, 0.40, 0.38],
+      shoe_roi: [0.77, 0.52, 0.14, 0.11],
+      discard_roi: [0.11, 0.45, 0.22, 0.22],
     };
     const rois = {};
     for (const k of Object.keys(defRois)) {
@@ -121,7 +123,30 @@
       banner_roi: rois.banner_roi,
       place_bets_roi: rois.place_bets_roi,
       shuffle_roi: rois.shuffle_roi,
+      shoe_roi: rois.shoe_roi,
+      discard_roi: rois.discard_roi,
       rois,
+      shoe_detect: Object.assign(
+        {
+          enabled: true,
+          enable_shoe_roi: true,
+          enable_discard_fallback: true,
+          shoe_present_hold_sec: 2.0,
+          shoe_absent_hold_sec: 3.5,
+          shoe_return_hold_sec: 1.5,
+          shoe_corroborated_absent_sec: 1.8,
+          shoe_max_flicker_sec: 0.7,
+          shoe_absent_safety_sec: 12.0,
+          shoe_min_cards: 15,
+          discard_peak_white_min: 0.022,
+          discard_empty_white_max: 0.007,
+          discard_empty_hold_sec: 4.5,
+          discard_housing_dark_min: 0.10,
+          discard_min_cards: 45,
+          cooldown_sec: 30.0,
+        },
+        base.shoe_detect || {}
+      ),
       felt_motion: Object.assign(
         {
           min_contour_area_ratio: 0.015,
@@ -3009,6 +3034,106 @@
     return validPool[0] || { rank: "10", val: 0 };
   }
 
+  function _bgrToHsvOpenCv(b, g, r) {
+    const maxv = r >= g ? (r >= b ? r : b) : (g >= b ? g : b);
+    const minv = r <= g ? (r <= b ? r : b) : (g <= b ? g : b);
+    const diff = maxv - minv;
+    const v = maxv;
+    const s = maxv > 0 ? Math.round((diff * 255) / maxv) : 0;
+    let hDeg = 0;
+    if (diff > 0) {
+      if (maxv === r) hDeg = 60 * (((g - b) / diff) % 6);
+      else if (maxv === g) hDeg = 60 * ((b - r) / diff + 2);
+      else hDeg = 60 * ((r - g) / diff + 4);
+      if (hDeg < 0) hDeg += 360;
+    }
+    return [Math.round(hDeg * 0.5), s, v];
+  }
+
+  function detectShoeState(shoeImg) {
+    if (!shoeImg || shoeImg.w === 0 || shoeImg.h === 0 || shoeImg.c !== 3) {
+      return { state: "", darkFrac: 0.0, tealFrac: 0.0 };
+    }
+    const n = shoeImg.w * shoeImg.h;
+    const d = shoeImg.data;
+    let darkCnt = 0;
+    let tealCnt = 0;
+    for (let i = 0; i < n; i++) {
+      const o = i * 3;
+      const [h, s, v] = _bgrToHsvOpenCv(d[o], d[o + 1], d[o + 2]);
+      if (v < 58) darkCnt++;
+      if (h >= 78 && h <= 108 && s >= 55 && v >= 55) tealCnt++;
+    }
+    const darkFrac = darkCnt / n;
+    const tealFrac = tealCnt / n;
+    let state = "OCCLUDED";
+    if (darkFrac >= 0.36 && tealFrac <= 0.46) state = "PRESENT";
+    else if (darkFrac <= 0.24 && tealFrac >= 0.50) state = "ABSENT";
+    return {
+      state,
+      darkFrac: Number(darkFrac.toFixed(4)),
+      tealFrac: Number(tealFrac.toFixed(4)),
+    };
+  }
+
+  function detectDiscardStack(discardImg) {
+    if (!discardImg || discardImg.w === 0 || discardImg.h === 0 || discardImg.c !== 3) {
+      return { whiteFrac: 0.0, darkFrac: 0.0, tealFrac: 0.0 };
+    }
+    const w = discardImg.w;
+    const h = discardImg.h;
+    const n = w * h;
+    const d = discardImg.data;
+    const rawWhite = new Uint8Array(n);
+    let darkCnt = 0;
+    let tealCnt = 0;
+    for (let i = 0; i < n; i++) {
+      const o = i * 3;
+      const [hv, sv, vv] = _bgrToHsvOpenCv(d[o], d[o + 1], d[o + 2]);
+      if (vv < 58) darkCnt++;
+      if (hv >= 78 && hv <= 108 && sv >= 55 && vv >= 55) tealCnt++;
+      if (sv <= 45 && vv >= 175) rawWhite[i] = 255;
+    }
+    // 2x2 morphological open (erode then dilate) to remove 1px noise
+    const eroded = new Uint8Array(n);
+    for (let y = 0; y < h - 1; y++) {
+      const r0 = y * w;
+      const r1 = r0 + w;
+      for (let x = 0; x < w - 1; x++) {
+        if (rawWhite[r0 + x] && rawWhite[r0 + x + 1] && rawWhite[r1 + x] && rawWhite[r1 + x + 1]) {
+          eroded[r0 + x] = 255;
+        }
+      }
+    }
+    const opened = new Uint8Array(n);
+    for (let y = 0; y < h - 1; y++) {
+      const r0 = y * w;
+      const r1 = r0 + w;
+      for (let x = 0; x < w - 1; x++) {
+        if (eroded[r0 + x]) {
+          opened[r0 + x] = 255;
+          opened[r0 + x + 1] = 255;
+          opened[r1 + x] = 255;
+          opened[r1 + x + 1] = 255;
+        }
+      }
+    }
+    const cc = connectedComponentsWithStats(opened, w, h);
+    const minBlobPx = Math.max(6, Math.round(n * 0.002));
+    let stackPx = 0;
+    for (let i = 1; i < cc.count; i++) {
+      const [, , bw, bh, area] = cc.stats[i];
+      if (area < minBlobPx || bw < 2 || bh < 2) continue;
+      const solidity = area / Math.max(1, bw * bh);
+      if (solidity >= 0.45) stackPx += area;
+    }
+    return {
+      whiteFrac: Number((stackPx / Math.max(1, n)).toFixed(4)),
+      darkFrac: Number((darkCnt / Math.max(1, n)).toFixed(4)),
+      tealFrac: Number((tealCnt / Math.max(1, n)).toFixed(4)),
+    };
+  }
+
   class PlaytechDetector {
     constructor(cfg, initialPack = null) {
       this.cfg = cfg;
@@ -3284,7 +3409,7 @@
       return [allP, hands, Object.keys(hands).length >= 2, clusters, []];
     }
 
-    processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, ts = null, forceDealerScan = false }) {
+    processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, shoeImg = null, discardImg = null, ts = null, forceDealerScan = false }) {
       const now = ts !== null ? ts : performance.now() / 1000;
       const REFRESH_PERIOD = 8;
       const HUD_REFRESH_PERIOD = 4;
@@ -3439,6 +3564,22 @@
         shufConf = Math.max(shufConf, bannerConf);
       }
 
+      // Dual-ROI physical shoe & movable discard-tray metrics (throttled ~2.5 Hz)
+      let shoeRes = this._cachedShoe || { state: "", darkFrac: 0.0, tealFrac: 0.0 };
+      let discRes = this._cachedDiscard || { whiteFrac: 0.0, darkFrac: 0.0, tealFrac: 0.0 };
+      const lastShoeTs = this._lastShoeScanTs ?? -999.0;
+      if ((shoeImg || discardImg) && (forceDealerScan || (now - lastShoeTs) >= 0.35)) {
+        this._lastShoeScanTs = now;
+        if (shoeImg && shoeImg.w > 0 && shoeImg.h > 0) {
+          shoeRes = detectShoeState(shoeImg);
+          this._cachedShoe = shoeRes;
+        }
+        if (discardImg && discardImg.w > 0 && discardImg.h > 0) {
+          discRes = detectDiscardStack(discardImg);
+          this._cachedDiscard = discRes;
+        }
+      }
+
       return {
         ts: now,
         player_cards: pCards,
@@ -3458,6 +3599,12 @@
         dealer_badge_total: dBadgeTotal,
         dealer_badge_conf: dBadgeConf,
         dealer_badge_hint: dBadgeHint || null,
+        shoe_state: shoeRes.state,
+        shoe_dark_frac: shoeRes.darkFrac,
+        shoe_teal_frac: shoeRes.tealFrac,
+        discard_white_frac: discRes.whiteFrac,
+        discard_dark_frac: discRes.darkFrac,
+        discard_teal_frac: discRes.tealFrac,
       };
     }
   }
@@ -3714,6 +3861,197 @@
     }
   }
 
+  class ShoeSwapTracker {
+    constructor(cfg = {}) {
+      this.cfg = Object.assign(
+        {
+          enabled: true,
+          enable_shoe_roi: true,
+          enable_discard_fallback: true,
+          shoe_present_hold_sec: 2.0,
+          shoe_absent_hold_sec: 3.5,
+          shoe_return_hold_sec: 1.5,
+          shoe_corroborated_absent_sec: 1.8,
+          shoe_max_flicker_sec: 0.7,
+          shoe_absent_safety_sec: 12.0,
+          shoe_min_cards: 15,
+          discard_peak_white_min: 0.022,
+          discard_empty_white_max: 0.007,
+          discard_empty_hold_sec: 4.5,
+          discard_housing_dark_min: 0.10,
+          discard_min_cards: 45,
+          cooldown_sec: 30.0,
+        },
+        cfg || {}
+      );
+      this.shoeState = "";
+      this.shoeDarkFrac = 0.0;
+      this.shoeTealFrac = 0.0;
+      this.discardWhiteFrac = 0.0;
+      this.discardDarkFrac = 0.0;
+      this.discardTealFrac = 0.0;
+      this._shoePresentSince = null;
+      this._shoeConfirmedPresent = false;
+      this._shoeAbsentSince = null;
+      this._shoeOccludedSince = null;
+      this._shoeReturnSince = null;
+      this._shoeSwapArmed = false;
+      this._shoeSwapCorroborated = false;
+      this._discardWindow = [];
+      this._discardPeakWhite = 0.0;
+      this._discardEmptySince = null;
+      this._cooldownUntil = -1e9;
+      this.lastTriggerReason = "";
+    }
+
+    resetForNewShoe(now) {
+      this._shoePresentSince = null;
+      this._shoeConfirmedPresent = false;
+      this._shoeAbsentSince = null;
+      this._shoeOccludedSince = null;
+      this._shoeReturnSince = null;
+      this._shoeSwapArmed = false;
+      this._shoeSwapCorroborated = false;
+      this._discardWindow = [];
+      this._discardPeakWhite = 0.0;
+      this._discardEmptySince = null;
+      this._cooldownUntil = now + this.cfg.cooldown_sec;
+    }
+
+    onUndoNewShoe(now) {
+      this._shoeAbsentSince = null;
+      this._shoeOccludedSince = null;
+      this._shoeReturnSince = null;
+      this._shoeSwapArmed = false;
+      this._shoeSwapCorroborated = false;
+      this._shoeConfirmedPresent = true;
+      this._discardEmptySince = null;
+      this._cooldownUntil = now + this.cfg.cooldown_sec;
+    }
+
+    statusDict() {
+      return {
+        enabled: !!this.cfg.enabled,
+        shoeState: this.shoeState || "UNKNOWN",
+        shoeDark: Number(this.shoeDarkFrac.toFixed(3)),
+        shoeTeal: Number(this.shoeTealFrac.toFixed(3)),
+        swapArmed: this._shoeSwapArmed,
+        discardWhite: Number(this.discardWhiteFrac.toFixed(4)),
+        discardPeak: Number(this._discardPeakWhite.toFixed(4)),
+        discardDark: Number(this.discardDarkFrac.toFixed(3)),
+        discardTeal: Number(this.discardTealFrac.toFixed(3)),
+        lastReason: this.lastTriggerReason,
+      };
+    }
+
+    step(obs, { cardsSeen = 0, hasActiveCards = false, inBettingOverlay = false, suppressed = false } = {}) {
+      const now = typeof obs.ts === "number" && Number.isFinite(obs.ts) ? obs.ts : Date.now() / 1000;
+      if (obs.shoe_state) {
+        this.shoeState = obs.shoe_state;
+        this.shoeDarkFrac = Number(obs.shoe_dark_frac || 0);
+        this.shoeTealFrac = Number(obs.shoe_teal_frac || 0);
+      }
+      if ((obs.discard_teal_frac || 0) > 0 || (obs.discard_dark_frac || 0) > 0 || (obs.discard_white_frac || 0) > 0) {
+        this.discardWhiteFrac = Number(obs.discard_white_frac || 0);
+        this.discardDarkFrac = Number(obs.discard_dark_frac || 0);
+        this.discardTealFrac = Number(obs.discard_teal_frac || 0);
+      }
+      if (!this.cfg.enabled || suppressed || now < this._cooldownUntil) return null;
+
+      let discardJustEmptied = false;
+      if (this.cfg.enable_discard_fallback && !inBettingOverlay && this.discardTealFrac >= 0.12) {
+        this._discardWindow.push(this.discardWhiteFrac);
+        if (this._discardWindow.length > 5) this._discardWindow.shift();
+        const sorted = this._discardWindow.slice().sort((a, b) => a - b);
+        const medWhite = sorted[Math.floor(sorted.length / 2)];
+        if (medWhite > this._discardPeakWhite) this._discardPeakWhite = medWhite;
+        const housingVisible = this.discardDarkFrac >= this.cfg.discard_housing_dark_min;
+        if (
+          this._discardPeakWhite >= this.cfg.discard_peak_white_min &&
+          medWhite <= this.cfg.discard_empty_white_max &&
+          housingVisible &&
+          !hasActiveCards
+        ) {
+          if (this._discardEmptySince === null) this._discardEmptySince = now;
+          discardJustEmptied = true;
+        } else {
+          this._discardEmptySince = null;
+        }
+      }
+
+      if (this.cfg.enable_shoe_roi && this.shoeState) {
+        if (this.shoeState === "PRESENT") {
+          this._shoeAbsentSince = null;
+          this._shoeOccludedSince = null;
+          if (this._shoePresentSince === null) this._shoePresentSince = now;
+          else if ((now - this._shoePresentSince) >= this.cfg.shoe_present_hold_sec) {
+            this._shoeConfirmedPresent = true;
+          }
+          if (this._shoeSwapArmed) {
+            if (this._shoeReturnSince === null) this._shoeReturnSince = now;
+            else if ((now - this._shoeReturnSince) >= this.cfg.shoe_return_hold_sec && !hasActiveCards) {
+              const reason = this._shoeSwapCorroborated ? "shoe_and_discard" : "shoe_swap";
+              this.lastTriggerReason = reason;
+              this.resetForNewShoe(now);
+              return reason;
+            }
+          } else {
+            this._shoeReturnSince = null;
+          }
+        } else if (this.shoeState === "ABSENT") {
+          this._shoePresentSince = null;
+          this._shoeReturnSince = null;
+          this._shoeOccludedSince = null;
+          if (this._shoeConfirmedPresent && cardsSeen >= this.cfg.shoe_min_cards) {
+            if (this._shoeAbsentSince === null) this._shoeAbsentSince = now;
+            const absentDur = now - this._shoeAbsentSince;
+            if (absentDur >= this.cfg.shoe_absent_hold_sec) {
+              this._shoeSwapArmed = true;
+            } else if (discardJustEmptied && absentDur >= this.cfg.shoe_corroborated_absent_sec) {
+              this._shoeSwapArmed = true;
+              this._shoeSwapCorroborated = true;
+            }
+            if (
+              this._shoeSwapArmed &&
+              absentDur >= this.cfg.shoe_absent_safety_sec &&
+              obs.banner_state === "PLACE_BETS" &&
+              !hasActiveCards
+            ) {
+              const reason = this._shoeSwapCorroborated ? "shoe_and_discard" : "shoe_swap";
+              this.lastTriggerReason = reason;
+              this.resetForNewShoe(now);
+              return reason;
+            }
+          }
+        } else if (this.shoeState === "OCCLUDED") {
+          this._shoePresentSince = null;
+          this._shoeReturnSince = null;
+          if (this._shoeAbsentSince !== null && !this._shoeSwapArmed) {
+            if (this._shoeOccludedSince === null) this._shoeOccludedSince = now;
+            else if ((now - this._shoeOccludedSince) > this.cfg.shoe_max_flicker_sec) {
+              this._shoeAbsentSince = null;
+              this._shoeOccludedSince = null;
+            }
+          }
+        }
+      }
+
+      if (
+        this.cfg.enable_discard_fallback &&
+        this._discardEmptySince !== null &&
+        cardsSeen >= this.cfg.discard_min_cards &&
+        (now - this._discardEmptySince) >= this.cfg.discard_empty_hold_sec &&
+        !hasActiveCards
+      ) {
+        this.lastTriggerReason = "discard_cleared";
+        this.resetForNewShoe(now);
+        return "discard_cleared";
+      }
+
+      return null;
+    }
+  }
+
   class CompanionStateMachine {
     constructor(cfg) {
       this.cfg = cfg;
@@ -3752,7 +4090,16 @@
       this._sawClearSinceRoundOver = true;
       this._shuffleSince = null;
       this._shuffleEmitted = false;
+      this.shoeTracker = new ShoeSwapTracker(cfg && cfg.shoe_detect ? cfg.shoe_detect : {});
       this._resetRoundAccumulators();
+    }
+
+    onUndoNewShoe(now = Date.now() / 1000) {
+      this.shoeTracker.onUndoNewShoe(now);
+    }
+
+    resetForNewShoe(now = Date.now() / 1000) {
+      this.shoeTracker.resetForNewShoe(now);
     }
 
     _resetRoundAccumulators() {
@@ -4411,7 +4758,7 @@
       });
     }
 
-    step(obs) {
+    step(obs, { keepaliveGrace = false } = {}) {
       if (this.paused) return [];
       const events = [];
       const now = typeof obs.ts === "number" && Number.isFinite(obs.ts) ? obs.ts : Date.now() / 1000;
@@ -4428,6 +4775,7 @@
           this.resyncRound();
           this.state = "SHUFFLING";
           this._shuffleEmitted = true;
+          this.shoeTracker.resetForNewShoe(now);
           events.push({ type: "new_shoe", reason: "cut", hasPendingBet });
         }
         return events;
@@ -4435,6 +4783,40 @@
       this._shuffleSince = null;
       if (this.state === "SHUFFLING") this.state = "IDLE";
       this._shuffleEmitted = false;
+
+      // Dual-ROI physical shoe / movable discard-tray auto-new-shoe detection
+      const cardsSeenInShoe =
+        Array.isArray(this.sync_shoe_rem) && this.sync_shoe_rem.length === 10
+          ? Math.max(0, 416 - this.sync_shoe_rem.reduce((a, b) => a + (Number(b) || 0), 0))
+          : 0;
+      const hasActiveCardsNow =
+        (obs.player_cards && obs.player_cards.length > 0) ||
+        (obs.dealer_cards && obs.dealer_cards.length > 0) ||
+        (obs.player_hands && Object.keys(obs.player_hands).length > 0) ||
+        this._emittedP > 0 ||
+        this._emittedD > 0;
+      const inBettingUi = obs.banner_state === "PLACE_BETS" || obs.banner_state === "LAST_BETS";
+      const swapReason = this.shoeTracker.step(obs, {
+        cardsSeen: cardsSeenInShoe,
+        hasActiveCards: hasActiveCardsNow,
+        inBettingOverlay: inBettingUi,
+        suppressed: Boolean(keepaliveGrace || obs.loading_screen || this.paused),
+      });
+      if (swapReason) {
+        this._flushPendingAutoWatch(events);
+        const hasPendingBet = !["IDLE", "BETTING"].includes(this.state) && (this.sync_play_mode === "bet" || this._splitDetected);
+        this.sync_track_felt = false;
+        this._clearReviewSnapshot();
+        this.resyncRound();
+        this.state = "IDLE";
+        events.push({
+          type: "new_shoe",
+          reason: swapReason,
+          cardsSeen: cardsSeenInShoe,
+          hasPendingBet,
+        });
+        return events;
+      }
 
       const banner = obs.banner_state || "";
       const hasCards = this._emittedP > 0 || this._emittedD > 0;
@@ -5756,6 +6138,7 @@
         frameInfo: this.frameInfo || "",
         hostInfo: this.hostInfo,
         keepalive: this.keepalive.getStatus(now),
+        shoeDetect: this.sm.shoeTracker.statusDict(),
       };
     }
 
@@ -5800,6 +6183,8 @@
       const bannerImg = cropNorm(anchorImg, this.cfg.banner_roi);
       const placeBetsImg = cropNorm(anchorImg, this.cfg.place_bets_roi);
       const shuffleImg = cropNorm(anchorImg, this.cfg.shuffle_roi);
+      const shoeImg = this.cfg.shoe_roi ? cropNorm(anchorImg, this.cfg.shoe_roi) : null;
+      const discardImg = this.cfg.discard_roi ? cropNorm(anchorImg, this.cfg.discard_roi) : null;
 
       const forceDealerScan =
         this.sm.state === "DEALER_TURN" ||
@@ -5808,6 +6193,7 @@
       const isLoading = detectLoadingScreen(anchorImg);
       this._lastLoadingScreen = isLoading;
       const inKaReload = Boolean(this.keepalive && ["REFRESHING", "RECOVERING"].includes(this.keepalive.state));
+      const inKaGrace = Boolean(this.keepalive && typeof this.keepalive.inGracePeriod === "function" && this.keepalive.inGracePeriod(now));
 
       const prevSmState = this.sm.state;
       const prevKaState = this.keepalive.state;
@@ -5833,13 +6219,15 @@
               shuffleImg,
               bannerImg,
               placeBetsImg,
+              shoeImg,
+              discardImg,
               ts: now,
               forceDealerScan,
             }),
             { loading_screen: false }
           );
 
-      const events = !isLoading && !inKaReload ? this.sm.step(obs) : [];
+      const events = !isLoading && !inKaReload ? this.sm.step(obs, { keepaliveGrace: inKaGrace }) : [];
       const kaEvents = this.keepalive.step({
         now,
         windowFound: true,
@@ -6163,6 +6551,11 @@
         }
         return;
       }
+      if (mtype === "undo_new_shoe") {
+        this.sm.onUndoNewShoe(performance.now() / 1000);
+        reply(this.buildStatusPayload());
+        return;
+      }
       if (mtype === "calib_test_detect") {
         const snap = this._calibSnapBgr;
         if (!snap) {
@@ -6175,6 +6568,8 @@
         const bRoi = normalizeRoi(rois.banner_roi || this.cfg.banner_roi);
         const pbRoi = normalizeRoi(rois.place_bets_roi || this.cfg.place_bets_roi);
         const shRoi = normalizeRoi(rois.shuffle_roi || this.cfg.shuffle_roi);
+        const shoeRoi = normalizeRoi(rois.shoe_roi || this.cfg.shoe_roi);
+        const discRoi = normalizeRoi(rois.discard_roi || this.cfg.discard_roi);
 
         this.detector.invalidateCaches();
         const obs = this.detector.processCrops({
@@ -6183,6 +6578,9 @@
           bannerImg: cropNorm(snap, bRoi),
           placeBetsImg: cropNorm(snap, pbRoi),
           shuffleImg: cropNorm(snap, shRoi),
+          shoeImg: cropNorm(snap, shoeRoi),
+          discardImg: cropNorm(snap, discRoi),
+          forceDealerScan: true,
         });
 
         const toNormDets = (roi, dets) => {
@@ -6219,6 +6617,14 @@
           },
           placeBets: {
             conf: Number((obs.place_bets_conf || 0).toFixed(3)),
+          },
+          shoeDetect: {
+            shoeState: obs.shoe_state || "UNKNOWN",
+            shoeDark: Number((obs.shoe_dark_frac || 0).toFixed(3)),
+            shoeTeal: Number((obs.shoe_teal_frac || 0).toFixed(3)),
+            discardWhite: Number((obs.discard_white_frac || 0).toFixed(4)),
+            discardDark: Number((obs.discard_dark_frac || 0).toFixed(3)),
+            discardTeal: Number((obs.discard_teal_frac || 0).toFixed(3)),
           },
         });
       }
@@ -6674,6 +7080,9 @@
     extractFeltRankViews,
     trimCardGlyph,
     detectLoadingScreen,
+    detectShoeState,
+    detectDiscardStack,
+    ShoeSwapTracker,
     findWhiteCardClusters,
     detectClusterCards,
     detectDealerBadgeTotal,

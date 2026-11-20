@@ -63,6 +63,75 @@ class FrameObservation:
     dealer_sub_cards: list[dict[str, Any]] = field(default_factory=list)
     dealer_badge_hint: dict[str, Any] | None = None
     loading_screen: bool = False
+    shoe_state: str = ""  # "PRESENT" | "ABSENT" | "OCCLUDED" | ""
+    shoe_dark_frac: float = 0.0
+    shoe_teal_frac: float = 0.0
+    discard_white_frac: float = 0.0
+    discard_dark_frac: float = 0.0
+    discard_teal_frac: float = 0.0
+
+
+def detect_shoe_state(shoe_img: np.ndarray | None) -> tuple[str, float, float]:
+    """Classify the right-side physical dealing shoe ROI into PRESENT | ABSENT | OCCLUDED.
+
+    - PRESENT: dark black shoe body occupies the ROI (`dark_frac >= 0.36`, `teal_frac <= 0.46`).
+    - ABSENT: shoe removed from its spot, exposing bright Playtech teal felt underneath
+      (`dark_frac <= 0.24` AND `teal_frac >= 0.50`).
+    - OCCLUDED: dealer hand/arm, shift-change dealer, or dark loading screen (no exposed teal felt).
+    """
+    if shoe_img is None or shoe_img.size == 0 or shoe_img.ndim != 3:
+        return "", 0.0, 0.0
+    hsv = cv2.cvtColor(shoe_img, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    dark_frac = float(np.mean(v < 58))
+    teal_frac = float(np.mean((h >= 78) & (h <= 108) & (s >= 55) & (v >= 55)))
+    if dark_frac >= 0.36 and teal_frac <= 0.46:
+        state = "PRESENT"
+    elif dark_frac <= 0.24 and teal_frac >= 0.50:
+        state = "ABSENT"
+    else:
+        state = "OCCLUDED"
+    return state, round(dark_frac, 4), round(teal_frac, 4)
+
+
+def detect_discard_stack(discard_img: np.ndarray | None) -> tuple[float, float, float]:
+    """Position-invariant movable discard-tray stack detector inside a wide left-side ROI.
+
+    Returns `(white_stack_frac, dark_frac, teal_frac)`:
+    - `white_stack_frac`: fraction of ROI covered by compact neutral-white card-stack blobs
+      (invariant to where the dealer slid/angled the discard tray inside the zone, while
+      rejecting thin icon strokes like UNDO via solidity & minimum-area filtering).
+    - `dark_frac`: fraction of dark tray-housing pixels (`V < 58`), used to distinguish
+      an emptied tray sitting in the zone from a tray slid completely outside the ROI.
+    - `teal_frac`: fraction of Playtech teal felt pixels, proving live table visibility.
+    """
+    if discard_img is None or discard_img.size == 0 or discard_img.ndim != 3:
+        return 0.0, 0.0, 0.0
+    hsv = cv2.cvtColor(discard_img, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    dark_frac = float(np.mean(v < 58))
+    teal_frac = float(np.mean((h >= 78) & (h <= 108) & (s >= 55) & (v >= 55)))
+
+    white_mask = ((s <= 45) & (v >= 175)).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+
+    total_px = float(discard_img.shape[0] * discard_img.shape[1])
+    min_blob_px = max(6, int(round(total_px * 0.002)))
+    n_lbl, _, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
+    stack_px = 0
+    for i in range(1, n_lbl):
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_blob_px or bw < 2 or bh < 2:
+            continue
+        solidity = area / float(max(1, bw * bh))
+        if solidity >= 0.45:
+            stack_px += area
+
+    white_stack_frac = stack_px / max(1.0, total_px)
+    return round(white_stack_frac, 4), round(dark_frac, 4), round(teal_frac, 4)
 
 
 @dataclass
@@ -1017,11 +1086,21 @@ def _has_red_back_signature(bgr_patch: np.ndarray) -> bool:
     b = bgr_patch[:, :, 0].astype(np.int16)
     g = bgr_patch[:, :, 1].astype(np.int16)
     r = bgr_patch[:, :, 2].astype(np.int16)
-    red_ratio = float(np.mean((r - np.maximum(b, g)) > 32))
+    red_mask = (r - np.maximum(b, g)) > 32
+    red_ratio = float(np.mean(red_mask))
     mn = bgr_patch.min(axis=2)
     dot_ratio = float(np.mean(mn > 150))
     white_ratio = float(np.mean(mn >= 225))
-    return red_ratio >= 0.24 and dot_ratio >= 0.10 and white_ratio <= 0.42
+    if not (red_ratio >= 0.24 and dot_ratio >= 0.10 and white_ratio <= 0.42):
+        return False
+    # Red face-up Hearts/Diamonds cards only have red ink concentrated in the rank/pip corner,
+    # whereas a checkered card back spans both top and bottom halves of the patch.
+    h = bgr_patch.shape[0]
+    if h >= 6:
+        mid = h // 2
+        if float(np.mean(red_mask[:mid, :])) < 0.14 or float(np.mean(red_mask[mid:, :])) < 0.14:
+            return False
+    return True
 
 
 def _classify_suit_zone(
@@ -1059,6 +1138,7 @@ def _classify_suit_zone(
     zh, zw = suit_min.shape[:2]
     best_suit: str | None = None
     best_conf = 0.0
+    per_suit_best: dict[str, tuple[float, int, int, int, int]] = {}
     for tpl in filtered:
         for sc in (0.88, 0.96, 1.0, 1.06, 1.12):
             entry = _get_scaled_tpl_gray(tpl, sc, use_min_gray=True)
@@ -1068,10 +1148,43 @@ def _classify_suit_zone(
             if sw > zw or sh > zh:
                 continue
             res = cv2.matchTemplate(suit_min, scaled, cv2.TM_CCOEFF_NORMED)
-            _, mval, _, _ = cv2.minMaxLoc(res)
-            if np.isfinite(mval) and float(mval) > best_conf:
-                best_conf = float(mval)
-                best_suit = tpl.rank
+            _, mval, _, mloc = cv2.minMaxLoc(res)
+            if np.isfinite(mval):
+                fval = float(mval)
+                prev = per_suit_best.get(tpl.rank)
+                if prev is None or fval > prev[0]:
+                    per_suit_best[tpl.rank] = (fval, int(mloc[0]), int(mloc[1]), sw, sh)
+                if fval > best_conf:
+                    best_conf = fval
+                    best_suit = tpl.rank
+
+    # Clubs vs Spades apex-fill tie-breaker when black-suit NCC scores are close (within 0.04)
+    if (
+        not is_red
+        and best_suit in ("C", "S")
+        and "C" in per_suit_best
+        and "S" in per_suit_best
+        and abs(per_suit_best["C"][0] - per_suit_best["S"][0]) <= 0.04
+    ):
+        _, mx, my, mw, mh = per_suit_best[best_suit]
+        if mh >= 7 and mw >= 6:
+            sub = suit_min[my : my + mh, mx : mx + mw]
+            ink = sub < suit_ink_thr
+            top_h = max(2, int(round(mh * 0.28)))
+            mid_y0 = max(top_h, int(round(mh * 0.35)))
+            mid_y1 = max(mid_y0 + 1, int(round(mh * 0.65)))
+            top_band = ink[:top_h, :]
+            mid_band = ink[mid_y0:mid_y1, :]
+            top_fill = float(np.mean(top_band)) if top_band.size else 0.0
+            mid_fill = float(np.mean(mid_band)) if mid_band.size else 0.0
+            # Clubs have a wide rounded top lobe (higher top fill relative to middle pinch);
+            # Spades taper to a sharp point at the apex (lower top fill relative to wide lower-mid belly).
+            if top_fill >= 0.44 and top_fill >= mid_fill * 0.72:
+                best_suit = "C"
+                best_conf = per_suit_best["C"][0]
+            elif top_fill <= 0.30 and mid_fill >= 0.50:
+                best_suit = "S"
+                best_conf = per_suit_best["S"][0]
 
     if best_suit is not None and best_conf >= 0.56:
         return best_suit, best_conf
@@ -1779,8 +1892,22 @@ def detect_dealer_badge_total(
     if bw < 10 or bh < 10:
         return (None, 0.0, None) if return_hint else (None, 0.0)
 
-    sub_gray = _to_gray(dealer_img[by0:by1, bx0:bx1])
-    mask = (sub_gray >= 165).astype(np.uint8)
+    sub_bgr = dealer_img[by0:by1, bx0:bx1]
+    sub_gray = _to_gray(sub_bgr)
+    is_color = sub_bgr.ndim == 3 and sub_bgr.shape[2] >= 3
+    if is_color:
+        b_ch = sub_bgr[:, :, 0].astype(np.int16)
+        g_ch = sub_bgr[:, :, 1].astype(np.int16)
+        r_ch = sub_bgr[:, :, 2].astype(np.int16)
+        mn_ch = np.minimum(np.minimum(b_ch, g_ch), r_ch)
+        mx_ch = np.maximum(np.maximum(b_ch, g_ch), r_ch)
+        chroma = mx_ch - mn_ch
+        mask = ((mn_ch >= 150) | ((sub_gray >= 165) & (chroma < 42))).astype(np.uint8)
+        pill_bg_mask = (sub_gray < 135) | ((chroma >= 45) & (mn_ch < 155))
+    else:
+        mask = (sub_gray >= 165).astype(np.uint8)
+        pill_bg_mask = sub_gray < 135
+
     num, _, stats, _ = cv2.connectedComponentsWithStats(mask)
     digit_cands: list[tuple[int, int, int, int, str, float]] = []
     soft_cands: list[tuple[int, int, int, int, str, float]] = []
@@ -1788,7 +1915,7 @@ def detect_dealer_badge_total(
         x, y, w, h, area = [int(v) for v in stats[lbl]]
         if h < min_digit_h or h > max_digit_h:
             continue
-        if w < 2 or w > int(round(h * 1.05)) or area < 8:
+        if w < 2 or w > int(round(h * 1.05)) or area < 6:
             continue
         if (x + w) >= (bw - 1) and h >= max_digit_h * 0.9:
             continue
@@ -1797,17 +1924,19 @@ def detect_dealer_badge_total(
         my0 = max(0, y - 3)
         mx1 = min(bw, x + w + 3)
         my1 = min(bh, y + h + 3)
-        patch = sub_gray[my0:my1, mx0:mx1]
-        ring_mask = np.ones(patch.shape, dtype=bool)
+        ring_bg = pill_bg_mask[my0:my1, mx0:mx1]
+        ring_mask = np.ones(ring_bg.shape, dtype=bool)
         ring_mask[y - my0 : y + h - my0, x - mx0 : x + w - mx0] = False
-        ring_px = patch[ring_mask]
-        if ring_px.size > 0 and float(np.mean(ring_px < 135)) < 0.45:
+        ring_px = ring_bg[ring_mask]
+        dark_ratio = float(np.mean(ring_px)) if ring_px.size > 0 else 0.0
+        if ring_px.size > 0 and dark_ratio < 0.45:
             continue
 
         digit, conf = _match_badge_digit_patch(sub_gray, x, y, w, h)
+        min_single_conf = 0.55 if dark_ratio >= 0.80 else 0.68
         if digit is not None and conf >= 0.54:
             soft_cands.append((x, y, w, h, digit, conf))
-            if conf >= 0.72:
+            if conf >= min_single_conf:
                 digit_cands.append((x, y, w, h, digit, conf))
 
     if not soft_cands:
@@ -1815,19 +1944,34 @@ def detect_dealer_badge_total(
 
     def _group_digits(cands: list[tuple[int, int, int, int, str, float]]) -> list[list[tuple[int, int, int, int, str, float]]]:
         cands.sort(key=lambda c: c[0])
-        grps: list[list[tuple[int, int, int, int, str, float]]] = []
+        raw_runs: list[list[tuple[int, int, int, int, str, float]]] = []
         for cand in cands:
             x, y, w, h, _, _ = cand
-            if grps:
-                last_g = grps[-1]
+            if raw_runs:
+                last_g = raw_runs[-1]
                 px, py, pw, ph, _, _ = last_g[-1]
                 same_row = abs(y - py) <= max(3, int(round(ph * 0.25)))
                 same_h = (ph * 0.70) <= h <= (ph * 1.40)
                 gap = x - (px + pw)
-                if same_row and same_h and -2 <= gap <= max(4, int(round(ph * 0.55))) and len(last_g) < 2:
+                if same_row and same_h and -2 <= gap <= max(4, int(round(ph * 0.55))):
                     last_g.append(cand)
                     continue
-            grps.append([cand])
+            raw_runs.append([cand])
+
+        # Split any 3+ digit soft X/Y run (e.g. "7/17" with '/' dropped -> [7, 1, 7]) from the right
+        grps: list[list[tuple[int, int, int, int, str, float]]] = []
+        for run in raw_runs:
+            if len(run) <= 2:
+                grps.append(run)
+            else:
+                tail2 = run[-2:]
+                tail_val = int("".join(c[4] for c in tail2))
+                if 12 <= tail_val <= 21:
+                    grps.append(run[:-2])
+                    grps.append(tail2)
+                else:
+                    for i in range(0, len(run), 2):
+                        grps.append(run[i : i + 2])
         return grps
 
     best_total: int | None = None
@@ -2139,6 +2283,8 @@ class PlaytechDetector:
         dealer_felt_img: np.ndarray | None = None,
         place_bets_img: np.ndarray | None = None,
         force_dealer_scan: bool = False,
+        shoe_img: np.ndarray | None = None,
+        discard_img: np.ndarray | None = None,
     ) -> FrameObservation:
         """Analyze cropped ROIs and return detections for a single tick."""
         now = ts if ts is not None else time.monotonic()
@@ -2383,6 +2529,21 @@ class PlaytechDetector:
             if d_obs is not None:
                 felt_events.append(d_obs)
 
+        # Dual-ROI physical shoe & movable discard-tray metrics (throttled ~2.5 Hz)
+        shoe_state, shoe_dark, shoe_teal = getattr(self, "_cached_shoe", ("", 0.0, 0.0))
+        disc_white, disc_dark, disc_teal = getattr(self, "_cached_discard", (0.0, 0.0, 0.0))
+        last_shoe_ts = getattr(self, "_last_shoe_scan_ts", -999.0)
+        if (shoe_img is not None or discard_img is not None) and (
+            force_dealer_scan or (now - last_shoe_ts) >= 0.35
+        ):
+            self._last_shoe_scan_ts = now
+            if shoe_img is not None and shoe_img.size:
+                shoe_state, shoe_dark, shoe_teal = detect_shoe_state(shoe_img)
+                self._cached_shoe = (shoe_state, shoe_dark, shoe_teal)
+            if discard_img is not None and discard_img.size:
+                disc_white, disc_dark, disc_teal = detect_discard_stack(discard_img)
+                self._cached_discard = (disc_white, disc_dark, disc_teal)
+
         return FrameObservation(
             ts=now,
             player_cards=list(p_cards),
@@ -2402,4 +2563,10 @@ class PlaytechDetector:
             dealer_badge_conf=d_badge_conf,
             dealer_sub_cards=list(d_sub_cards),
             dealer_badge_hint=d_badge_hint,
+            shoe_state=shoe_state,
+            shoe_dark_frac=shoe_dark,
+            shoe_teal_frac=shoe_teal,
+            discard_white_frac=disc_white,
+            discard_dark_frac=disc_dark,
+            discard_teal_frac=disc_teal,
         )

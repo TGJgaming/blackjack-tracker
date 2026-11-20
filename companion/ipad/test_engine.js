@@ -2298,7 +2298,92 @@ console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks
   console.log("   Test 37 PASSED");
 }
 
-console.log("\nALL 37 ENGINE TESTS PASSED SUCCESSFULLY!");
+// Test 38: Dual-ROI physical shoe & movable discard-tray auto-new-shoe detection + undo cooldown
+{
+  console.log("38. Testing dual-ROI shoe_roi & movable discard_roi auto-new-shoe parity...");
+  const mkTeal = (w, h) => {
+    const im = Engine.createImage(w, h, 3, 0);
+    // Playtech teal felt BGR ~ (125, 110, 42) -> HSV H~96, S~170, V~125
+    fillRect(im, 0, 0, w, h, 125, 110, 42);
+    return im;
+  };
+
+  // 1. Shoe PRESENT vs ABSENT vs OCCLUDED
+  const shoePres = mkTeal(80, 60);
+  fillRect(shoePres, 10, 8, 60, 46, 18, 18, 22);
+  const rPres = Engine.detectShoeState(shoePres);
+  assert.strictEqual(rPres.state, "PRESENT", `Expected PRESENT, got ${JSON.stringify(rPres)}`);
+
+  const shoeAbs = mkTeal(80, 60);
+  const rAbs = Engine.detectShoeState(shoeAbs);
+  assert.strictEqual(rAbs.state, "ABSENT", `Expected ABSENT, got ${JSON.stringify(rAbs)}`);
+
+  const armOcc = Engine.createImage(80, 60, 3, 0);
+  fillRect(armOcc, 0, 0, 80, 60, 120, 150, 195);
+  const rOcc = Engine.detectShoeState(armOcc);
+  assert.strictEqual(rOcc.state, "OCCLUDED", `Expected OCCLUDED, got ${JSON.stringify(rOcc)}`);
+
+  // 2. Position-invariant movable discard tray (left, center, right)
+  const mkDisc = (trayX, withStack, housing = true) => {
+    const im = mkTeal(120, 80);
+    if (housing) {
+      fillRect(im, trayX, 14, 34, 52, 20, 22, 26);
+      if (withStack) fillRect(im, trayX + 5, 24, 24, 36, 232, 232, 235);
+    }
+    return im;
+  };
+  const dEmpty = Engine.detectDiscardStack(mkDisc(15, false, true));
+  assert(dEmpty.whiteFrac <= 0.005 && dEmpty.darkFrac >= 0.12 && dEmpty.tealFrac >= 0.40);
+  const stackFracs = [8, 42, 76].map((tx) => Engine.detectDiscardStack(mkDisc(tx, true, true)).whiteFrac);
+  assert(stackFracs.every((v) => v >= 0.05), `Stack fractions too low: ${stackFracs}`);
+  assert(Math.max(...stackFracs) - Math.min(...stackFracs) < 0.015, "Discard stack must be position-invariant");
+
+  // 3. Primary shoe_swap cycle + undo cooldown
+  const cfg38 = Engine.defaultConfig();
+  const sm38 = new Engine.CompanionStateMachine(cfg38);
+  sm38.setSyncState({ playMode: "bet", shoeRem: [30, 30, 30, 30, 30, 30, 30, 30, 30, 86] }); // 60 cards seen
+  const obs38 = (ts, shoe_state, shoe_dark_frac = 0.65, shoe_teal_frac = 0.25, discW = 0.0, discD = 0.30, discT = 0.45) => ({
+    ts, player_cards: [], dealer_cards: [], player_hands: {}, banner_state: "",
+    shoe_state, shoe_dark_frac, shoe_teal_frac,
+    discard_white_frac: discW, discard_dark_frac: discD, discard_teal_frac: discT,
+  });
+  sm38.step(obs38(0.0, "PRESENT"));
+  sm38.step(obs38(2.5, "PRESENT"));
+  sm38.step(obs38(10.0, "ABSENT", 0.05, 0.85));
+  sm38.step(obs38(11.5, "OCCLUDED", 0.10, 0.10));
+  sm38.step(obs38(11.9, "ABSENT", 0.05, 0.85));
+  sm38.step(obs38(13.8, "ABSENT", 0.05, 0.85));
+  sm38.step(obs38(15.0, "PRESENT"));
+  const ev38 = sm38.step(obs38(16.7, "PRESENT"));
+  const ns38 = ev38.find((e) => e.type === "new_shoe");
+  assert(ns38 && ns38.reason === "shoe_swap" && ns38.cardsSeen === 60 && ns38.hasPendingBet === false);
+
+  // Undo cooldown blocks immediate re-trigger
+  sm38.onUndoNewShoe(17.0);
+  sm38.step(obs38(20.0, "ABSENT", 0.05, 0.85));
+  sm38.step(obs38(25.0, "ABSENT", 0.05, 0.85));
+  assert.strictEqual(sm38.shoeTracker._shoeSwapArmed, false);
+
+  // 4. Discard fallback + off-zone tray movement guard
+  const tr38 = new Engine.ShoeSwapTracker(cfg38.shoe_detect);
+  for (const t of [1, 2, 3, 4, 5]) {
+    tr38.step(obs38(t, "OCCLUDED", 0.2, 0.2, 0.045, 0.30, 0.45), { cardsSeen: 90 });
+  }
+  // Tray moved off-zone (dark drops to 0.02) -> MUST NOT trigger
+  for (const t of [10, 12, 14, 16, 18, 20]) {
+    assert.strictEqual(tr38.step(obs38(t, "OCCLUDED", 0.2, 0.2, 0.001, 0.02, 0.85), { cardsSeen: 90 }), null);
+  }
+  // Emptied in-place (housing dark=0.25) -> triggers discard_cleared
+  let fbReason = null;
+  for (const t of [25, 26.5, 28, 29.5, 31, 32.5]) {
+    const r = tr38.step(obs38(t, "OCCLUDED", 0.2, 0.2, 0.002, 0.25, 0.55), { cardsSeen: 90 });
+    if (r) { fbReason = r; break; }
+  }
+  assert.strictEqual(fbReason, "discard_cleared");
+  console.log("   Test 38 PASSED");
+}
+
+console.log("\nALL 38 ENGINE TESTS PASSED SUCCESSFULLY!");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

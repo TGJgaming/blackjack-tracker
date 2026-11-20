@@ -7,7 +7,7 @@ import random
 import time
 from typing import Any
 
-from config import RANK_TO_VAL, CompanionConfig, KeepaliveConfig
+from config import RANK_TO_VAL, CompanionConfig, KeepaliveConfig, ShoeDetectConfig
 from detector import CardDetection, FeltObservation, FrameObservation
 
 
@@ -1037,6 +1037,204 @@ class WatchKeepaliveManager:
         }
 
 
+class ShoeSwapTracker:
+    """Dual-ROI physical table auto-new-shoe tracker (dealing shoe + movable discard tray).
+
+    Triggers:
+      1. Primary (`shoe_swap`): shoe_roi transitions PRESENT (>=2.0s) -> ABSENT (>=3.5s,
+         tolerating <=0.7s OCCLUDED flicker) -> RETURNED (>=1.5s) [or ABSENT >=12s + PLACE_BETS].
+      2. Fast Corroborated (`shoe_and_discard`): shoe_roi ABSENT >=1.8s AND discard_roi
+         drops from confirmed white stack peak to empty.
+      3. Fallback (`discard_cleared`): discard_roi drops from confirmed peak (>=0.022) to
+         empty (<=0.007) for >=4.5s while dark tray housing remains visible (>=0.10) so
+         sliding the tray completely off-zone never false-triggers.
+    """
+
+    def __init__(self, cfg: ShoeDetectConfig) -> None:
+        self.cfg = cfg
+        self.shoe_state: str = ""
+        self.shoe_dark_frac: float = 0.0
+        self.shoe_teal_frac: float = 0.0
+        self.discard_white_frac: float = 0.0
+        self.discard_dark_frac: float = 0.0
+        self.discard_teal_frac: float = 0.0
+
+        self._shoe_present_since: float | None = None
+        self._shoe_confirmed_present: bool = False
+        self._shoe_absent_since: float | None = None
+        self._shoe_occluded_since: float | None = None
+        self._shoe_return_since: float | None = None
+        self._shoe_swap_armed: bool = False
+        self._shoe_swap_corroborated: bool = False
+
+        self._discard_window: list[float] = []
+        self._discard_peak_white: float = 0.0
+        self._discard_empty_since: float | None = None
+
+        self._cooldown_until: float = -1e9
+        self.last_trigger_reason: str = ""
+
+    def reset_for_new_shoe(self, now: float) -> None:
+        self._shoe_present_since = None
+        self._shoe_confirmed_present = False
+        self._shoe_absent_since = None
+        self._shoe_occluded_since = None
+        self._shoe_return_since = None
+        self._shoe_swap_armed = False
+        self._shoe_swap_corroborated = False
+        self._discard_window.clear()
+        self._discard_peak_white = 0.0
+        self._discard_empty_since = None
+        self._cooldown_until = now + self.cfg.cooldown_sec
+
+    def on_undo_new_shoe(self, now: float) -> None:
+        """Called when the user clicks Undo Auto-Reset: suppress re-triggering for cooldown_sec."""
+        self._shoe_absent_since = None
+        self._shoe_occluded_since = None
+        self._shoe_return_since = None
+        self._shoe_swap_armed = False
+        self._shoe_swap_corroborated = False
+        self._shoe_confirmed_present = True
+        self._discard_empty_since = None
+        self._cooldown_until = now + self.cfg.cooldown_sec
+
+    def status_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.cfg.enabled,
+            "shoeState": self.shoe_state or "UNKNOWN",
+            "shoeDark": round(self.shoe_dark_frac, 3),
+            "shoeTeal": round(self.shoe_teal_frac, 3),
+            "swapArmed": self._shoe_swap_armed,
+            "discardWhite": round(self.discard_white_frac, 4),
+            "discardPeak": round(self._discard_peak_white, 4),
+            "discardDark": round(self.discard_dark_frac, 3),
+            "discardTeal": round(self.discard_teal_frac, 3),
+            "lastReason": self.last_trigger_reason,
+        }
+
+    def step(
+        self,
+        obs: FrameObservation,
+        *,
+        cards_seen: int,
+        has_active_cards: bool,
+        in_betting_overlay: bool,
+        suppressed: bool,
+    ) -> str | None:
+        """Advance physical shoe & discard-tray state. Returns trigger reason or None."""
+        now = obs.ts
+        if obs.shoe_state:
+            self.shoe_state = obs.shoe_state
+            self.shoe_dark_frac = obs.shoe_dark_frac
+            self.shoe_teal_frac = obs.shoe_teal_frac
+        if obs.discard_teal_frac > 0.0 or obs.discard_dark_frac > 0.0 or obs.discard_white_frac > 0.0:
+            self.discard_white_frac = obs.discard_white_frac
+            self.discard_dark_frac = obs.discard_dark_frac
+            self.discard_teal_frac = obs.discard_teal_frac
+
+        if not self.cfg.enabled or suppressed or now < self._cooldown_until:
+            return None
+
+        # --- 1. Update movable discard-tray stack peak (only when live felt visible & no betting UI overlay) ---
+        discard_just_emptied = False
+        if (
+            self.cfg.enable_discard_fallback
+            and not in_betting_overlay
+            and self.discard_teal_frac >= 0.12
+        ):
+            self._discard_window.append(self.discard_white_frac)
+            if len(self._discard_window) > 5:
+                self._discard_window.pop(0)
+            med_white = sorted(self._discard_window)[len(self._discard_window) // 2]
+
+            if med_white > self._discard_peak_white:
+                self._discard_peak_white = med_white
+
+            housing_visible = self.discard_dark_frac >= self.cfg.discard_housing_dark_min
+            if (
+                self._discard_peak_white >= self.cfg.discard_peak_white_min
+                and med_white <= self.cfg.discard_empty_white_max
+                and housing_visible
+                and not has_active_cards
+            ):
+                if self._discard_empty_since is None:
+                    self._discard_empty_since = now
+                discard_just_emptied = True
+            else:
+                self._discard_empty_since = None
+
+        # --- 2. Primary: shoe_roi PRESENT -> ABSENT -> RETURNED ---
+        if self.cfg.enable_shoe_roi and self.shoe_state:
+            if self.shoe_state == "PRESENT":
+                self._shoe_absent_since = None
+                self._shoe_occluded_since = None
+                if self._shoe_present_since is None:
+                    self._shoe_present_since = now
+                elif (now - self._shoe_present_since) >= self.cfg.shoe_present_hold_sec:
+                    self._shoe_confirmed_present = True
+
+                if self._shoe_swap_armed:
+                    if self._shoe_return_since is None:
+                        self._shoe_return_since = now
+                    elif (now - self._shoe_return_since) >= self.cfg.shoe_return_hold_sec and not has_active_cards:
+                        reason = "shoe_and_discard" if self._shoe_swap_corroborated else "shoe_swap"
+                        self.last_trigger_reason = reason
+                        self.reset_for_new_shoe(now)
+                        return reason
+                else:
+                    self._shoe_return_since = None
+
+            elif self.shoe_state == "ABSENT":
+                self._shoe_present_since = None
+                self._shoe_return_since = None
+                self._shoe_occluded_since = None
+                if self._shoe_confirmed_present and cards_seen >= self.cfg.shoe_min_cards:
+                    if self._shoe_absent_since is None:
+                        self._shoe_absent_since = now
+                    absent_dur = now - self._shoe_absent_since
+                    if absent_dur >= self.cfg.shoe_absent_hold_sec:
+                        self._shoe_swap_armed = True
+                    elif discard_just_emptied and absent_dur >= self.cfg.shoe_corroborated_absent_sec:
+                        self._shoe_swap_armed = True
+                        self._shoe_swap_corroborated = True
+                    # Safety valve: shoe absent >= 12s and PLACE_BETS appeared (e.g. new shoe shifted off ROI)
+                    if (
+                        self._shoe_swap_armed
+                        and absent_dur >= self.cfg.shoe_absent_safety_sec
+                        and obs.banner_state == "PLACE_BETS"
+                        and not has_active_cards
+                    ):
+                        reason = "shoe_and_discard" if self._shoe_swap_corroborated else "shoe_swap"
+                        self.last_trigger_reason = reason
+                        self.reset_for_new_shoe(now)
+                        return reason
+
+            elif self.shoe_state == "OCCLUDED":
+                # Tolerate brief dealer arm flicker while ABSENT; otherwise ignore occlusions
+                self._shoe_present_since = None
+                self._shoe_return_since = None
+                if self._shoe_absent_since is not None and not self._shoe_swap_armed:
+                    if self._shoe_occluded_since is None:
+                        self._shoe_occluded_since = now
+                    elif (now - self._shoe_occluded_since) > self.cfg.shoe_max_flicker_sec:
+                        self._shoe_absent_since = None
+                        self._shoe_occluded_since = None
+
+        # --- 3. Standalone Fallback: discard_roi peak -> empty ---
+        if (
+            self.cfg.enable_discard_fallback
+            and self._discard_empty_since is not None
+            and cards_seen >= self.cfg.discard_min_cards
+            and (now - self._discard_empty_since) >= self.cfg.discard_empty_hold_sec
+            and not has_active_cards
+        ):
+            self.last_trigger_reason = "discard_cleared"
+            self.reset_for_new_shoe(now)
+            return "discard_cleared"
+
+        return None
+
+
 class CompanionStateMachine:
     """Tracks live Playtech All Bets round progression and outputs tracker WebSocket events."""
 
@@ -1131,6 +1329,13 @@ class CompanionStateMachine:
         self._shuffle_since: float | None = None
         self._shuffle_emitted: bool = False
         self._pending_auto_watch: dict[str, Any] | None = None
+        self.shoe_tracker = ShoeSwapTracker(cfg.shoe_detect)
+
+    def on_undo_new_shoe(self, now: float | None = None) -> None:
+        self.shoe_tracker.on_undo_new_shoe(time.monotonic() if now is None else now)
+
+    def reset_for_new_shoe(self, now: float | None = None) -> None:
+        self.shoe_tracker.reset_for_new_shoe(time.monotonic() if now is None else now)
 
     @property
     def p_debouncer(self) -> SequenceDebouncer:
@@ -1958,7 +2163,7 @@ class CompanionStateMachine:
                 }
             )
 
-    def step(self, obs: FrameObservation) -> list[dict[str, Any]]:
+    def step(self, obs: FrameObservation, *, keepalive_grace: bool = False) -> list[dict[str, Any]]:
         """Consume one FrameObservation and return zero or more WebSocket protocol events."""
         if self.paused:
             return []
@@ -2000,6 +2205,7 @@ class CompanionStateMachine:
                 self.resync_round()
                 self.state = "SHUFFLING"
                 self._shuffle_emitted = True
+                self.shoe_tracker.reset_for_new_shoe(obs.ts)
                 events.append({"type": "new_shoe", "reason": "cut", "hasPendingBet": has_pending_bet})
             return events
 
@@ -2007,6 +2213,42 @@ class CompanionStateMachine:
         if self.state == "SHUFFLING":
             self.state = "IDLE"
         self._shuffle_emitted = False
+
+        # 1b. Dual-ROI physical shoe / movable discard-tray auto-new-shoe detection
+        cards_seen_in_shoe = (
+            max(0, 416 - sum(self.sync_shoe_rem))
+            if self.sync_shoe_rem and len(self.sync_shoe_rem) == 10
+            else 0
+        )
+        has_active_cards_now = bool(
+            obs.player_cards or obs.dealer_cards or obs.player_hands or self._emitted_p > 0 or self._emitted_d > 0
+        )
+        in_betting_ui = obs.banner_state in ("PLACE_BETS", "LAST_BETS")
+        swap_reason = self.shoe_tracker.step(
+            obs,
+            cards_seen=cards_seen_in_shoe,
+            has_active_cards=has_active_cards_now,
+            in_betting_overlay=in_betting_ui,
+            suppressed=bool(keepalive_grace or obs.loading_screen or self.paused),
+        )
+        if swap_reason:
+            self._flush_pending_auto_watch(events)
+            has_pending_bet = (self.state not in ("IDLE", "BETTING")) and (
+                self.sync_play_mode == "bet" or self._split_detected
+            )
+            self.sync_track_felt = False
+            self._clear_review_snapshot()
+            self.resync_round()
+            self.state = "IDLE"
+            events.append(
+                {
+                    "type": "new_shoe",
+                    "reason": swap_reason,
+                    "cardsSeen": cards_seen_in_shoe,
+                    "hasPendingBet": has_pending_bet,
+                }
+            )
+            return events
 
         # 2. Process Round Status Banner Transitions
         # Playtech banner flow: PLACE_BETS -> LAST_BETS -> NO_MORE_BETS (no cards dealt).
