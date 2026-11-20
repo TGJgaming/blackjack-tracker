@@ -908,7 +908,7 @@ def _match_loading_logo(band_bgr: np.ndarray, loading_tpls: list[np.ndarray] | N
     for tpl_g in tpls:
         if tpl_g.shape[0] < 4 or tpl_g.shape[1] < 8:
             continue
-        for sc in (0.30, 0.34, 0.38, 0.42, 0.48, 0.56, 0.65, 0.78, 0.92, 1.08):
+        for sc in (0.24, 0.28, 0.32, 0.36, 0.42, 0.48, 0.56, 0.66, 0.78, 0.92, 1.08):
             sw = max(12, int(round(tpl_g.shape[1] * sc)))
             sh = max(6, int(round(tpl_g.shape[0] * sc)))
             if sw > nw or sh > nh:
@@ -938,8 +938,8 @@ def detect_loading_screen(anchor_bgr: np.ndarray, loading_tpls: list[np.ndarray]
     if float(np.std(gray[:core_h, :])) < 8.5:
         return True
 
-    # 2. Reliable template match for the Playtech "ALL BETS" loading logo in center band [x:0.10..0.90, y:0.25..0.68]
-    band = anchor_bgr[int(h * 0.25) : int(h * 0.68), int(w * 0.10) : int(w * 0.90)]
+    # 2. Reliable template match for the Playtech "ALL BETS" loading logo in center band [x:0.08..0.92, y:0.20..0.72]
+    band = anchor_bgr[int(h * 0.20) : int(h * 0.72), int(w * 0.08) : int(w * 0.92)]
     if _match_loading_logo(band, loading_tpls=loading_tpls):
         return True
 
@@ -1330,6 +1330,8 @@ def _detect_cluster_cards(
 
     sc = 45.0 / float(ch)
     cw_norm = max(1, int(round(cw * sc)))
+    if not is_dealer and not edge_clipped and cw_norm < 22:
+        return [], False
     interp = cv2.INTER_CUBIC if sc > 1.0 else cv2.INTER_AREA
     norm_bgr = cluster_bgr if ch == 45 else cv2.resize(cluster_bgr, (cw_norm, 45), interpolation=interp)
     norm_top = _to_min_gray(norm_bgr[:23, :])

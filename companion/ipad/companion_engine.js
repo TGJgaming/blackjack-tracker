@@ -1581,12 +1581,12 @@
     }
     if (Math.sqrt(gVar / Math.max(1, coreN)) < 8.5) return true;
 
-    // 2. Reliable template match for the Playtech "ALL BETS" loading logo in center band [x:0.10..0.90, y:0.25..0.68]
+    // 2. Reliable template match for the Playtech "ALL BETS" loading logo in center band [x:0.08..0.92, y:0.20..0.72]
     if (Array.isArray(loadingTpls) && loadingTpls.length > 0) {
-      const rx0 = Math.floor(anchorBgr.w * 0.10);
-      const ry0 = Math.floor(anchorBgr.h * 0.25);
-      const rw = Math.max(20, Math.floor(anchorBgr.w * 0.80));
-      const rh = Math.max(20, Math.floor(anchorBgr.h * 0.43));
+      const rx0 = Math.floor(anchorBgr.w * 0.08);
+      const ry0 = Math.floor(anchorBgr.h * 0.20);
+      const rw = Math.max(20, Math.floor(anchorBgr.w * 0.84));
+      const rh = Math.max(20, Math.floor(anchorBgr.h * 0.52));
       const band = cropImage(anchorBgr, rx0, ry0, rw, rh);
       const nh = 100;
       const nw = Math.max(40, Math.round(rw * (nh / Math.max(1, rh))));
@@ -1595,7 +1595,7 @@
       for (const tpl of loadingTpls) {
         const tGray = tpl && tpl.gray;
         if (!tGray || tGray.w < 8 || tGray.h < 4) continue;
-        for (const sc of [0.30, 0.34, 0.38, 0.42, 0.48, 0.56]) {
+        for (const sc of [0.24, 0.28, 0.32, 0.36, 0.42, 0.48, 0.56, 0.66]) {
           const sw = Math.max(12, Math.round(tGray.w * sc));
           const sh = Math.max(6, Math.round(tGray.h * sc));
           if (sw > nw || sh > nh) continue;
@@ -2010,6 +2010,7 @@
 
     const sc = 45.0 / ch;
     const cwNorm = Math.max(1, Math.round(cw * sc));
+    if (!isDealer && !edgeClipped && cwNorm < 22) return [[], false];
     const normBgr = ch === 45 ? clusterBgr : resizeImage(clusterBgr, cwNorm, 45);
     const normTop = toMinGray(cropImage(normBgr, 0, 0, cwNorm, 23));
 
@@ -6220,9 +6221,26 @@
       if (this.detector && typeof this.detector._ensureBankDecoded === "function") {
         this.detector._ensureBankDecoded("ui");
       }
-      const loadingTpls = (this.detector && this.detector.banks && Array.isArray(this.detector.banks.ui))
+      let loadingTpls = (this.detector && this.detector.banks && Array.isArray(this.detector.banks.ui))
         ? this.detector.banks.ui.filter((t) => t && (t.rank === "LOADING" || (t.name && t.name.startsWith("LOADING_ALLBETS"))))
         : [];
+      if (!loadingTpls.length) {
+        if (!this._fallbackLoadingTpls) {
+          const defPack = PRELOADED_PACK || (typeof globalThis.DEFAULT_COMPANION_PACK === "object" ? globalThis.DEFAULT_COMPANION_PACK : null);
+          const rawUi = (defPack && defPack.templates && Array.isArray(defPack.templates.ui)) ? defPack.templates.ui : [];
+          this._fallbackLoadingTpls = [];
+          for (const item of rawUi) {
+            if (!item || !item.name || !item.name.startsWith("LOADING_ALLBETS")) continue;
+            const bgr = item.bgrB64 && item.w && item.h
+              ? { w: item.w, h: item.h, c: 3, data: b64ToUint8(item.bgrB64) }
+              : (item.bgr && item.bgr.data ? item.bgr : null);
+            if (!bgr) continue;
+            const entry = createTemplateEntry("ui", item.name, bgr, item.dataB64 || "");
+            if (entry) this._fallbackLoadingTpls.push(entry);
+          }
+        }
+        loadingTpls = this._fallbackLoadingTpls;
+      }
       const isLoading = detectLoadingScreen(anchorImg, loadingTpls);
       this._lastLoadingScreen = isLoading;
       const inKaReload = Boolean(this.keepalive && ["REFRESHING", "RECOVERING"].includes(this.keepalive.state));
