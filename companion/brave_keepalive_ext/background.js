@@ -1,29 +1,46 @@
 // Localhost-only WebSocket bridge for native Brave tab reloading.
+// Connects in parallel to both Blackjack (8765) and Baccarat (8766) companions.
 // Runs purely in the MV3 service worker with ONLY `tabs` and `alarms` permissions
 // (zero content scripts, zero host permissions, zero DOM/page access).
 
-const WS_URL = "ws://127.0.0.1:8765";
+const WS_URLS = ["ws://127.0.0.1:8765", "ws://127.0.0.1:8766"];
 const HEARTBEAT_MS = 20000;
 const RECONNECT_MS = 4000;
 
-let ws = null;
-let heartbeatTimer = null;
-let reconnectTimer = null;
+// Per-endpoint connection state
+const endpoints = new Map(
+  WS_URLS.map((url) => [
+    url,
+    { url, ws: null, heartbeatTimer: null, reconnectTimer: null },
+  ])
+);
 
-// Tracks active reload requests keyed by tabId so onUpdated reports load progress cleanly
+// Tracks active reload requests keyed by tabId so onUpdated reports load progress back to the requesting companion
 const watchedTabs = new Map();
 
-function setBadge(text, color) {
+function updateBadge() {
+  let openCount = 0;
+  for (const ep of endpoints.values()) {
+    if (ep.ws && ep.ws.readyState === WebSocket.OPEN) openCount++;
+  }
   try {
-    chrome.action.setBadgeText({ text });
-    chrome.action.setBadgeBackgroundColor({ color });
+    if (openCount >= 2) {
+      chrome.action.setBadgeText({ text: "ON2" });
+      chrome.action.setBadgeBackgroundColor({ color: "#16a34a" });
+    } else if (openCount === 1) {
+      chrome.action.setBadgeText({ text: "ON" });
+      chrome.action.setBadgeBackgroundColor({ color: "#16a34a" });
+    } else {
+      chrome.action.setBadgeText({ text: "OFF" });
+      chrome.action.setBadgeBackgroundColor({ color: "#64748b" });
+    }
   } catch (_) {}
 }
 
-function sendJson(payload) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+function sendJson(ep, payload) {
+  if (ep && ep.ws && ep.ws.readyState === WebSocket.OPEN) {
     try {
-      ws.send(JSON.stringify(payload));
+      ep.ws.send(JSON.stringify(payload));
       return true;
     } catch (_) {
       return false;
@@ -32,40 +49,40 @@ function sendJson(payload) {
   return false;
 }
 
-function cleanupSocket() {
-  if (heartbeatTimer) {
-    clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
+function cleanupSocket(ep) {
+  if (ep.heartbeatTimer) {
+    clearInterval(ep.heartbeatTimer);
+    ep.heartbeatTimer = null;
   }
-  ws = null;
-  setBadge("OFF", "#64748b");
+  ep.ws = null;
+  updateBadge();
 }
 
-function scheduleReconnect(delayMs = RECONNECT_MS) {
-  if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectCompanion();
+function scheduleReconnect(ep, delayMs = RECONNECT_MS) {
+  if (ep.reconnectTimer) return;
+  ep.reconnectTimer = setTimeout(() => {
+    ep.reconnectTimer = null;
+    connectEndpoint(ep);
   }, delayMs);
 }
 
-function connectCompanion() {
-  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+function connectEndpoint(ep) {
+  if (ep.ws && (ep.ws.readyState === WebSocket.CONNECTING || ep.ws.readyState === WebSocket.OPEN)) {
     return;
   }
   try {
-    const sock = new WebSocket(WS_URL);
-    ws = sock;
+    const sock = new WebSocket(ep.url);
+    ep.ws = sock;
 
     sock.addEventListener("open", () => {
-      if (ws !== sock) return;
-      setBadge("ON", "#16a34a");
-      sendJson({ type: "browser_ext_hello", agent: "brave_ext", version: "1.0.0" });
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
-      heartbeatTimer = setInterval(() => {
-        if (!sendJson({ type: "browser_ext_ping", ts: Date.now() })) {
-          cleanupSocket();
-          scheduleReconnect(RECONNECT_MS);
+      if (ep.ws !== sock) return;
+      updateBadge();
+      sendJson(ep, { type: "browser_ext_hello", agent: "brave_ext", version: "1.1.0" });
+      if (ep.heartbeatTimer) clearInterval(ep.heartbeatTimer);
+      ep.heartbeatTimer = setInterval(() => {
+        if (!sendJson(ep, { type: "browser_ext_ping", ts: Date.now() })) {
+          cleanupSocket(ep);
+          scheduleReconnect(ep, RECONNECT_MS);
         }
       }, HEARTBEAT_MS);
     });
@@ -79,8 +96,8 @@ function connectCompanion() {
       }
       if (!msg || typeof msg !== "object") return;
       if (msg.type === "ext_reload_tab") {
-        handleReloadCommand(msg).catch((err) => {
-          sendJson({
+        handleReloadCommand(ep, msg).catch((err) => {
+          sendJson(ep, {
             type: "ext_reload_ack",
             requestId: msg.requestId || "",
             ok: false,
@@ -91,22 +108,28 @@ function connectCompanion() {
     });
 
     sock.addEventListener("close", () => {
-      if (ws === sock) {
-        cleanupSocket();
-        scheduleReconnect(RECONNECT_MS);
+      if (ep.ws === sock) {
+        cleanupSocket(ep);
+        scheduleReconnect(ep, RECONNECT_MS);
       }
     });
 
     sock.addEventListener("error", () => {
-      if (ws === sock) {
+      if (ep.ws === sock) {
         try { sock.close(); } catch (_) {}
-        cleanupSocket();
-        scheduleReconnect(RECONNECT_MS);
+        cleanupSocket(ep);
+        scheduleReconnect(ep, RECONNECT_MS);
       }
     });
   } catch (_) {
-    cleanupSocket();
-    scheduleReconnect(RECONNECT_MS);
+    cleanupSocket(ep);
+    scheduleReconnect(ep, RECONNECT_MS);
+  }
+}
+
+function connectAll() {
+  for (const ep of endpoints.values()) {
+    connectEndpoint(ep);
   }
 }
 
@@ -173,11 +196,11 @@ async function selectTargetTab(msg) {
   return candidates[0].tab;
 }
 
-async function handleReloadCommand(msg) {
+async function handleReloadCommand(ep, msg) {
   const requestId = String(msg.requestId || "");
   const target = await selectTargetTab(msg);
   if (!target || typeof target.id !== "number") {
-    sendJson({
+    sendJson(ep, {
       type: "ext_reload_ack",
       requestId,
       ok: false,
@@ -187,6 +210,7 @@ async function handleReloadCommand(msg) {
   }
 
   watchedTabs.set(target.id, {
+    ep,
     requestId,
     startedAt: Date.now(),
     title: target.title || "",
@@ -194,7 +218,7 @@ async function handleReloadCommand(msg) {
 
   await chrome.tabs.reload(target.id, { bypassCache: !!msg.bypassCache });
 
-  sendJson({
+  sendJson(ep, {
     type: "ext_reload_ack",
     requestId,
     ok: true,
@@ -212,7 +236,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     return;
   }
   if (changeInfo.status === "loading" || changeInfo.status === "complete") {
-    sendJson({
+    sendJson(info.ep, {
       type: "ext_tab_status",
       tabId,
       requestId: info.requestId,
@@ -232,18 +256,18 @@ chrome.alarms.get("companionReconnect", (existing) => {
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm && alarm.name === "companionReconnect") {
-    connectCompanion();
+    connectAll();
   }
 });
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create("companionReconnect", { periodInMinutes: 1 });
-  connectCompanion();
+  connectAll();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create("companionReconnect", { periodInMinutes: 1 });
-  connectCompanion();
+  connectAll();
 });
 
-connectCompanion();
+connectAll();

@@ -2547,7 +2547,7 @@ function renderPlay(){
     hdrExtra: `
       <span id="compPhasePill" class="pill ${draft.phaseBanner ? (['WAIT','DEALING'].includes(draft.phaseBanner)?'green':['PLACE_BETS','LAST_BETS','NO_MORE_BETS'].includes(draft.phaseBanner)?'amber':'blue') : ''}" style="${draft.phaseBanner ? '' : 'visibility:hidden'}" title="Detected Playtech Table Banner Phase">${draft.phaseBanner ? (draft.phaseBanner==='WAIT'?'WAIT · RECORDING':draft.phaseBanner==='DEALING'?'DEALING · RECORDING':draft.phaseBanner.replace(/_/g,' ')) : 'IDLE'}</span>
       <button class="btn xs ${compPillCls}" id="compToggleBtn" title="Toggle local desktop companion auto-tracking (ws://127.0.0.1:8765)">${compPillText}</button>
-      ${_comp.connected ? `<button class="btn xs ${getKeepaliveBadgeState().cls}" id="compKeepaliveBtn" title="${getKeepaliveBadgeState().title}">${getKeepaliveBadgeState().text}</button>${(_comp.keepalive && _comp.keepalive.enabled !== false && _comp.keepalive.mode !== 'off') ? `<button class="btn xs" id="compKeepaliveResetBtn" title="Reset Watch-mode inactivity timer">↺</button>` : ''}<button class="btn xs" id="compCalibBtn" title="Open fit-to-screen ROI & template calibrator">🎯 Calibrate</button><button class="btn xs" id="compPauseBtn" title="Pause/Resume companion">${_comp.paused?'▶ Resume':'⏸ Pause'}</button><button class="btn xs" id="compResyncBtn" title="Reset companion round sync">↻ Resync</button>` : ''}
+      ${_comp.connected ? `<button class="btn xs ${getKeepaliveBadgeState().cls}" id="compKeepaliveBtn" title="${getKeepaliveBadgeState().title}">${getKeepaliveBadgeState().text}</button>${(_comp.keepalive && _comp.keepalive.enabled !== false && _comp.keepalive.mode !== 'off') ? `<button class="btn xs" id="compKeepaliveResetBtn" title="Reset Watch-mode inactivity timer">↺</button>` : ''}<button class="btn xs" id="compCalibBtn" title="Open fit-to-screen ROI & template calibrator">🎯 Calibrate</button><button class="btn xs" id="compPauseBtn" title="Pause/Resume companion">${_comp.paused?'▶ Resume':'⏸ Pause'}</button><button class="btn xs" id="compResyncBtn" title="Reset companion round sync">↻ Resync</button><button class="btn xs" id="compRestartBtn" title="Restart companion.py">↻ Restart</button><button class="btn xs" id="compStopBtn" title="Stop companion.py">⏹</button><button class="btn xs" id="compLogsBtn" title="View companion.log">📋</button>` : `<button class="btn xs good" id="compLaunchBtn" title="Launch Blackjack companion.py silently in background (tracker-companion://)">▶ Launch</button>`}
       <button class="btn xs ${cfg().soundAlert?'pinbtn on':''}" id="toggleSoundBtn" title="Sound alerts (Wong, Deviations, Insurance, +EV Side Bets, Splits, Banner Phase)">${cfg().soundAlert?'🔔 Sound On':'🔕 Sound Off'}</button>
       <button class="btn xs" id="newShoeBtn" title="Archive current shoe and reset 416 cards">🔄 New Shoe</button>
     `,
@@ -3082,6 +3082,55 @@ function renderPlay(){
     draft.phaseBanner = '';
     draft.lastMsg = '↻ Re-synced companion and cleared draft cards.';
     sendCompanionControl('resync');
+  };
+  const compLaunchBtn = document.getElementById('compLaunchBtn');
+  if(compLaunchBtn) compLaunchBtn.onclick = (e) => {
+    e.currentTarget.blur();
+    const a = document.createElement('a');
+    a.href = 'tracker-companion://start/blackjack';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    compLaunchBtn.textContent = 'Starting…';
+    compLaunchBtn.disabled = true;
+    let tries = 0;
+    const poll = setInterval(() => {
+      tries++;
+      if(_comp.connected){
+        clearInterval(poll);
+        return;
+      }
+      connectCompanion(true);
+      if(tries >= 10){
+        clearInterval(poll);
+        if(draft){
+          draft.lastMsg = '⚠ Still offline — first time using ▶ Launch? Run install_launcher_protocol.ps1 once in PowerShell.';
+          render();
+        }
+      }
+    }, 600);
+  };
+  const compRestartBtn = document.getElementById('compRestartBtn');
+  if(compRestartBtn) compRestartBtn.onclick = (e) => {
+    e.currentTarget.blur();
+    if(_comp.ws && _comp.ws.readyState === 1) _comp.ws.send(JSON.stringify({type:'restart_companion'}));
+  };
+  const compStopBtn = document.getElementById('compStopBtn');
+  if(compStopBtn) compStopBtn.onclick = (e) => {
+    e.currentTarget.blur();
+    if(_comp.ws && _comp.ws.readyState === 1 && confirm('Stop Blackjack companion.py?')){
+      _comp.ws.send(JSON.stringify({type:'stop_companion'}));
+    }
+  };
+  const compLogsBtn = document.getElementById('compLogsBtn');
+  if(compLogsBtn) compLogsBtn.onclick = (e) => {
+    e.currentTarget.blur();
+    const m = document.getElementById('bjLogsModal');
+    if(m) m.style.display = 'flex';
+    const pre = document.getElementById('bjLogsPre');
+    if(pre) pre.textContent = 'Loading logs…';
+    if(_comp.ws && _comp.ws.readyState === 1) _comp.ws.send(JSON.stringify({type:'get_logs', lines:140}));
   };
   const compDismissPromptBtn = document.getElementById('compDismissPromptBtn');
   if(compDismissPromptBtn) compDismissPromptBtn.onclick = () => {
@@ -4253,6 +4302,19 @@ function updateKeepaliveBadge(){
 
 function handleCompanionMessage(msg){
   if(!msg || !msg.type) return;
+  if(msg.type === 'companion_logs'){
+    const pre = document.getElementById('bjLogsPre');
+    if(pre) pre.textContent = msg.text || '(empty)';
+    return;
+  }
+  if(msg.type === 'companion_stopping'){
+    if(draft){
+      draft.lastMsg = msg.action === 'restart' ? '↻ Restarting Blackjack companion…' : '⏹ Stopped Blackjack companion.';
+      render();
+    }
+    if(msg.action === 'restart') setTimeout(() => connectCompanion(true), 900);
+    return;
+  }
   if(msg.type === 'keepalive_status'){
     const prevMode = (_comp.keepalive || {}).mode;
     const prevEnabled = (_comp.keepalive || {}).enabled;
@@ -5107,5 +5169,17 @@ if(!active()) startNewSession();
 else { restoreDraft(); render(); }
 connectCompanion(true);
 </script>
+<div id="bjLogsModal" style="display:none;position:fixed;inset:0;background:rgba(5,7,11,.86);z-index:120;align-items:center;justify-content:center;padding:12px" onclick="if(event.target===this)this.style.display='none'">
+  <div style="width:min(820px,96vw);max-height:85vh;display:flex;flex-direction:column;gap:10px;background:#181b22;border:1px solid #2c313c;border-radius:16px;padding:14px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <b style="font-size:16px;color:#e8eaf0">📋 Blackjack Companion Logs</b>
+      <span style="flex:1"></span>
+      <button class="btn sm" onclick="if(_comp.ws&&_comp.ws.readyState===1)_comp.ws.send(JSON.stringify({type:'get_logs',lines:140}))">↻ Refresh</button>
+      <button class="btn sm" onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('bjLogsPre').textContent||'')">Copy</button>
+      <button class="btn sm" onclick="document.getElementById('bjLogsModal').style.display='none'">✕ Close</button>
+    </div>
+    <pre id="bjLogsPre" style="margin:0;padding:12px;background:#090b10;border:1px solid #2c313c;border-radius:10px;color:#cbd5e1;font:12px/1.45 ui-monospace,Consolas,monospace;overflow:auto;flex:1;min-height:280px;white-space:pre-wrap;word-break:break-word">Loading…</pre>
+  </div>
+</div>
 </body>
 </html>

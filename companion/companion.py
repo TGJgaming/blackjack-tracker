@@ -5,6 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -118,7 +123,70 @@ def _draw_preview(
     return key not in (ord("q"), 27)
 
 
+LOG_PATH = COMPANION_DIR / "companion.log"
+PID_PATH = COMPANION_DIR / "companion.pid"
+
+
+class _TeeStream:
+    """Forwards print() output to both console (if attached) and companion.log (pythonw-safe)."""
+
+    def __init__(self, orig: Any, log_handler: RotatingFileHandler) -> None:
+        self._orig = orig
+        self._handler = log_handler
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+        if self._orig is not None:
+            try:
+                self._orig.write(data)
+            except Exception:
+                pass
+        for line in data.splitlines():
+            if line.strip():
+                rec = logging.LogRecord("bj_companion", logging.INFO, "", 0, line, (), None)
+                try:
+                    self._handler.emit(rec)
+                except Exception:
+                    pass
+        return len(data)
+
+    def flush(self) -> None:
+        if self._orig is not None:
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+        try:
+            self._handler.flush()
+        except Exception:
+            pass
+
+
+def _init_file_logging() -> None:
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    sys.stdout = _TeeStream(sys.stdout, handler)  # type: ignore[assignment]
+    sys.stderr = _TeeStream(sys.stderr, handler)  # type: ignore[assignment]
+
+
+def read_tail_logs(max_lines: int = 120) -> str:
+    if not LOG_PATH.exists():
+        return "(no logs yet)"
+    try:
+        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[-max(10, min(500, int(max_lines))):])
+    except Exception as exc:
+        return f"(failed reading log: {exc})"
+
+
 async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
+    stop_requested = False
+    restart_requested = False
+    try:
+        PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        pass
     detector = PlaytechDetector(cfg)
     sm = CompanionStateMachine(cfg)
     keepalive = WatchKeepaliveManager(cfg.keepalive)
@@ -600,6 +668,23 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
+        if mtype == "get_logs":
+            lines = int(msg.get("lines", 120))
+            return {"type": "companion_logs", "text": read_tail_logs(lines), "path": str(LOG_PATH)}
+
+        if mtype == "stop_companion":
+            nonlocal stop_requested
+            print("[Companion] Stop requested by tracker UI.")
+            stop_requested = True
+            return {"type": "companion_stopping", "action": "stop"}
+
+        if mtype == "restart_companion":
+            nonlocal restart_requested
+            print("[Companion] Restart requested by tracker UI.")
+            restart_requested = True
+            stop_requested = True
+            return {"type": "companion_stopping", "action": "restart"}
+
         return None
 
     def _on_ext_disconnect() -> None:
@@ -639,7 +724,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     next_felt_ts = next_hud_ts
 
     try:
-        while True:
+        while not stop_requested:
             now = time.monotonic()
             dt = max(1e-3, now - prev_tick)
             prev_tick = now
@@ -1042,9 +1127,29 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
             cv2.destroyAllWindows()
         capturer.close()
         await bridge.stop()
+        try:
+            PID_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if restart_requested:
+            flags = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+                if os.name == "nt"
+                else 0
+            )
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve())],
+                cwd=str(COMPANION_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                close_fds=True,
+            )
 
 
 def main() -> None:
+    _init_file_logging()
     parser = argparse.ArgumentParser(description="Playtech All Bets Blackjack local desktop companion.")
     parser.add_argument("--config", type=Path, help="Optional path to custom config.json")
     parser.add_argument("--preview", action="store_true", help="Show live annotated ROI/detection preview window")
