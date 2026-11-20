@@ -734,8 +734,10 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     )
 
     center_banner_roi = (0.34, 0.25, 0.32, 0.28)
+    loading_probe_roi = (0.12, 0.20, 0.76, 0.52)
     was_felt_armed = False
     last_pb_img = np.empty((0, 0, 3), dtype=np.uint8)
+    last_loading_img = np.empty((0, 0, 3), dtype=np.uint8)
     last_armed_diag_ts = 0.0
     last_armed_diag_sig = ""
     grab_failures = 0
@@ -903,6 +905,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                                 rois_to_grab["shoe_roi"] = cfg.rois["shoe_roi"]
                             if cfg.shoe_detect.enable_discard_fallback and "discard_roi" in cfg.rois:
                                 rois_to_grab["discard_roi"] = cfg.rois["discard_roi"]
+                        rois_to_grab["loading_probe"] = loading_probe_roi
                         if (need_center_probe and detector.is_center_scan_due(now, cards_active)) or keepalive.state in ("REFRESHING", "RECOVERING"):
                             rois_to_grab["center_probe"] = center_banner_roi
                         if felt_armed:
@@ -919,6 +922,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         last_shuffle_img = crops["shuffle_roi"]
                         last_banner_img = crops["banner_roi"]
                         last_pb_img = crops.get("place_bets_roi", empty)
+                        last_loading_img = crops.get("loading_probe", empty)
                         last_center_img = crops.get("center_probe", empty)
                         last_shoe_img = crops.get("shoe_roi", empty)
                         last_discard_img = crops.get("discard_roi", empty)
@@ -978,7 +982,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         last_shuffle_img,
                         last_player_img,
                         last_dealer_img,
-                        center_img=last_center_img,
+                        center_img=(last_loading_img if last_loading_img.size else last_center_img),
                         place_bets_img=last_pb_img,
                     )
                 )
