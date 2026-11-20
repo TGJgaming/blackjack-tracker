@@ -1062,6 +1062,8 @@ class ShoeSwapTracker:
         self._shoe_present_since: float | None = None
         self._shoe_confirmed_present: bool = False
         self._shoe_absent_since: float | None = None
+        self._shoe_absent_accum: float = 0.0
+        self._last_absent_tick: float | None = None
         self._shoe_occluded_since: float | None = None
         self._shoe_return_since: float | None = None
         self._shoe_swap_armed: bool = False
@@ -1084,6 +1086,8 @@ class ShoeSwapTracker:
         self._shoe_present_since = None
         self._shoe_confirmed_present = False
         self._shoe_absent_since = None
+        self._shoe_absent_accum = 0.0
+        self._last_absent_tick = None
         self._shoe_occluded_since = None
         self._shoe_return_since = None
         self._shoe_swap_armed = False
@@ -1101,6 +1105,8 @@ class ShoeSwapTracker:
     def on_undo_new_shoe(self, now: float) -> None:
         """Called when the user clicks Undo Auto-Reset: suppress re-triggering for cooldown_sec."""
         self._shoe_absent_since = None
+        self._shoe_absent_accum = 0.0
+        self._last_absent_tick = None
         self._shoe_occluded_since = None
         self._shoe_return_since = None
         self._shoe_swap_armed = False
@@ -1191,7 +1197,7 @@ class ShoeSwapTracker:
             else:
                 self._discard_empty_since = None
 
-        # --- 2. Primary: shoe_roi PRESENT -> ABSENT -> RETURNED ---
+        # --- 2. Primary (ALWAYS-ON across ALL stages): shoe_roi PRESENT -> ABSENT -> RETURNED ---
         if self.cfg.enable_shoe_roi and self.shoe_state:
             if self.shoe_state in ("ABSENT", "OCCLUDED"):
                 if self._shoe_disturb_since is None:
@@ -1203,6 +1209,8 @@ class ShoeSwapTracker:
 
             if self.shoe_state == "PRESENT":
                 self._shoe_absent_since = None
+                self._shoe_absent_accum = 0.0
+                self._last_absent_tick = None
                 self._shoe_occluded_since = None
                 if self._shoe_present_since is None:
                     self._shoe_present_since = now
@@ -1212,7 +1220,7 @@ class ShoeSwapTracker:
                 if self._shoe_swap_armed:
                     if self._shoe_return_since is None:
                         self._shoe_return_since = now
-                    elif (now - self._shoe_return_since) >= self.cfg.shoe_return_hold_sec and not has_active_cards:
+                    elif (now - self._shoe_return_since) >= self.cfg.shoe_return_hold_sec:
                         reason = "shoe_and_discard" if self._shoe_swap_corroborated else "shoe_swap"
                         self.last_trigger_reason = reason
                         self.reset_for_new_shoe(now)
@@ -1227,33 +1235,43 @@ class ShoeSwapTracker:
                 if self._shoe_confirmed_present and cards_seen >= self.cfg.shoe_min_cards:
                     if self._shoe_absent_since is None:
                         self._shoe_absent_since = now
+                        self._shoe_absent_accum = 0.0
+                        self._last_absent_tick = now
+                    else:
+                        if self._last_absent_tick is not None:
+                            self._shoe_absent_accum += min(1.5, max(0.0, now - self._last_absent_tick))
+                        self._last_absent_tick = now
                     absent_dur = now - self._shoe_absent_since
-                    if absent_dur >= self.cfg.shoe_absent_hold_sec:
+                    min_accum = min(1.0, self.cfg.shoe_absent_hold_sec * 0.45)
+                    if absent_dur >= self.cfg.shoe_absent_hold_sec and self._shoe_absent_accum >= min_accum:
                         self._shoe_swap_armed = True
                     elif discard_just_emptied and absent_dur >= self.cfg.shoe_corroborated_absent_sec:
                         self._shoe_swap_armed = True
                         self._shoe_swap_corroborated = True
-                    # Safety valve: shoe absent >= 12s and PLACE_BETS appeared (e.g. new shoe shifted off ROI)
-                    if (
-                        self._shoe_swap_armed
-                        and absent_dur >= self.cfg.shoe_absent_safety_sec
-                        and obs.banner_state == "PLACE_BETS"
-                        and not has_active_cards
-                    ):
+                    # Stage-independent safety valve: shoe absent >= safety_sec (e.g. new shoe shifted off ROI)
+                    if self._shoe_swap_armed and absent_dur >= self.cfg.shoe_absent_safety_sec:
                         reason = "shoe_and_discard" if self._shoe_swap_corroborated else "shoe_swap"
                         self.last_trigger_reason = reason
                         self.reset_for_new_shoe(now)
                         return reason
 
             elif self.shoe_state == "OCCLUDED":
-                # Tolerate brief dealer arm flicker while ABSENT; otherwise ignore occlusions
+                # Tolerate dealer hands/pit-boss crossing empty spot during swap without wiping absent timer
                 self._shoe_present_since = None
                 self._shoe_return_since = None
-                if self._shoe_absent_since is not None and not self._shoe_swap_armed:
+                self._last_absent_tick = None
+                if self._shoe_swap_armed and self._shoe_absent_since is not None:
+                    if (now - self._shoe_absent_since) >= self.cfg.shoe_absent_safety_sec:
+                        reason = "shoe_and_discard" if self._shoe_swap_corroborated else "shoe_swap"
+                        self.last_trigger_reason = reason
+                        self.reset_for_new_shoe(now)
+                        return reason
+                elif self._shoe_absent_since is not None:
                     if self._shoe_occluded_since is None:
                         self._shoe_occluded_since = now
                     elif (now - self._shoe_occluded_since) > self.cfg.shoe_max_flicker_sec:
                         self._shoe_absent_since = None
+                        self._shoe_absent_accum = 0.0
                         self._shoe_occluded_since = None
 
         # --- 3. Standalone Fallback: discard_roi peak -> empty (with cross-sensor shoe_roi veto & idle gap) ---

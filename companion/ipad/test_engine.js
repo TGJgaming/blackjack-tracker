@@ -2429,7 +2429,59 @@ console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks
   console.log("   Test 39 PASSED");
 }
 
-console.log("\nALL 39 ENGINE TESTS PASSED SUCCESSFULLY!");
+console.log("40. Testing live shoe NCC baseline, stage-independent trigger & calib_save_rois shoe_roi persistence...");
+{
+  const rt40 = new Engine.IpadCompanionRuntime({ onSavePack: () => {} });
+  rt40.detector._ensureBankDecoded("ui");
+  const pTpls = (rt40.detector.banks.ui || []).filter((t) => t.name && t.name.startsWith("SHOE_PRESENT_"));
+  const aTpls = (rt40.detector.banks.ui || []).filter((t) => t.name && t.name.startsWith("SHOE_ABSENT_"));
+  assert(pTpls.length >= 1 && aTpls.length >= 1, "Default pack must include SHOE_PRESENT and SHOE_ABSENT templates");
+  const pImg = pTpls[0].bgr;
+  const aImg = aTpls[0].bgr;
+
+  // 1. Lock live baseline over 2.0s on SHOE_PRESENT_1
+  for (const t of [0.0, 0.5, 1.0, 1.6, 2.0]) {
+    const r = rt40.detector._classifyShoeWithBaseline(pImg, pTpls, aTpls, t);
+    assert.strictEqual(r.state, "PRESENT", `Expected PRESENT while locking baseline at t=${t}`);
+  }
+  assert(rt40.detector._shoeRefGray && rt40.detector._shoeRefGray.length === 48 * 36, "Live shoe baseline must lock");
+
+  // 2. Dimmed betting overlay (0.65x brightness) stays PRESENT via brightness-invariant NCC
+  const dimmed = { w: pImg.w, h: pImg.h, c: 3, data: new Uint8Array(pImg.data.length) };
+  for (let i = 0; i < pImg.data.length; i++) dimmed.data[i] = Math.round(pImg.data[i] * 0.65);
+  assert.strictEqual(rt40.detector._classifyShoeWithBaseline(dimmed, pTpls, aTpls, 2.5).state, "PRESENT");
+
+  // 3. Shoe removed (SHOE_ABSENT_1 with dark backup shoe in top half) -> immediately ABSENT
+  assert.strictEqual(rt40.detector._classifyShoeWithBaseline(aImg, pTpls, aTpls, 3.0).state, "ABSENT");
+
+  // 4. Stage-independent trigger: mid-shoe join (cardsSeen=2), LAST_BETS / active cards, 2s OCCLUDED flicker
+  const tr40 = new Engine.ShoeSwapTracker();
+  assert.strictEqual(tr40.step({ ts: 0.0, shoe_state: "PRESENT", banner_state: "LAST_BETS" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: true }), null);
+  assert.strictEqual(tr40.step({ ts: 2.2, shoe_state: "PRESENT", banner_state: "LAST_BETS" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: true }), null);
+  assert.strictEqual(tr40.step({ ts: 3.0, shoe_state: "ABSENT", banner_state: "NO_MORE_BETS" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: false }), null);
+  assert.strictEqual(tr40.step({ ts: 4.0, shoe_state: "ABSENT" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: false }), null);
+  assert.strictEqual(tr40.step({ ts: 4.5, shoe_state: "OCCLUDED" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: false }), null);
+  assert.strictEqual(tr40.step({ ts: 6.2, shoe_state: "OCCLUDED" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: false }), null);
+  assert.strictEqual(tr40.step({ ts: 6.6, shoe_state: "ABSENT" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: false }), null);
+  assert.strictEqual(tr40._shoeSwapArmed, true, "Must stay armed across 2s OCCLUDED dealer-arm flicker");
+  assert.strictEqual(tr40.step({ ts: 7.0, shoe_state: "PRESENT" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: false }), null);
+  assert.strictEqual(tr40.step({ ts: 8.3, shoe_state: "PRESENT" }, { cardsSeen: 2, hasActiveCards: true, inBettingOverlay: false }), "shoe_swap");
+
+  // 5. calib_save_rois persists shoe_roi & discard_roi and resets shoe baseline
+  let savedReply = null;
+  const mockWs = { readyState: 1, onRawMessage: (r) => { savedReply = r; } };
+  rt40.handleClientMessage(mockWs, JSON.stringify({
+    type: "calib_save_rois",
+    rois: { shoe_roi: [0.70, 0.30, 0.20, 0.12], discard_roi: [0.05, 0.35, 0.18, 0.18] },
+  }));
+  assert(savedReply && savedReply.type === "calib_saved", "calib_save_rois must reply");
+  assert.deepStrictEqual(rt40.cfg.shoe_roi, [0.7, 0.3, 0.2, 0.12]);
+  assert.deepStrictEqual(rt40.cfg.discard_roi, [0.05, 0.35, 0.18, 0.18]);
+  assert.strictEqual(rt40.detector._shoeRefGray, null, "calib_save_rois must reset live shoe baseline");
+  console.log("   Test 40 PASSED");
+}
+
+console.log("\nALL 40 ENGINE TESTS PASSED SUCCESSFULLY!");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

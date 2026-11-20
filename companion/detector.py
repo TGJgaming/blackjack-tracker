@@ -120,6 +120,20 @@ def _felt_mask(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
     return teal | burgundy
 
 
+def _shoe_gray_48x36(shoe_img: np.ndarray) -> np.ndarray:
+    g = cv2.cvtColor(shoe_img, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(g, (48, 36), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
+def _ncc_flat(a: np.ndarray, b: np.ndarray) -> float:
+    am = a - float(a.mean())
+    bm = b - float(b.mean())
+    denom = float(np.sqrt(np.sum(am * am) * np.sum(bm * bm)))
+    if denom < 1e-6:
+        return 0.0
+    return float(np.sum(am * bm) / denom)
+
+
 def detect_shoe_state(
     shoe_img: np.ndarray | None,
     present_tpls: list[np.ndarray] | None = None,
@@ -127,29 +141,38 @@ def detect_shoe_state(
 ) -> tuple[str, float, float]:
     """Classify the right-side physical dealing shoe ROI into PRESENT | ABSENT | OCCLUDED.
 
-    Fuses optional SHOE_PRESENT / SHOE_ABSENT training templates with HSV dark/felt classification
-    (supporting both Playtech teal felt and Soho burgundy/red felt).
+    Fuses optional SHOE_PRESENT / SHOE_ABSENT training templates with full-ROI & bottom-half
+    HSV dark/felt classification (supporting Playtech teal felt, Soho burgundy felt, and ROIs
+    whose upper half includes a dark table rim or backup shoe).
     """
     if shoe_img is None or shoe_img.size == 0 or shoe_img.ndim != 3:
         return "", 0.0, 0.0
     hsv = cv2.cvtColor(shoe_img, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-    dark_frac = float(np.mean(v < 58))
-    felt_frac = float(np.mean(_felt_mask(h, s, v)))
+    dark_mask = v < 58
+    felt_mask = _felt_mask(h, s, v)
+    dark_frac = float(np.mean(dark_mask))
+    felt_frac = float(np.mean(felt_mask))
+    h_px = shoe_img.shape[0]
+    bot = slice(int(h_px * 0.48), h_px)
+    bot_dark = float(np.mean(dark_mask[bot])) if h_px >= 4 else dark_frac
+    bot_felt = float(np.mean(felt_mask[bot])) if h_px >= 4 else felt_frac
 
     p_tpls = _get_ui_templates("SHOE_PRESENT_") if present_tpls is None else present_tpls
     a_tpls = _get_ui_templates("SHOE_ABSENT_") if absent_tpls is None else absent_tpls
     p_conf = _match_ui_templates(shoe_img, p_tpls) if p_tpls else 0.0
     a_conf = _match_ui_templates(shoe_img, a_tpls) if a_tpls else 0.0
 
-    if a_conf >= 0.82 and a_conf >= p_conf + 0.12 and felt_frac >= 0.25:
+    if a_conf >= 0.72 and a_conf >= p_conf + 0.08 and (felt_frac >= 0.25 or bot_felt >= 0.45):
         state = "ABSENT"
-    elif p_conf >= 0.78 and p_conf >= a_conf + 0.10 and dark_frac >= 0.25:
+    elif p_conf >= 0.70 and p_conf >= a_conf + 0.08 and dark_frac >= 0.22:
         state = "PRESENT"
-    elif dark_frac >= 0.36 and felt_frac <= 0.56:
-        state = "PRESENT"
-    elif dark_frac <= 0.24 and felt_frac >= 0.50:
+    elif dark_frac <= 0.24 and felt_frac >= 0.45:
         state = "ABSENT"
+    elif bot_felt >= 0.65 and bot_dark <= 0.22 and felt_frac >= 0.35 and p_conf < 0.70:
+        state = "ABSENT"
+    elif dark_frac >= 0.28 and felt_frac <= 0.62:
+        state = "PRESENT"
     else:
         state = "OCCLUDED"
     return state, round(dark_frac, 4), round(felt_frac, 4)
@@ -2682,7 +2705,7 @@ class PlaytechDetector:
         ):
             self._last_shoe_scan_ts = now
             if shoe_img is not None and shoe_img.size:
-                shoe_state, shoe_dark, shoe_teal = detect_shoe_state(shoe_img)
+                shoe_state, shoe_dark, shoe_teal = self._classify_shoe_with_baseline(shoe_img, now)
                 self._cached_shoe = (shoe_state, shoe_dark, shoe_teal)
             if discard_img is not None and discard_img.size:
                 disc_white, disc_dark, disc_teal = detect_discard_stack(discard_img)
@@ -2714,3 +2737,88 @@ class PlaytechDetector:
             discard_dark_frac=disc_dark,
             discard_teal_frac=disc_teal,
         )
+
+    def reset_shoe_baseline(self) -> None:
+        """Clear the live resting-shoe reference (called on new_shoe or ROI recalibration)."""
+        self._shoe_ref_gray: np.ndarray | None = None
+        self._shoe_ref_dark: float = 0.0
+        self._shoe_ref_felt: float = 0.0
+        self._shoe_ref_bot_dark: float = 0.0
+        self._shoe_ref_bot_felt: float = 0.0
+        self._shoe_prev_gray: np.ndarray | None = None
+        self._shoe_still_since: float | None = None
+        self._shoe_new_present_since: float | None = None
+
+    def _classify_shoe_with_baseline(
+        self, shoe_img: np.ndarray, now: float
+    ) -> tuple[str, float, float]:
+        """Classify shoe_roi using both stateless template/HSV cues and a live resting-shoe NCC baseline.
+
+        Because NCC is invariant to uniform brightness/contrast shifts (e.g. dimmed betting overlays),
+        the live baseline reliably stays PRESENT while the shoe sits in place and immediately flags
+        ABSENT when the shoe leaves its spot — even if a dark table rim or backup shoe sits in the
+        upper half of shoe_roi.
+        """
+        st, dark_frac, felt_frac = detect_shoe_state(shoe_img)
+        cur_gray = _shoe_gray_48x36(shoe_img)
+        hsv = cv2.cvtColor(shoe_img, cv2.COLOR_BGR2HSV)
+        h_px = shoe_img.shape[0]
+        bot = slice(int(h_px * 0.48), h_px)
+        bot_dark = float(np.mean(hsv[bot, :, 2] < 58)) if h_px >= 4 else dark_frac
+        bot_felt = float(np.mean(_felt_mask(hsv[bot, :, 0], hsv[bot, :, 1], hsv[bot, :, 2]))) if h_px >= 4 else felt_frac
+
+        prev_gray = getattr(self, "_shoe_prev_gray", None)
+        frame_ncc = _ncc_flat(cur_gray, prev_gray) if prev_gray is not None else 1.0
+        self._shoe_prev_gray = cur_gray
+
+        if frame_ncc >= 0.88:
+            if getattr(self, "_shoe_still_since", None) is None:
+                self._shoe_still_since = now
+        else:
+            self._shoe_still_since = None
+
+        ref_gray = getattr(self, "_shoe_ref_gray", None)
+        still_dur = (now - self._shoe_still_since) if self._shoe_still_since is not None else 0.0
+
+        # Lock baseline once the shoe sits still in shoe_roi for >= 1.5s
+        if ref_gray is None:
+            if still_dur >= 1.5 and (st == "PRESENT" or (dark_frac >= 0.22 and st != "ABSENT")):
+                self._shoe_ref_gray = cur_gray.copy()
+                self._shoe_ref_dark = dark_frac
+                self._shoe_ref_felt = felt_frac
+                self._shoe_ref_bot_dark = bot_dark
+                self._shoe_ref_bot_felt = bot_felt
+                st = "PRESENT"
+            return st, dark_frac, felt_frac
+
+        ref_ncc = _ncc_flat(cur_gray, ref_gray)
+        if ref_ncc >= 0.72:
+            self._shoe_new_present_since = None
+            if frame_ncc >= 0.92:
+                self._shoe_ref_gray = 0.98 * ref_gray + 0.02 * cur_gray
+                self._shoe_ref_dark = 0.98 * self._shoe_ref_dark + 0.02 * dark_frac
+                self._shoe_ref_felt = 0.98 * self._shoe_ref_felt + 0.02 * felt_frac
+                self._shoe_ref_bot_dark = 0.98 * self._shoe_ref_bot_dark + 0.02 * bot_dark
+                self._shoe_ref_bot_felt = 0.98 * self._shoe_ref_bot_felt + 0.02 * bot_felt
+            return "PRESENT", dark_frac, felt_frac
+
+        if ref_ncc < 0.52:
+            felt_rose = (felt_frac >= self._shoe_ref_felt + 0.12) or (bot_felt >= self._shoe_ref_bot_felt + 0.15)
+            dark_dropped = (dark_frac <= self._shoe_ref_dark - 0.12) or (bot_dark <= self._shoe_ref_bot_dark - 0.15)
+            empty_still = (ref_ncc < 0.38) and (frame_ncc >= 0.82) and (felt_frac >= 0.20 or bot_felt >= 0.35)
+            if st == "ABSENT" or felt_rose or dark_dropped or empty_still:
+                self._shoe_new_present_since = None
+                return "ABSENT", dark_frac, felt_frac
+            # New shoe placed back down at a slightly shifted angle/position
+            if st == "PRESENT" and frame_ncc >= 0.88:
+                if getattr(self, "_shoe_new_present_since", None) is None:
+                    self._shoe_new_present_since = now
+                elif (now - self._shoe_new_present_since) >= 1.0:
+                    return "PRESENT", dark_frac, felt_frac
+            else:
+                self._shoe_new_present_since = None
+            return "OCCLUDED", dark_frac, felt_frac
+
+        self._shoe_new_present_since = None
+        return st, dark_frac, felt_frac
+

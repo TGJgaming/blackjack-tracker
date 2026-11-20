@@ -132,12 +132,12 @@
           enable_shoe_roi: true,
           enable_discard_fallback: true,
           shoe_present_hold_sec: 2.0,
-          shoe_absent_hold_sec: 3.5,
-          shoe_return_hold_sec: 1.5,
-          shoe_corroborated_absent_sec: 1.8,
-          shoe_max_flicker_sec: 0.7,
-          shoe_absent_safety_sec: 12.0,
-          shoe_min_cards: 15,
+          shoe_absent_hold_sec: 2.5,
+          shoe_return_hold_sec: 1.2,
+          shoe_corroborated_absent_sec: 1.5,
+          shoe_max_flicker_sec: 4.0,
+          shoe_absent_safety_sec: 10.0,
+          shoe_min_cards: 1,
           discard_peak_white_min: 0.025,
           discard_peak_hold_sec: 4.0,
           discard_empty_white_max: 0.007,
@@ -3111,33 +3111,79 @@
     return best;
   }
 
+  function _shoeGray48x36(shoeImg) {
+    const g = toGray(resizeImage(shoeImg, 48, 36));
+    const out = new Float32Array(g.data.length);
+    for (let i = 0; i < g.data.length; i++) out[i] = g.data[i];
+    return out;
+  }
+
+  function _nccFlat(a, b) {
+    if (!a || !b || a.length !== b.length || a.length === 0) return 0.0;
+    const n = a.length;
+    let ma = 0.0, mb = 0.0;
+    for (let i = 0; i < n; i++) { ma += a[i]; mb += b[i]; }
+    ma /= n; mb /= n;
+    let num = 0.0, da = 0.0, db = 0.0;
+    for (let i = 0; i < n; i++) {
+      const xa = a[i] - ma;
+      const xb = b[i] - mb;
+      num += xa * xb;
+      da += xa * xa;
+      db += xb * xb;
+    }
+    const denom = Math.sqrt(da * db);
+    return denom < 1e-6 ? 0.0 : num / denom;
+  }
+
   function detectShoeState(shoeImg, presentTpls = null, absentTpls = null) {
     if (!shoeImg || shoeImg.w === 0 || shoeImg.h === 0 || shoeImg.c !== 3) {
-      return { state: "", darkFrac: 0.0, tealFrac: 0.0 };
+      return { state: "", darkFrac: 0.0, tealFrac: 0.0, botDarkFrac: 0.0, botFeltFrac: 0.0 };
     }
-    const n = shoeImg.w * shoeImg.h;
+    const w = shoeImg.w;
+    const h = shoeImg.h;
+    const n = w * h;
     const d = shoeImg.data;
+    const botY = Math.floor(h * 0.48);
     let darkCnt = 0;
     let feltCnt = 0;
-    for (let i = 0; i < n; i++) {
-      const o = i * 3;
-      const [h, s, v] = _bgrToHsvOpenCv(d[o], d[o + 1], d[o + 2]);
-      if (v < 58) darkCnt++;
-      if (_isFeltPixelHsv(h, s, v)) feltCnt++;
+    let botDarkCnt = 0;
+    let botFeltCnt = 0;
+    let botTotal = 0;
+    for (let y = 0; y < h; y++) {
+      const inBot = y >= botY;
+      for (let x = 0; x < w; x++) {
+        const o = (y * w + x) * 3;
+        const [hv, sv, vv] = _bgrToHsvOpenCv(d[o], d[o + 1], d[o + 2]);
+        const isDark = vv < 58;
+        const isFelt = _isFeltPixelHsv(hv, sv, vv);
+        if (isDark) darkCnt++;
+        if (isFelt) feltCnt++;
+        if (inBot) {
+          botTotal++;
+          if (isDark) botDarkCnt++;
+          if (isFelt) botFeltCnt++;
+        }
+      }
     }
     const darkFrac = darkCnt / n;
     const feltFrac = feltCnt / n;
+    const botDarkFrac = botTotal > 0 ? botDarkCnt / botTotal : darkFrac;
+    const botFeltFrac = botTotal > 0 ? botFeltCnt / botTotal : feltFrac;
     const pConf = presentTpls && presentTpls.length ? _matchUiTemplatesJs(shoeImg, presentTpls) : 0.0;
     const aConf = absentTpls && absentTpls.length ? _matchUiTemplatesJs(shoeImg, absentTpls) : 0.0;
     let state = "OCCLUDED";
-    if (aConf >= 0.82 && aConf >= pConf + 0.12 && feltFrac >= 0.25) state = "ABSENT";
-    else if (pConf >= 0.78 && pConf >= aConf + 0.10 && darkFrac >= 0.25) state = "PRESENT";
-    else if (darkFrac >= 0.36 && feltFrac <= 0.56) state = "PRESENT";
-    else if (darkFrac <= 0.24 && feltFrac >= 0.50) state = "ABSENT";
+    if (aConf >= 0.72 && aConf >= pConf + 0.08 && (feltFrac >= 0.25 || botFeltFrac >= 0.45)) state = "ABSENT";
+    else if (pConf >= 0.70 && pConf >= aConf + 0.08 && darkFrac >= 0.22) state = "PRESENT";
+    else if (darkFrac <= 0.24 && feltFrac >= 0.45) state = "ABSENT";
+    else if (botFeltFrac >= 0.65 && botDarkFrac <= 0.22 && feltFrac >= 0.35 && pConf < 0.70) state = "ABSENT";
+    else if (darkFrac >= 0.28 && feltFrac <= 0.62) state = "PRESENT";
     return {
       state,
       darkFrac: Number(darkFrac.toFixed(4)),
       tealFrac: Number(feltFrac.toFixed(4)),
+      botDarkFrac: Number(botDarkFrac.toFixed(4)),
+      botFeltFrac: Number(botFeltFrac.toFixed(4)),
     };
   }
 
@@ -3687,7 +3733,7 @@
           return this._fallbackUiPrefixCache[prefix];
         };
         if (shoeImg && shoeImg.w > 0 && shoeImg.h > 0) {
-          shoeRes = detectShoeState(shoeImg, getUiPrefix("SHOE_PRESENT_"), getUiPrefix("SHOE_ABSENT_"));
+          shoeRes = this._classifyShoeWithBaseline(shoeImg, getUiPrefix("SHOE_PRESENT_"), getUiPrefix("SHOE_ABSENT_"), now);
           this._cachedShoe = shoeRes;
         }
         if (discardImg && discardImg.w > 0 && discardImg.h > 0) {
@@ -3722,6 +3768,80 @@
         discard_dark_frac: discRes.darkFrac,
         discard_teal_frac: discRes.tealFrac,
       };
+    }
+
+    resetShoeBaseline() {
+      this._shoeRefGray = null;
+      this._shoeRefDark = 0.0;
+      this._shoeRefFelt = 0.0;
+      this._shoeRefBotDark = 0.0;
+      this._shoeRefBotFelt = 0.0;
+      this._shoePrevGray = null;
+      this._shoeStillSince = null;
+      this._shoeNewPresentSince = null;
+    }
+
+    _classifyShoeWithBaseline(shoeImg, presentTpls, absentTpls, now) {
+      const res = detectShoeState(shoeImg, presentTpls, absentTpls);
+      const curGray = _shoeGray48x36(shoeImg);
+      const prevGray = this._shoePrevGray || null;
+      const frameNcc = prevGray ? _nccFlat(curGray, prevGray) : 1.0;
+      this._shoePrevGray = curGray;
+
+      if (frameNcc >= 0.88) {
+        if (this._shoeStillSince == null) this._shoeStillSince = now;
+      } else {
+        this._shoeStillSince = null;
+      }
+
+      const stillDur = this._shoeStillSince != null ? (now - this._shoeStillSince) : 0.0;
+      if (!this._shoeRefGray) {
+        if (stillDur >= 1.5 && (res.state === "PRESENT" || (res.darkFrac >= 0.22 && res.state !== "ABSENT"))) {
+          this._shoeRefGray = new Float32Array(curGray);
+          this._shoeRefDark = res.darkFrac;
+          this._shoeRefFelt = res.tealFrac;
+          this._shoeRefBotDark = res.botDarkFrac;
+          this._shoeRefBotFelt = res.botFeltFrac;
+          return { state: "PRESENT", darkFrac: res.darkFrac, tealFrac: res.tealFrac };
+        }
+        return { state: res.state, darkFrac: res.darkFrac, tealFrac: res.tealFrac };
+      }
+
+      const refNcc = _nccFlat(curGray, this._shoeRefGray);
+      if (refNcc >= 0.72) {
+        this._shoeNewPresentSince = null;
+        if (frameNcc >= 0.92) {
+          const ref = this._shoeRefGray;
+          for (let i = 0; i < ref.length; i++) ref[i] = 0.98 * ref[i] + 0.02 * curGray[i];
+          this._shoeRefDark = 0.98 * this._shoeRefDark + 0.02 * res.darkFrac;
+          this._shoeRefFelt = 0.98 * this._shoeRefFelt + 0.02 * res.tealFrac;
+          this._shoeRefBotDark = 0.98 * this._shoeRefBotDark + 0.02 * res.botDarkFrac;
+          this._shoeRefBotFelt = 0.98 * this._shoeRefBotFelt + 0.02 * res.botFeltFrac;
+        }
+        return { state: "PRESENT", darkFrac: res.darkFrac, tealFrac: res.tealFrac };
+      }
+
+      if (refNcc < 0.52) {
+        const feltRose = (res.tealFrac >= this._shoeRefFelt + 0.12) || (res.botFeltFrac >= this._shoeRefBotFelt + 0.15);
+        const darkDropped = (res.darkFrac <= this._shoeRefDark - 0.12) || (res.botDarkFrac <= this._shoeRefBotDark - 0.15);
+        const emptyStill = (refNcc < 0.38) && (frameNcc >= 0.82) && (res.tealFrac >= 0.20 || res.botFeltFrac >= 0.35);
+        if (res.state === "ABSENT" || feltRose || darkDropped || emptyStill) {
+          this._shoeNewPresentSince = null;
+          return { state: "ABSENT", darkFrac: res.darkFrac, tealFrac: res.tealFrac };
+        }
+        if (res.state === "PRESENT" && frameNcc >= 0.88) {
+          if (this._shoeNewPresentSince == null) this._shoeNewPresentSince = now;
+          else if ((now - this._shoeNewPresentSince) >= 1.0) {
+            return { state: "PRESENT", darkFrac: res.darkFrac, tealFrac: res.tealFrac };
+          }
+        } else {
+          this._shoeNewPresentSince = null;
+        }
+        return { state: "OCCLUDED", darkFrac: res.darkFrac, tealFrac: res.tealFrac };
+      }
+
+      this._shoeNewPresentSince = null;
+      return { state: res.state, darkFrac: res.darkFrac, tealFrac: res.tealFrac };
     }
   }
 
@@ -3985,12 +4105,12 @@
           enable_shoe_roi: true,
           enable_discard_fallback: true,
           shoe_present_hold_sec: 2.0,
-          shoe_absent_hold_sec: 3.5,
-          shoe_return_hold_sec: 1.5,
-          shoe_corroborated_absent_sec: 1.8,
-          shoe_max_flicker_sec: 0.7,
-          shoe_absent_safety_sec: 12.0,
-          shoe_min_cards: 15,
+          shoe_absent_hold_sec: 2.5,
+          shoe_return_hold_sec: 1.2,
+          shoe_corroborated_absent_sec: 1.5,
+          shoe_max_flicker_sec: 4.0,
+          shoe_absent_safety_sec: 10.0,
+          shoe_min_cards: 1,
           discard_peak_white_min: 0.025,
           discard_peak_hold_sec: 4.0,
           discard_empty_white_max: 0.007,
@@ -4013,6 +4133,8 @@
       this._shoePresentSince = null;
       this._shoeConfirmedPresent = false;
       this._shoeAbsentSince = null;
+      this._shoeAbsentAccum = 0.0;
+      this._lastAbsentTick = null;
       this._shoeOccludedSince = null;
       this._shoeReturnSince = null;
       this._shoeSwapArmed = false;
@@ -4034,6 +4156,8 @@
       this._shoePresentSince = null;
       this._shoeConfirmedPresent = false;
       this._shoeAbsentSince = null;
+      this._shoeAbsentAccum = 0.0;
+      this._lastAbsentTick = null;
       this._shoeOccludedSince = null;
       this._shoeReturnSince = null;
       this._shoeSwapArmed = false;
@@ -4051,6 +4175,8 @@
 
     onUndoNewShoe(now) {
       this._shoeAbsentSince = null;
+      this._shoeAbsentAccum = 0.0;
+      this._lastAbsentTick = null;
       this._shoeOccludedSince = null;
       this._shoeReturnSince = null;
       this._shoeSwapArmed = false;
@@ -4127,6 +4253,7 @@
         }
       }
 
+      // Primary (ALWAYS-ON across ALL stages): shoe_roi PRESENT -> ABSENT -> RETURNED
       if (this.cfg.enable_shoe_roi && this.shoeState) {
         if (this.shoeState === "ABSENT" || this.shoeState === "OCCLUDED") {
           if (this._shoeDisturbSince === null) this._shoeDisturbSince = now;
@@ -4137,6 +4264,8 @@
 
         if (this.shoeState === "PRESENT") {
           this._shoeAbsentSince = null;
+          this._shoeAbsentAccum = 0.0;
+          this._lastAbsentTick = null;
           this._shoeOccludedSince = null;
           if (this._shoePresentSince === null) this._shoePresentSince = now;
           else if ((now - this._shoePresentSince) >= this.cfg.shoe_present_hold_sec) {
@@ -4144,7 +4273,7 @@
           }
           if (this._shoeSwapArmed) {
             if (this._shoeReturnSince === null) this._shoeReturnSince = now;
-            else if ((now - this._shoeReturnSince) >= this.cfg.shoe_return_hold_sec && !hasActiveCards) {
+            else if ((now - this._shoeReturnSince) >= this.cfg.shoe_return_hold_sec) {
               const reason = this._shoeSwapCorroborated ? "shoe_and_discard" : "shoe_swap";
               this.lastTriggerReason = reason;
               this.resetForNewShoe(now);
@@ -4158,20 +4287,25 @@
           this._shoeReturnSince = null;
           this._shoeOccludedSince = null;
           if (this._shoeConfirmedPresent && cardsSeen >= this.cfg.shoe_min_cards) {
-            if (this._shoeAbsentSince === null) this._shoeAbsentSince = now;
+            if (this._shoeAbsentSince === null) {
+              this._shoeAbsentSince = now;
+              this._shoeAbsentAccum = 0.0;
+              this._lastAbsentTick = now;
+            } else {
+              if (this._lastAbsentTick !== null) {
+                this._shoeAbsentAccum += Math.min(1.5, Math.max(0.0, now - this._lastAbsentTick));
+              }
+              this._lastAbsentTick = now;
+            }
             const absentDur = now - this._shoeAbsentSince;
-            if (absentDur >= this.cfg.shoe_absent_hold_sec) {
+            const minAccum = Math.min(1.0, this.cfg.shoe_absent_hold_sec * 0.45);
+            if (absentDur >= this.cfg.shoe_absent_hold_sec && this._shoeAbsentAccum >= minAccum) {
               this._shoeSwapArmed = true;
             } else if (discardJustEmptied && absentDur >= this.cfg.shoe_corroborated_absent_sec) {
               this._shoeSwapArmed = true;
               this._shoeSwapCorroborated = true;
             }
-            if (
-              this._shoeSwapArmed &&
-              absentDur >= this.cfg.shoe_absent_safety_sec &&
-              obs.banner_state === "PLACE_BETS" &&
-              !hasActiveCards
-            ) {
+            if (this._shoeSwapArmed && absentDur >= this.cfg.shoe_absent_safety_sec) {
               const reason = this._shoeSwapCorroborated ? "shoe_and_discard" : "shoe_swap";
               this.lastTriggerReason = reason;
               this.resetForNewShoe(now);
@@ -4181,10 +4315,19 @@
         } else if (this.shoeState === "OCCLUDED") {
           this._shoePresentSince = null;
           this._shoeReturnSince = null;
-          if (this._shoeAbsentSince !== null && !this._shoeSwapArmed) {
+          this._lastAbsentTick = null;
+          if (this._shoeSwapArmed && this._shoeAbsentSince !== null) {
+            if ((now - this._shoeAbsentSince) >= this.cfg.shoe_absent_safety_sec) {
+              const reason = this._shoeSwapCorroborated ? "shoe_and_discard" : "shoe_swap";
+              this.lastTriggerReason = reason;
+              this.resetForNewShoe(now);
+              return reason;
+            }
+          } else if (this._shoeAbsentSince !== null) {
             if (this._shoeOccludedSince === null) this._shoeOccludedSince = now;
             else if ((now - this._shoeOccludedSince) > this.cfg.shoe_max_flicker_sec) {
               this._shoeAbsentSince = null;
+              this._shoeAbsentAccum = 0.0;
               this._shoeOccludedSince = null;
             }
           }
@@ -6445,6 +6588,9 @@
         this.sm._flushPendingAutoWatch(events);
       }
       const allEvents = [...events, ...kaEvents];
+      if (allEvents.some((ev) => ev && ev.type === "new_shoe") && typeof this.detector.resetShoeBaseline === "function") {
+        this.detector.resetShoeBaseline();
+      }
       for (const ev of allEvents) {
         this.broadcast(ev);
       }
@@ -6499,6 +6645,8 @@
           banner_roi: this.cfg.banner_roi,
           place_bets_roi: this.cfg.place_bets_roi,
           shuffle_roi: this.cfg.shuffle_roi,
+          shoe_roi: this.cfg.shoe_roi,
+          discard_roi: this.cfg.discard_roi,
         },
         templates: this.detector.listTemplateCounts(),
         reloadBtnOffset: this.cfg.reload_btn_client_offset,
@@ -6618,9 +6766,12 @@
       }
       if (mtype === "calib_save_rois") {
         const rois = msg.rois || {};
-        for (const k of ["player_strip", "dealer_strip", "community_roi", "dealer_felt_roi", "banner_roi", "place_bets_roi", "shuffle_roi"]) {
+        if (!this.cfg.rois || typeof this.cfg.rois !== "object") this.cfg.rois = {};
+        for (const k of ["player_strip", "dealer_strip", "community_roi", "dealer_felt_roi", "banner_roi", "place_bets_roi", "shuffle_roi", "shoe_roi", "discard_roi"]) {
           if (Array.isArray(rois[k]) && rois[k].length === 4) {
-            this.cfg[k] = normalizeRoi(rois[k]);
+            const norm = normalizeRoi(rois[k]);
+            this.cfg[k] = norm;
+            this.cfg.rois[k] = norm;
           }
         }
         if (["ipad_split_left", "game_viewport", "window"].includes(msg.anchorMode)) {
@@ -6629,6 +6780,7 @@
         }
         this.smoother.reset();
         this.detector.invalidateCaches();
+        if (typeof this.detector.resetShoeBaseline === "function") this.detector.resetShoeBaseline();
         this.persistPack();
         reply({
           type: "calib_saved",
@@ -6641,6 +6793,8 @@
             banner_roi: this.cfg.banner_roi,
             place_bets_roi: this.cfg.place_bets_roi,
             shuffle_roi: this.cfg.shuffle_roi,
+            shoe_roi: this.cfg.shoe_roi,
+            discard_roi: this.cfg.discard_roi,
           },
           anchorMode: this.cfg.anchor_mode,
           frameRotation: normalizeRotationDeg(this.cfg.frame_rotation || 0),
@@ -6733,6 +6887,8 @@
               banner_roi: this.cfg.banner_roi,
               place_bets_roi: this.cfg.place_bets_roi,
               shuffle_roi: this.cfg.shuffle_roi,
+              shoe_roi: this.cfg.shoe_roi,
+              discard_roi: this.cfg.discard_roi,
             },
             anchorMode: this.cfg.anchor_mode,
             frameRotation: this.cfg.frame_rotation,
