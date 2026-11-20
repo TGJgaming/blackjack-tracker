@@ -2654,6 +2654,17 @@ def test_playtech_loading_screen_detection_and_crop_fallback() -> None:
     sharp_blue[:140, :] = rng.integers(30, 225, size=(140, 600, 3), dtype=np.uint8)
     assert detect_loading_screen(sharp_blue) is False
 
+    # 5. Real LOADING_ALLBETS_1.png template match works even on a non-blue background
+    from pathlib import Path
+    tpl_path = Path(__file__).resolve().parent.parent / "templates" / "ui" / "LOADING_ALLBETS_1.png"
+    tpl_bgr = cv2.imread(str(tpl_path))
+    assert tpl_bgr is not None and tpl_bgr.size > 0
+    non_blue = np.full((556, 325, 3), (40, 45, 50), dtype=np.uint8)
+    th, tw = tpl_bgr.shape[:2]
+    non_blue[206 : 206 + th, 98 : 98 + tw] = tpl_bgr
+    assert detect_loading_screen(non_blue) is True
+    assert detect_loading_screen_crops(non_blue[0:60, :], non_blue[380:460, :], center_img=non_blue[160:280, 60:260]) is True
+
 
 
 

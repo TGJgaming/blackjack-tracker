@@ -875,8 +875,54 @@ class FeltBurstMonitor:
         return None
 
 
-def detect_loading_screen(anchor_bgr: np.ndarray) -> bool:
-    """Detect Playtech reload/loading splash screens (uniform blank flash or blurred-blue splash + logo/bar)."""
+_LOADING_TPLS_CACHE: list[np.ndarray] | None = None
+
+
+def _get_loading_templates() -> list[np.ndarray]:
+    global _LOADING_TPLS_CACHE
+    if _LOADING_TPLS_CACHE is not None:
+        return _LOADING_TPLS_CACHE
+    ui_dir = Path(__file__).resolve().parent / "templates" / "ui"
+    tpls: list[np.ndarray] = []
+    if ui_dir.exists():
+        for p in sorted(ui_dir.glob("LOADING_ALLBETS*.png")):
+            im = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            if im is not None and im.size > 0:
+                tpls.append(im)
+    _LOADING_TPLS_CACHE = tpls
+    return tpls
+
+
+def _match_loading_logo(band_bgr: np.ndarray, loading_tpls: list[np.ndarray] | None = None) -> bool:
+    if band_bgr is None or band_bgr.size == 0 or band_bgr.ndim != 3:
+        return False
+    tpls = _get_loading_templates() if loading_tpls is None else loading_tpls
+    if not tpls:
+        return False
+    bh, bw = band_bgr.shape[:2]
+    if bh < 16 or bw < 20:
+        return False
+    nh = 100
+    nw = max(40, int(round(bw * (nh / float(bh)))))
+    band_g = cv2.resize(cv2.cvtColor(band_bgr, cv2.COLOR_BGR2GRAY), (nw, nh), interpolation=cv2.INTER_AREA)
+    for tpl_g in tpls:
+        if tpl_g.shape[0] < 4 or tpl_g.shape[1] < 8:
+            continue
+        for sc in (0.30, 0.34, 0.38, 0.42, 0.48, 0.56, 0.65, 0.78, 0.92, 1.08):
+            sw = max(12, int(round(tpl_g.shape[1] * sc)))
+            sh = max(6, int(round(tpl_g.shape[0] * sc)))
+            if sw > nw or sh > nh:
+                continue
+            st = cv2.resize(tpl_g, (sw, sh), interpolation=cv2.INTER_AREA if sc < 1.0 else cv2.INTER_CUBIC)
+            res = cv2.matchTemplate(band_g, st, cv2.TM_CCOEFF_NORMED)
+            _, mv, _, _ = cv2.minMaxLoc(res)
+            if np.isfinite(mv) and float(mv) >= 0.72:
+                return True
+    return False
+
+
+def detect_loading_screen(anchor_bgr: np.ndarray, loading_tpls: list[np.ndarray] | None = None) -> bool:
+    """Detect Playtech reload/loading splash screens (uniform blank flash, ALL BETS logo template, or blurred-blue splash)."""
     if anchor_bgr is None or anchor_bgr.size == 0 or anchor_bgr.ndim != 3:
         return False
     h, w = anchor_bgr.shape[:2]
@@ -892,7 +938,12 @@ def detect_loading_screen(anchor_bgr: np.ndarray) -> bool:
     if float(np.std(gray[:core_h, :])) < 8.5:
         return True
 
-    # 2. Playtech blurred-blue loading splash: cool blue wash (B > G, B - R > 14, B >= 45) + heavily blurred top + splash sig
+    # 2. Reliable template match for the Playtech "ALL BETS" loading logo in center band [x:0.10..0.90, y:0.25..0.68]
+    band = anchor_bgr[int(h * 0.25) : int(h * 0.68), int(w * 0.10) : int(w * 0.90)]
+    if _match_loading_logo(band, loading_tpls=loading_tpls):
+        return True
+
+    # 3. Playtech blurred-blue loading splash fallback: cool blue wash (B > G, B - R > 14, B >= 45) + blurred top + splash sig
     core = sm[:core_h, :]
     cb = core[:, :, 0].astype(np.int16)
     cg = core[:, :, 1].astype(np.int16)
@@ -943,9 +994,17 @@ def detect_loading_screen(anchor_bgr: np.ndarray) -> bool:
 
 
 def detect_loading_screen_crops(
-    shuffle_img: np.ndarray, player_img: np.ndarray, dealer_img: np.ndarray | None = None
+    shuffle_img: np.ndarray,
+    player_img: np.ndarray,
+    dealer_img: np.ndarray | None = None,
+    center_img: np.ndarray | None = None,
+    place_bets_img: np.ndarray | None = None,
+    loading_tpls: list[np.ndarray] | None = None,
 ) -> bool:
-    """Lightweight loading-screen check from tight ROI crops when full anchor image is not captured."""
+    """Loading-screen check from tight ROI crops (template match on center/place_bets + uniform/blue-blur fallback)."""
+    for probe in (center_img, place_bets_img):
+        if probe is not None and probe.size > 0 and _match_loading_logo(probe, loading_tpls=loading_tpls):
+            return True
     if shuffle_img is None or shuffle_img.size == 0 or player_img is None or player_img.size == 0:
         return False
     if float(np.std(shuffle_img)) < 8.5 and float(np.std(player_img)) < 8.5:
