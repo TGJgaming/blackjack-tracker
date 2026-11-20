@@ -890,7 +890,14 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                             "banner_roi": cfg.rois["banner_roi"],
                         }
                         if "place_bets_roi" in cfg.rois:
-                            rois_to_grab["place_bets_roi"] = cfg.rois["place_bets_roi"]
+                            prx, pry, prw, prh = cfg.rois["place_bets_roi"]
+                            if prh < 0.07:
+                                pry = max(0.0, pry - (0.075 - prh) * 0.5)
+                                prh = 0.075
+                            if prw < 0.22:
+                                prx = max(0.0, prx - (0.22 - prw) * 0.5)
+                                prw = 0.22
+                            rois_to_grab["place_bets_roi"] = (prx, pry, min(1.0 - prx, prw), min(1.0 - pry, prh))
                         if cfg.shoe_detect.enabled:
                             if cfg.shoe_detect.enable_shoe_roi and "shoe_roi" in cfg.rois:
                                 rois_to_grab["shoe_roi"] = cfg.rois["shoe_roi"]

@@ -1646,6 +1646,7 @@ _TOP_BANNER_SCALES = (
 )
 _CENTER_BANNER_SCALES = (0.75, 0.88, 0.95, 1.0, 1.12, 1.25, 1.45, 1.65, 1.85, 2.05, 2.35)
 _PLACE_BETS_SCALES = (
+    0.45, 0.52, 0.60, 0.65,
     0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.12, 1.20,
     1.28, 1.36, 1.45, 1.56, 1.68, 1.80, 1.85, 1.95, 2.08, 2.25, 2.45,
 )
@@ -2446,7 +2447,7 @@ class PlaytechDetector:
                         pb_conf, _ = self._cached_pb
                     else:
                         self._last_pb_sig = pb_sig
-                        pb_min_conf = max(0.66, self.cfg.min_banner_confidence - 0.02)
+                        pb_min_conf = max(0.60, self.cfg.min_banner_confidence - 0.08)
                         ptpl, pconf = self._detect_banner_with_hint(
                             place_bets_img,
                             pb_tpls,
@@ -2454,6 +2455,23 @@ class PlaytechDetector:
                             _PLACE_BETS_SCALES,
                             hint_key="place_bets",
                         )
+                        if ptpl is None:
+                            # Foreground white-text isolation fallback: suppresses moving dealer/shirt
+                            # background behind the semi-transparent center "PLACE YOUR BETS" text.
+                            pb_min_ch = _to_min_gray(place_bets_img)
+                            _, pb_fg = cv2.threshold(pb_min_ch, 155, 255, cv2.THRESH_TOZERO)
+                            if float(np.mean(pb_fg > 0)) >= 0.015:
+                                fg_tpls = []
+                                for t in pb_tpls:
+                                    _, t_fg = cv2.threshold(t.gray, 155, 255, cv2.THRESH_TOZERO)
+                                    fg_tpls.append(TemplateEntry(rank=t.rank, val=t.val, gray=t_fg, name=t.name))
+                                ptpl, pconf = detect_best_single_with_scale(
+                                    pb_fg,
+                                    fg_tpls,
+                                    min_conf=pb_min_conf,
+                                    scales=_PLACE_BETS_SCALES,
+                                    require_contrast=True,
+                                )[0:2]
                         pb_conf = pconf if ptpl is not None else 0.0
                         self._cached_pb = (pb_conf, False)
                     if pb_conf > 0.0 and not banner_state:
