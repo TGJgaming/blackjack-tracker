@@ -63,6 +63,75 @@ class FrameObservation:
     dealer_sub_cards: list[dict[str, Any]] = field(default_factory=list)
     dealer_badge_hint: dict[str, Any] | None = None
     loading_screen: bool = False
+    shoe_state: str = ""  # "PRESENT" | "ABSENT" | "OCCLUDED" | ""
+    shoe_dark_frac: float = 0.0
+    shoe_teal_frac: float = 0.0
+    discard_white_frac: float = 0.0
+    discard_dark_frac: float = 0.0
+    discard_teal_frac: float = 0.0
+
+
+def detect_shoe_state(shoe_img: np.ndarray | None) -> tuple[str, float, float]:
+    """Classify the right-side physical dealing shoe ROI into PRESENT | ABSENT | OCCLUDED.
+
+    - PRESENT: dark black shoe body occupies the ROI (`dark_frac >= 0.36`, `teal_frac <= 0.46`).
+    - ABSENT: shoe removed from its spot, exposing bright Playtech teal felt underneath
+      (`dark_frac <= 0.24` AND `teal_frac >= 0.50`).
+    - OCCLUDED: dealer hand/arm, shift-change dealer, or dark loading screen (no exposed teal felt).
+    """
+    if shoe_img is None or shoe_img.size == 0 or shoe_img.ndim != 3:
+        return "", 0.0, 0.0
+    hsv = cv2.cvtColor(shoe_img, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    dark_frac = float(np.mean(v < 58))
+    teal_frac = float(np.mean((h >= 78) & (h <= 108) & (s >= 55) & (v >= 55)))
+    if dark_frac >= 0.36 and teal_frac <= 0.46:
+        state = "PRESENT"
+    elif dark_frac <= 0.24 and teal_frac >= 0.50:
+        state = "ABSENT"
+    else:
+        state = "OCCLUDED"
+    return state, round(dark_frac, 4), round(teal_frac, 4)
+
+
+def detect_discard_stack(discard_img: np.ndarray | None) -> tuple[float, float, float]:
+    """Position-invariant movable discard-tray stack detector inside a wide left-side ROI.
+
+    Returns `(white_stack_frac, dark_frac, teal_frac)`:
+    - `white_stack_frac`: fraction of ROI covered by compact neutral-white card-stack blobs
+      (invariant to where the dealer slid/angled the discard tray inside the zone, while
+      rejecting thin icon strokes like UNDO via solidity & minimum-area filtering).
+    - `dark_frac`: fraction of dark tray-housing pixels (`V < 58`), used to distinguish
+      an emptied tray sitting in the zone from a tray slid completely outside the ROI.
+    - `teal_frac`: fraction of Playtech teal felt pixels, proving live table visibility.
+    """
+    if discard_img is None or discard_img.size == 0 or discard_img.ndim != 3:
+        return 0.0, 0.0, 0.0
+    hsv = cv2.cvtColor(discard_img, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    dark_frac = float(np.mean(v < 58))
+    teal_frac = float(np.mean((h >= 78) & (h <= 108) & (s >= 55) & (v >= 55)))
+
+    white_mask = ((s <= 45) & (v >= 175)).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+
+    total_px = float(discard_img.shape[0] * discard_img.shape[1])
+    min_blob_px = max(6, int(round(total_px * 0.002)))
+    n_lbl, _, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
+    stack_px = 0
+    for i in range(1, n_lbl):
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < min_blob_px or bw < 2 or bh < 2:
+            continue
+        solidity = area / float(max(1, bw * bh))
+        if solidity >= 0.45:
+            stack_px += area
+
+    white_stack_frac = stack_px / max(1.0, total_px)
+    return round(white_stack_frac, 4), round(dark_frac, 4), round(teal_frac, 4)
 
 
 @dataclass
@@ -2214,6 +2283,8 @@ class PlaytechDetector:
         dealer_felt_img: np.ndarray | None = None,
         place_bets_img: np.ndarray | None = None,
         force_dealer_scan: bool = False,
+        shoe_img: np.ndarray | None = None,
+        discard_img: np.ndarray | None = None,
     ) -> FrameObservation:
         """Analyze cropped ROIs and return detections for a single tick."""
         now = ts if ts is not None else time.monotonic()
@@ -2458,6 +2529,21 @@ class PlaytechDetector:
             if d_obs is not None:
                 felt_events.append(d_obs)
 
+        # Dual-ROI physical shoe & movable discard-tray metrics (throttled ~2.5 Hz)
+        shoe_state, shoe_dark, shoe_teal = getattr(self, "_cached_shoe", ("", 0.0, 0.0))
+        disc_white, disc_dark, disc_teal = getattr(self, "_cached_discard", (0.0, 0.0, 0.0))
+        last_shoe_ts = getattr(self, "_last_shoe_scan_ts", -999.0)
+        if (shoe_img is not None or discard_img is not None) and (
+            force_dealer_scan or (now - last_shoe_ts) >= 0.35
+        ):
+            self._last_shoe_scan_ts = now
+            if shoe_img is not None and shoe_img.size:
+                shoe_state, shoe_dark, shoe_teal = detect_shoe_state(shoe_img)
+                self._cached_shoe = (shoe_state, shoe_dark, shoe_teal)
+            if discard_img is not None and discard_img.size:
+                disc_white, disc_dark, disc_teal = detect_discard_stack(discard_img)
+                self._cached_discard = (disc_white, disc_dark, disc_teal)
+
         return FrameObservation(
             ts=now,
             player_cards=list(p_cards),
@@ -2477,4 +2563,10 @@ class PlaytechDetector:
             dealer_badge_conf=d_badge_conf,
             dealer_sub_cards=list(d_sub_cards),
             dealer_badge_hint=d_badge_hint,
+            shoe_state=shoe_state,
+            shoe_dark_frac=shoe_dark,
+            shoe_teal_frac=shoe_teal,
+            discard_white_frac=disc_white,
+            discard_dark_frac=disc_dark,
+            discard_teal_frac=disc_teal,
         )

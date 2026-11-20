@@ -2405,9 +2405,53 @@ function startNewSession(){
   render();
 }
 
-function startNewShoe(s, reason = 'cut'){
+let _autoShoeUndo = null;
+
+function _shoeReasonLabel(reason){
+  if(reason === 'shoe_swap') return 'Shoe removed & returned';
+  if(reason === 'shoe_and_discard') return 'Shoe swap + discard cleared';
+  if(reason === 'discard_cleared') return 'Discard tray emptied (fallback)';
+  if(reason === 'cut') return 'Cut Card Reached';
+  return 'Early Switch';
+}
+
+function undoAutoNewShoe(){
+  if(!_autoShoeUndo) return;
+  const u = _autoShoeUndo;
+  const prevIdx = S.sessions.findIndex(x => x.id === u.prevSessionId);
+  const newIdx = S.sessions.findIndex(x => x.id === u.newSessionId);
+  if(prevIdx < 0){ _autoShoeUndo = null; render(); return; }
+  const prevSess = S.sessions[prevIdx];
+  const newSess = newIdx >= 0 ? S.sessions[newIdx] : null;
+  // Lossless merge: carry over any rounds already logged into the accidental new shoe
+  const mergedRounds = (newSess && Array.isArray(newSess.rounds)) ? newSess.rounds : [];
+  if(mergedRounds.length){
+    prevSess.rounds.push(...mergedRounds);
+  }
+  prevSess.end = null;
+  prevSess.endReason = null;
+  if(newIdx >= 0 && newIdx !== prevIdx){
+    S.sessions.splice(newIdx, 1);
+  }
+  S.activeId = prevSess.id;
+  if(!mergedRounds.length && u.prevDraft){
+    draft = u.prevDraft;
+  }
+  draft.lastMsg = `↩ Restored Shoe #${u.prevShoeNum}${mergedRounds.length ? ` (+${mergedRounds.length} merged round${mergedRounds.length>1?'s':''})` : ''} — auto-reset undone (30s cooldown).`;
+  _autoShoeUndo = null;
+  save();
+  if(_comp.ws && _comp.ws.readyState === 1){
+    try{ _comp.ws.send(JSON.stringify({ type: 'undo_new_shoe' })); }catch(_){}
+  }
+  syncCompanionState(true);
+  render();
+}
+
+function startNewShoe(s, reason = 'cut', { saveUndo = false, cardsSeen = null } = {}){
   _alertState.firedKeys.clear();
   const prevShoeNum = (s.shoeMeta && s.shoeMeta.shoeNum) || 1;
+  const prevDraftSnap = saveUndo ? JSON.parse(JSON.stringify(draft)) : null;
+  const seenCnt = cardsSeen != null ? cardsSeen : Math.max(0, 416 - buildShoeState(s, true).rem.reduce((a,b)=>a+b, 0));
   s.end = Date.now();
   s.endReason = reason;
   const next = {
@@ -2421,6 +2465,20 @@ function startNewShoe(s, reason = 'cut'){
   };
   S.sessions.push(next);
   S.activeId = next.id;
+  if(saveUndo){
+    _autoShoeUndo = {
+      prevSessionId: s.id,
+      newSessionId: next.id,
+      prevShoeNum,
+      newShoeNum: prevShoeNum + 1,
+      prevDraft: prevDraftSnap,
+      reason,
+      cardsSeen: seenCnt,
+      ts: Date.now()
+    };
+  } else {
+    _autoShoeUndo = null;
+  }
   draft = freshDraft();
   draft.playMode = 'watch';
   draft.trackCommunityFelt = false;
@@ -2428,7 +2486,7 @@ function startNewShoe(s, reason = 'cut'){
   draft.watchLocked = false;
   draft.stake = cfg().unit;
   draft.viewShoeId = null;
-  draft.lastMsg = `🔄 Archived Shoe #${prevShoeNum} (${reason==='cut'?'Cut Card Reached':'Early Switch'}) & started Fresh 8-Deck Shoe #${prevShoeNum + 1} (TC 0.00).`;
+  draft.lastMsg = `🔄 Archived Shoe #${prevShoeNum} (${_shoeReasonLabel(reason)}) & started Fresh 8-Deck Shoe #${prevShoeNum + 1} (TC 0.00).`;
   save();
   render();
 }
@@ -2553,6 +2611,16 @@ function renderPlay(){
     `,
     body: `
       ${compPromptHtml}
+      ${(_autoShoeUndo && _autoShoeUndo.newSessionId === s.id && s.rounds.length <= 3) ? `
+        <div class="alert green" style="margin:0 0 10px">
+          <div class="row small">
+            <span>🔄 <strong>Auto-started Shoe #${_autoShoeUndo.newShoeNum}</strong> (${_shoeReasonLabel(_autoShoeUndo.reason)} · ${_autoShoeUndo.cardsSeen} cards seen in Shoe #${_autoShoeUndo.prevShoeNum})</span>
+            <span class="sp"></span>
+            <button class="btn xs amber" id="undoAutoShoeBtn">↩ Undo New Shoe (Restore #${_autoShoeUndo.prevShoeNum})</button>
+            <button class="btn xs" id="dismissAutoShoeBtn">Dismiss</button>
+          </div>
+        </div>
+      ` : ''}
       ${draft.confirmEndOpen ? `
         <div class="alert amber" style="margin:0 0 10px">
           <div class="row small">
@@ -3137,6 +3205,10 @@ function renderPlay(){
     draft.compPrompt = null;
     render();
   };
+  const undoAutoShoeBtn = document.getElementById('undoAutoShoeBtn');
+  if(undoAutoShoeBtn) undoAutoShoeBtn.onclick = () => undoAutoNewShoe();
+  const dismissAutoShoeBtn = document.getElementById('dismissAutoShoeBtn');
+  if(dismissAutoShoeBtn) dismissAutoShoeBtn.onclick = () => { _autoShoeUndo = null; render(); };
   el.querySelectorAll('[data-prompt-felt-d]').forEach(b => {
     b.onclick = () => {
       const v = +b.dataset.val;
@@ -4585,11 +4657,13 @@ function handleCompanionMessage(msg){
   if(msg.type === 'new_shoe'){
     const s = active();
     if(!s) return;
-    if(!msg.hasPendingBet && draft.playMode === 'watch' && !draft.compPrompt){
-      startNewShoe(s, msg.reason || 'cut');
+    const reason = msg.reason || 'cut';
+    if(!msg.hasPendingBet && !draft.compPrompt){
+      startNewShoe(s, reason, { saveUndo: true, cardsSeen: msg.cardsSeen });
+      triggerAlert('window', `🔄 Auto-Started Shoe #${(_autoShoeUndo && _autoShoeUndo.newShoeNum) || ''}`, `${_shoeReasonLabel(reason)} — click Undo in the banner if this was a false trigger.`, { key: `new_shoe_auto_${Date.now()}`, cooldownMs: 5000, speak: 'New shoe detected' });
     } else {
       draft.confirmEndOpen = true;
-      draft.lastMsg = '🔄 Shuffle detected — confirm current round then click Cut Card Reached.';
+      draft.lastMsg = `🔄 New Shoe detected (${_shoeReasonLabel(reason)}) — confirm current round then click Cut Card Reached.`;
       triggerAlert('window', '🔄 New Shoe / Shuffle Detected', 'Confirm current round then click Cut Card Reached.', { key: 'new_shoe_wait' });
       render();
     }
@@ -4678,7 +4752,9 @@ function handleCompanionMessage(msg){
     const bState = msg.banner && msg.banner.state ? `Banner: [${msg.banner.state} ${Math.round((msg.banner.conf||0)*100)}%${srcTag}] · ` : '';
     const pbTxt = (msg.placeBets && msg.placeBets.conf > 0) ? `PlaceBets: ${Math.round(msg.placeBets.conf*100)}% · ` : '';
     const fTxt = (cfCnt || dfCnt) ? ` · Felt: ${cfCnt} Comm [B], ${dfCnt} Dealer [D]` : '';
-    _calib.status = `🧪 ${bState}${pbTxt}Matched ${pCnt} Player${sTxt} & ${dCnt} Dealer HUD card(s)${fTxt}.`;
+    const sd = msg.shoeDetect;
+    const sdTxt = sd ? ` · Shoe: ${sd.shoeState} (dark ${Math.round((sd.shoeDark||0)*100)}%, teal ${Math.round((sd.shoeTeal||0)*100)}%) · Discard: white ${((sd.discardWhite||0)*100).toFixed(1)}% (dark ${Math.round((sd.discardDark||0)*100)}%)` : '';
+    _calib.status = `🧪 ${bState}${pbTxt}Matched ${pCnt} Player${sTxt} & ${dCnt} Dealer HUD card(s)${fTxt}${sdTxt}.`;
     renderCalibModal();
     return;
   }
@@ -4699,7 +4775,9 @@ const CALIB_ROI_META = {
   dealer_felt_roi: { label: 'Felt Dealer [D]', color: '#f43f5e' },
   banner_roi:      { label: 'Status Banner (Top)', color: '#c084fc' },
   place_bets_roi:  { label: 'Place Bets Center', color: '#facc15' },
-  shuffle_roi:     { label: 'Shuffle Banner', color: '#e879f9' }
+  shuffle_roi:     { label: 'Shuffle Banner', color: '#e879f9' },
+  shoe_roi:        { label: 'Dealing Shoe (Auto New Shoe)', color: '#38bdf8' },
+  discard_roi:     { label: 'Discard Tray Zone (Fallback)', color: '#a3e635' }
 };
 const CALIB_RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K','BACK'];
 const CALIB_SUITS = ['S','H','C','D'];
@@ -4723,7 +4801,9 @@ const _calib = {
     dealer_felt_roi: [0.38, 0.28, 0.24, 0.18],
     banner_roi: [0.35, 0.00, 0.30, 0.06],
     place_bets_roi: [0.38, 0.30, 0.24, 0.11],
-    shuffle_roi: [0.30, 0.24, 0.40, 0.38]
+    shuffle_roi: [0.30, 0.24, 0.40, 0.38],
+    shoe_roi: [0.77, 0.52, 0.14, 0.11],
+    discard_roi: [0.11, 0.45, 0.22, 0.22]
   },
   cropBox: null, // [rx, ry, rw, rh] for template harvesting
   dragStart: null,

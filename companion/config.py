@@ -73,6 +73,28 @@ class KeepaliveConfig:
 
 
 @dataclass
+class ShoeDetectConfig:
+    """Dual-ROI physical table auto-new-shoe detection (dealing shoe + movable discard tray)."""
+
+    enabled: bool = True
+    enable_shoe_roi: bool = True
+    enable_discard_fallback: bool = True
+    shoe_present_hold_sec: float = 2.0
+    shoe_absent_hold_sec: float = 3.5
+    shoe_return_hold_sec: float = 1.5
+    shoe_corroborated_absent_sec: float = 1.8
+    shoe_max_flicker_sec: float = 0.7
+    shoe_absent_safety_sec: float = 12.0
+    shoe_min_cards: int = 15
+    discard_peak_white_min: float = 0.022
+    discard_empty_white_max: float = 0.007
+    discard_empty_hold_sec: float = 4.5
+    discard_housing_dark_min: float = 0.10
+    discard_min_cards: int = 45
+    cooldown_sec: float = 30.0
+
+
+@dataclass
 class CompanionConfig:
     window_titles: list[str] = field(default_factory=lambda: ["Live Games", "All Bets Blackjack", "epicworld", "Playtech"])
     anchor_mode: str = "game_viewport"  # "game_viewport" | "window"
@@ -102,10 +124,13 @@ class CompanionConfig:
             "banner_roi": (0.35, 0.00, 0.30, 0.06),
             "place_bets_roi": (0.38, 0.30, 0.24, 0.11),
             "shuffle_roi": (0.30, 0.24, 0.40, 0.38),
+            "shoe_roi": (0.77, 0.52, 0.14, 0.11),
+            "discard_roi": (0.11, 0.45, 0.22, 0.22),
         }
     )
     felt_motion: FeltMotionConfig = field(default_factory=FeltMotionConfig)
     keepalive: KeepaliveConfig = field(default_factory=KeepaliveConfig)
+    shoe_detect: ShoeDetectConfig = field(default_factory=ShoeDetectConfig)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "CompanionConfig":
@@ -180,6 +205,25 @@ class CompanionConfig:
         if not (1 <= ws_port <= 65535):
             ws_port = 8765
 
+        sd_raw = raw.get("shoe_detect") or {}
+        sd = ShoeDetectConfig(
+            enabled=bool(sd_raw.get("enabled", True)),
+            enable_shoe_roi=bool(sd_raw.get("enable_shoe_roi", True)),
+            enable_discard_fallback=bool(sd_raw.get("enable_discard_fallback", True)),
+            shoe_present_hold_sec=max(0.5, float(sd_raw.get("shoe_present_hold_sec", 2.0))),
+            shoe_absent_hold_sec=max(1.0, float(sd_raw.get("shoe_absent_hold_sec", 3.5))),
+            shoe_return_hold_sec=max(0.3, float(sd_raw.get("shoe_return_hold_sec", 1.5))),
+            shoe_corroborated_absent_sec=max(0.5, float(sd_raw.get("shoe_corroborated_absent_sec", 1.8))),
+            shoe_max_flicker_sec=max(0.1, float(sd_raw.get("shoe_max_flicker_sec", 0.7))),
+            shoe_absent_safety_sec=max(4.0, float(sd_raw.get("shoe_absent_safety_sec", 12.0))),
+            shoe_min_cards=max(0, int(sd_raw.get("shoe_min_cards", 15))),
+            discard_peak_white_min=max(0.005, float(sd_raw.get("discard_peak_white_min", 0.022))),
+            discard_empty_white_max=max(0.001, float(sd_raw.get("discard_empty_white_max", 0.007))),
+            discard_empty_hold_sec=max(1.0, float(sd_raw.get("discard_empty_hold_sec", 4.5))),
+            discard_housing_dark_min=max(0.02, float(sd_raw.get("discard_housing_dark_min", 0.10))),
+            discard_min_cards=max(0, int(sd_raw.get("discard_min_cards", 45))),
+            cooldown_sec=max(5.0, float(sd_raw.get("cooldown_sec", 30.0))),
+        )
         return cls(
             window_titles=list(raw.get("window_titles", cls().window_titles)),
             anchor_mode=anchor,
@@ -203,6 +247,7 @@ class CompanionConfig:
             rois=rois,
             felt_motion=fm,
             keepalive=ka,
+            shoe_detect=sd,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -252,6 +297,24 @@ class CompanionConfig:
                 "appcommand_verify_sec": self.keepalive.appcommand_verify_sec,
                 "reset_on_bet_round": self.keepalive.reset_on_bet_round,
                 "reload_btn_offset": self.keepalive.reload_btn_offset,
+            },
+            "shoe_detect": {
+                "enabled": self.shoe_detect.enabled,
+                "enable_shoe_roi": self.shoe_detect.enable_shoe_roi,
+                "enable_discard_fallback": self.shoe_detect.enable_discard_fallback,
+                "shoe_present_hold_sec": self.shoe_detect.shoe_present_hold_sec,
+                "shoe_absent_hold_sec": self.shoe_detect.shoe_absent_hold_sec,
+                "shoe_return_hold_sec": self.shoe_detect.shoe_return_hold_sec,
+                "shoe_corroborated_absent_sec": self.shoe_detect.shoe_corroborated_absent_sec,
+                "shoe_max_flicker_sec": self.shoe_detect.shoe_max_flicker_sec,
+                "shoe_absent_safety_sec": self.shoe_detect.shoe_absent_safety_sec,
+                "shoe_min_cards": self.shoe_detect.shoe_min_cards,
+                "discard_peak_white_min": self.shoe_detect.discard_peak_white_min,
+                "discard_empty_white_max": self.shoe_detect.discard_empty_white_max,
+                "discard_empty_hold_sec": self.shoe_detect.discard_empty_hold_sec,
+                "discard_housing_dark_min": self.shoe_detect.discard_housing_dark_min,
+                "discard_min_cards": self.shoe_detect.discard_min_cards,
+                "cooldown_sec": self.shoe_detect.cooldown_sec,
             },
         }
 

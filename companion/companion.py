@@ -217,6 +217,8 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     last_banner_img = empty
     last_pb_img = empty
     last_center_img = empty
+    last_shoe_img = empty
+    last_discard_img = empty
     ext_status_dirty = False
     bridge: CompanionBridge | None = None
     cached_tpl_counts: dict[str, dict[str, int]] = list_template_counts()
@@ -245,6 +247,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
             "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             "extConnected": bool(bridge is not None and bridge.has_extension_client),
             "keepalive": keepalive.to_status(time.monotonic()),
+            "shoeDetect": sm.shoe_tracker.status_dict(),
         }
 
     def _refresh_anchor_from_full(win: WindowRect) -> tuple[WindowRect, tuple[int, int, int, int], np.ndarray]:
@@ -298,6 +301,8 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
         s_img = _crop_norm(calib_snapshot, test_rois["shuffle_roi"])
         b_img = _crop_norm(calib_snapshot, test_rois["banner_roi"])
         pb_img = _crop_norm(calib_snapshot, test_rois["place_bets_roi"]) if "place_bets_roi" in test_rois else empty
+        sh_img = _crop_norm(calib_snapshot, test_rois["shoe_roi"]) if "shoe_roi" in test_rois else empty
+        dc_img = _crop_norm(calib_snapshot, test_rois["discard_roi"]) if "discard_roi" in test_rois else empty
 
         center_probe_roi = (0.34, 0.25, 0.32, 0.28)
         needs_center_probe = ("place_bets_roi" not in test_rois) and (
@@ -316,6 +321,9 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
             hud_refreshed=True,
             center_img=c_probe_img,
             place_bets_img=pb_img,
+            force_dealer_scan=True,
+            shoe_img=sh_img,
+            discard_img=dc_img,
         )
         detector._last_hud_hash = prev_hash
 
@@ -367,6 +375,14 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 else None
             ),
             "placeBets": {"active": obs.place_bets_conf > 0, "conf": round(obs.place_bets_conf, 3)},
+            "shoeDetect": {
+                "shoeState": obs.shoe_state or "UNKNOWN",
+                "shoeDark": round(obs.shoe_dark_frac, 3),
+                "shoeTeal": round(obs.shoe_teal_frac, 3),
+                "discardWhite": round(obs.discard_white_frac, 4),
+                "discardDark": round(obs.discard_dark_frac, 3),
+                "discardTeal": round(obs.discard_teal_frac, 3),
+            },
         }
 
     def on_inbound(msg: dict[str, Any]) -> dict[str, Any] | None:
@@ -668,6 +684,11 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
+        if mtype == "undo_new_shoe":
+            sm.on_undo_new_shoe(time.monotonic())
+            print("[ShoeDetect] Undo New Shoe received from tracker UI (30s cooldown active).")
+            return build_status(win_cache)
+
         if mtype == "get_logs":
             lines = int(msg.get("lines", 120))
             return {"type": "companion_logs", "text": read_tail_logs(lines), "path": str(LOG_PATH)}
@@ -842,6 +863,8 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                     last_banner_img = _crop_norm(base_img, cfg.rois["banner_roi"])
                     last_pb_img = _crop_norm(base_img, cfg.rois["place_bets_roi"]) if "place_bets_roi" in cfg.rois else empty
                     last_center_img = _crop_norm(base_img, center_banner_roi) if need_center_probe else empty
+                    last_shoe_img = _crop_norm(base_img, cfg.rois["shoe_roi"]) if "shoe_roi" in cfg.rois else empty
+                    last_discard_img = _crop_norm(base_img, cfg.rois["discard_roi"]) if "discard_roi" in cfg.rois else empty
                     comm_img = _crop_norm(base_img, cfg.rois["community_roi"]) if felt_armed else empty
                     dealer_felt_img = (
                         _crop_norm(base_img, cfg.rois["dealer_felt_roi"])
@@ -868,6 +891,11 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         }
                         if "place_bets_roi" in cfg.rois:
                             rois_to_grab["place_bets_roi"] = cfg.rois["place_bets_roi"]
+                        if cfg.shoe_detect.enabled:
+                            if cfg.shoe_detect.enable_shoe_roi and "shoe_roi" in cfg.rois:
+                                rois_to_grab["shoe_roi"] = cfg.rois["shoe_roi"]
+                            if cfg.shoe_detect.enable_discard_fallback and "discard_roi" in cfg.rois:
+                                rois_to_grab["discard_roi"] = cfg.rois["discard_roi"]
                         if need_center_probe and detector.is_center_scan_due(now, cards_active):
                             rois_to_grab["center_probe"] = center_banner_roi
                         if felt_armed:
@@ -885,6 +913,8 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         last_banner_img = crops["banner_roi"]
                         last_pb_img = crops.get("place_bets_roi", empty)
                         last_center_img = crops.get("center_probe", empty)
+                        last_shoe_img = crops.get("shoe_roi", empty)
+                        last_discard_img = crops.get("discard_roi", empty)
                         comm_img = crops.get("community_roi", empty) if felt_armed else empty
                         dealer_felt_img = crops.get("dealer_felt_roi", empty) if felt_armed else empty
                         last_hud_ts = now
@@ -959,10 +989,12 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         dealer_only=dealer_only_tick,
                         dealer_felt_img=dealer_felt_img,
                         force_dealer_scan=force_dealer_scan,
+                        shoe_img=last_shoe_img,
+                        discard_img=last_discard_img,
                     )
                 in_ka_reload = keepalive.state in ("REFRESHING", "RECOVERING")
                 if not in_ka_reload and not is_loading_screen:
-                    events = sm.step(obs)
+                    events = sm.step(obs, keepalive_grace=in_grace_now)
                     if events:
                         await bridge.broadcast_many(events)
 
