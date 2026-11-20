@@ -138,11 +138,15 @@
           shoe_max_flicker_sec: 0.7,
           shoe_absent_safety_sec: 12.0,
           shoe_min_cards: 15,
-          discard_peak_white_min: 0.022,
+          discard_peak_white_min: 0.025,
+          discard_peak_hold_sec: 4.0,
           discard_empty_white_max: 0.007,
-          discard_empty_hold_sec: 4.5,
+          discard_drop_ratio_max: 0.22,
+          discard_empty_hold_sec: 6.0,
+          discard_idle_gap_sec: 8.0,
           discard_housing_dark_min: 0.10,
           discard_min_cards: 45,
+          discard_require_shoe_disturbance: true,
           cooldown_sec: 30.0,
         },
         base.shoe_detect || {}
@@ -3078,33 +3082,66 @@
     return [Math.round(hDeg * 0.5), s, v];
   }
 
-  function detectShoeState(shoeImg) {
+  function _isFeltPixelHsv(h, s, v) {
+    return (h >= 78 && h <= 108 && s >= 55 && v >= 55) || ((h <= 7 || h >= 168) && s >= 120 && v >= 45 && v <= 155);
+  }
+
+  function _matchUiTemplatesJs(roiBgr, tpls, targetH = 72) {
+    if (!roiBgr || roiBgr.w < 12 || roiBgr.h < 12 || roiBgr.c !== 3 || !Array.isArray(tpls) || !tpls.length) {
+      return 0.0;
+    }
+    const nw = Math.max(24, Math.round(roiBgr.w * (targetH / roiBgr.h)));
+    const rg = toGray(resizeImage(roiBgr, nw, targetH));
+    const prep = prepareSourceForMatch(rg, false);
+    let best = 0.0;
+    for (const tpl of tpls) {
+      const tg = tpl && tpl.gray;
+      if (!tg || tg.w < 6 || tg.h < 6) continue;
+      for (const sc of [0.72, 0.84, 0.96, 1.08, 1.22]) {
+        const sw = Math.max(8, Math.round(tg.w * sc));
+        const sh = Math.max(8, Math.round(tg.h * sc));
+        if (sw > nw || sh > targetH) continue;
+        const st = resizeImage(tg, sw, sh);
+        const m = matchTemplateCCoeffNormed(rg, st, prep);
+        for (let i = 0; i < m.data.length; i++) {
+          if (m.data[i] > best) best = m.data[i];
+        }
+      }
+    }
+    return best;
+  }
+
+  function detectShoeState(shoeImg, presentTpls = null, absentTpls = null) {
     if (!shoeImg || shoeImg.w === 0 || shoeImg.h === 0 || shoeImg.c !== 3) {
       return { state: "", darkFrac: 0.0, tealFrac: 0.0 };
     }
     const n = shoeImg.w * shoeImg.h;
     const d = shoeImg.data;
     let darkCnt = 0;
-    let tealCnt = 0;
+    let feltCnt = 0;
     for (let i = 0; i < n; i++) {
       const o = i * 3;
       const [h, s, v] = _bgrToHsvOpenCv(d[o], d[o + 1], d[o + 2]);
       if (v < 58) darkCnt++;
-      if (h >= 78 && h <= 108 && s >= 55 && v >= 55) tealCnt++;
+      if (_isFeltPixelHsv(h, s, v)) feltCnt++;
     }
     const darkFrac = darkCnt / n;
-    const tealFrac = tealCnt / n;
+    const feltFrac = feltCnt / n;
+    const pConf = presentTpls && presentTpls.length ? _matchUiTemplatesJs(shoeImg, presentTpls) : 0.0;
+    const aConf = absentTpls && absentTpls.length ? _matchUiTemplatesJs(shoeImg, absentTpls) : 0.0;
     let state = "OCCLUDED";
-    if (darkFrac >= 0.36 && tealFrac <= 0.46) state = "PRESENT";
-    else if (darkFrac <= 0.24 && tealFrac >= 0.50) state = "ABSENT";
+    if (aConf >= 0.82 && aConf >= pConf + 0.12 && feltFrac >= 0.25) state = "ABSENT";
+    else if (pConf >= 0.78 && pConf >= aConf + 0.10 && darkFrac >= 0.25) state = "PRESENT";
+    else if (darkFrac >= 0.36 && feltFrac <= 0.56) state = "PRESENT";
+    else if (darkFrac <= 0.24 && feltFrac >= 0.50) state = "ABSENT";
     return {
       state,
       darkFrac: Number(darkFrac.toFixed(4)),
-      tealFrac: Number(tealFrac.toFixed(4)),
+      tealFrac: Number(feltFrac.toFixed(4)),
     };
   }
 
-  function detectDiscardStack(discardImg) {
+  function detectDiscardStack(discardImg, emptyTpls = null, fullTpls = null) {
     if (!discardImg || discardImg.w === 0 || discardImg.h === 0 || discardImg.c !== 3) {
       return { whiteFrac: 0.0, darkFrac: 0.0, tealFrac: 0.0 };
     }
@@ -3112,15 +3149,19 @@
     const h = discardImg.h;
     const n = w * h;
     const d = discardImg.data;
+    const bright = new Uint8Array(n);
+    const darkRaw = new Uint8Array(n);
     const rawWhite = new Uint8Array(n);
     let darkCnt = 0;
-    let tealCnt = 0;
+    let feltCnt = 0;
     for (let i = 0; i < n; i++) {
       const o = i * 3;
       const [hv, sv, vv] = _bgrToHsvOpenCv(d[o], d[o + 1], d[o + 2]);
       if (vv < 58) darkCnt++;
-      if (hv >= 78 && hv <= 108 && sv >= 55 && vv >= 55) tealCnt++;
-      if (sv <= 45 && vv >= 175) rawWhite[i] = 255;
+      if (vv < 65) darkRaw[i] = 1;
+      if (_isFeltPixelHsv(hv, sv, vv)) feltCnt++;
+      if (sv <= 50 && vv >= 170) { bright[i] = 1; rawWhite[i] = 255; }
+      else if (sv <= 85 && vv >= 110 && vv < 170) rawWhite[i] = 255;
     }
     // 2x2 morphological open (erode then dilate) to remove 1px noise
     const eroded = new Uint8Array(n);
@@ -3150,15 +3191,40 @@
     const minBlobPx = Math.max(6, Math.round(n * 0.002));
     let stackPx = 0;
     for (let i = 1; i < cc.count; i++) {
-      const [, , bw, bh, area] = cc.stats[i];
+      const [bx, by, bw, bh, area] = cc.stats[i];
       if (area < minBlobPx || bw < 2 || bh < 2) continue;
       const solidity = area / Math.max(1, bw * bh);
-      if (solidity >= 0.45) stackPx += area;
+      if (solidity < 0.45) continue;
+      // Keep blob if it has bright white pixels or sits inside/adjacent to dark tray housing
+      let valid = false;
+      const y0 = Math.max(0, by - 3), y1 = Math.min(h - 1, by + bh + 2);
+      const x0 = Math.max(0, bx - 3), x1 = Math.min(w - 1, bx + bw + 2);
+      for (let yy = y0; yy <= y1 && !valid; yy++) {
+        const yyOff = yy * w;
+        for (let xx = x0; xx <= x1; xx++) {
+          const idx = yyOff + xx;
+          if (darkRaw[idx] || (cc.labels[idx] === i && bright[idx])) {
+            valid = true;
+            break;
+          }
+        }
+      }
+      if (valid) stackPx += area;
+    }
+    let whiteFrac = stackPx / Math.max(1, n);
+    if ((emptyTpls && emptyTpls.length) || (fullTpls && fullTpls.length)) {
+      const eConf = emptyTpls && emptyTpls.length ? _matchUiTemplatesJs(discardImg, emptyTpls) : 0.0;
+      const fConf = fullTpls && fullTpls.length ? _matchUiTemplatesJs(discardImg, fullTpls) : 0.0;
+      if (eConf >= 0.80 && (fConf < 0.76 || eConf >= fConf + 0.08)) {
+        whiteFrac = Math.min(whiteFrac, 0.004);
+      } else if (fConf >= 0.76 && fConf >= eConf + 0.04) {
+        whiteFrac = Math.max(whiteFrac, 0.030);
+      }
     }
     return {
-      whiteFrac: Number((stackPx / Math.max(1, n)).toFixed(4)),
+      whiteFrac: Number(whiteFrac.toFixed(4)),
       darkFrac: Number((darkCnt / Math.max(1, n)).toFixed(4)),
-      tealFrac: Number((tealCnt / Math.max(1, n)).toFixed(4)),
+      tealFrac: Number((feltCnt / Math.max(1, n)).toFixed(4)),
     };
   }
 
@@ -3598,12 +3664,34 @@
       const lastShoeTs = this._lastShoeScanTs ?? -999.0;
       if ((shoeImg || discardImg) && (forceDealerScan || (now - lastShoeTs) >= 0.35)) {
         this._lastShoeScanTs = now;
+        this._ensureBankDecoded("ui");
+        const getUiPrefix = (prefix) => {
+          const fromBank = (this.banks.ui || []).filter((t) => t && t.name && t.name.startsWith(prefix));
+          if (fromBank.length) return fromBank;
+          if (!this._fallbackUiPrefixCache) this._fallbackUiPrefixCache = {};
+          if (!this._fallbackUiPrefixCache[prefix]) {
+            const defPack = PRELOADED_PACK || (typeof globalThis.DEFAULT_COMPANION_PACK === "object" ? globalThis.DEFAULT_COMPANION_PACK : null);
+            const rawUi = (defPack && defPack.templates && Array.isArray(defPack.templates.ui)) ? defPack.templates.ui : [];
+            const decoded = [];
+            for (const item of rawUi) {
+              if (!item || !item.name || !item.name.startsWith(prefix)) continue;
+              const bgr = item.bgrB64 && item.w && item.h
+                ? { w: item.w, h: item.h, c: 3, data: b64ToUint8(item.bgrB64) }
+                : (item.bgr && item.bgr.data ? item.bgr : null);
+              if (!bgr) continue;
+              const entry = createTemplateEntry("ui", item.name, bgr, item.dataB64 || "");
+              if (entry) decoded.push(entry);
+            }
+            this._fallbackUiPrefixCache[prefix] = decoded;
+          }
+          return this._fallbackUiPrefixCache[prefix];
+        };
         if (shoeImg && shoeImg.w > 0 && shoeImg.h > 0) {
-          shoeRes = detectShoeState(shoeImg);
+          shoeRes = detectShoeState(shoeImg, getUiPrefix("SHOE_PRESENT_"), getUiPrefix("SHOE_ABSENT_"));
           this._cachedShoe = shoeRes;
         }
         if (discardImg && discardImg.w > 0 && discardImg.h > 0) {
-          discRes = detectDiscardStack(discardImg);
+          discRes = detectDiscardStack(discardImg, getUiPrefix("DISCARD_EMPTY_"), getUiPrefix("DISCARD_FULL_"));
           this._cachedDiscard = discRes;
         }
       }
@@ -3903,11 +3991,15 @@
           shoe_max_flicker_sec: 0.7,
           shoe_absent_safety_sec: 12.0,
           shoe_min_cards: 15,
-          discard_peak_white_min: 0.022,
+          discard_peak_white_min: 0.025,
+          discard_peak_hold_sec: 4.0,
           discard_empty_white_max: 0.007,
-          discard_empty_hold_sec: 4.5,
+          discard_drop_ratio_max: 0.22,
+          discard_empty_hold_sec: 6.0,
+          discard_idle_gap_sec: 8.0,
           discard_housing_dark_min: 0.10,
           discard_min_cards: 45,
+          discard_require_shoe_disturbance: true,
           cooldown_sec: 30.0,
         },
         cfg || {}
@@ -3927,7 +4019,13 @@
       this._shoeSwapCorroborated = false;
       this._discardWindow = [];
       this._discardPeakWhite = 0.0;
+      this._discardPeakAboveSince = null;
+      this._discardPeakConfirmed = false;
       this._discardEmptySince = null;
+      this._lastActiveCardsTs = -1e9;
+      this._shoeDisturbSince = null;
+      this._lastShoeDisturbanceTs = -1e9;
+      this.discardVeto = "";
       this._cooldownUntil = -1e9;
       this.lastTriggerReason = "";
     }
@@ -3942,7 +4040,12 @@
       this._shoeSwapCorroborated = false;
       this._discardWindow = [];
       this._discardPeakWhite = 0.0;
+      this._discardPeakAboveSince = null;
+      this._discardPeakConfirmed = false;
       this._discardEmptySince = null;
+      this._shoeDisturbSince = null;
+      this._lastShoeDisturbanceTs = -1e9;
+      this.discardVeto = "";
       this._cooldownUntil = now + this.cfg.cooldown_sec;
     }
 
@@ -3954,6 +4057,9 @@
       this._shoeSwapCorroborated = false;
       this._shoeConfirmedPresent = true;
       this._discardEmptySince = null;
+      this._shoeDisturbSince = null;
+      this._lastShoeDisturbanceTs = -1e9;
+      this.discardVeto = "cooldown";
       this._cooldownUntil = now + this.cfg.cooldown_sec;
     }
 
@@ -3966,14 +4072,17 @@
         swapArmed: this._shoeSwapArmed,
         discardWhite: Number(this.discardWhiteFrac.toFixed(4)),
         discardPeak: Number(this._discardPeakWhite.toFixed(4)),
+        discardPeakConfirmed: this._discardPeakConfirmed,
         discardDark: Number(this.discardDarkFrac.toFixed(3)),
         discardTeal: Number(this.discardTealFrac.toFixed(3)),
+        discardVeto: this.discardVeto,
         lastReason: this.lastTriggerReason,
       };
     }
 
     step(obs, { cardsSeen = 0, hasActiveCards = false, inBettingOverlay = false, suppressed = false } = {}) {
       const now = typeof obs.ts === "number" && Number.isFinite(obs.ts) ? obs.ts : Date.now() / 1000;
+      if (hasActiveCards) this._lastActiveCardsTs = now;
       if (obs.shoe_state) {
         this.shoeState = obs.shoe_state;
         this.shoeDarkFrac = Number(obs.shoe_dark_frac || 0);
@@ -3989,14 +4098,25 @@
       let discardJustEmptied = false;
       if (this.cfg.enable_discard_fallback && !inBettingOverlay && this.discardTealFrac >= 0.12) {
         this._discardWindow.push(this.discardWhiteFrac);
-        if (this._discardWindow.length > 5) this._discardWindow.shift();
+        if (this._discardWindow.length > 15) this._discardWindow.shift();
         const sorted = this._discardWindow.slice().sort((a, b) => a - b);
         const medWhite = sorted[Math.floor(sorted.length / 2)];
-        if (medWhite > this._discardPeakWhite) this._discardPeakWhite = medWhite;
+        if (medWhite >= this.cfg.discard_peak_white_min) {
+          if (this._discardPeakAboveSince === null) this._discardPeakAboveSince = now;
+          if ((now - this._discardPeakAboveSince) >= this.cfg.discard_peak_hold_sec) {
+            this._discardPeakConfirmed = true;
+            if (medWhite > this._discardPeakWhite) this._discardPeakWhite = medWhite;
+          }
+        } else {
+          this._discardPeakAboveSince = null;
+        }
         const housingVisible = this.discardDarkFrac >= this.cfg.discard_housing_dark_min;
+        const dropOk = this._discardPeakWhite > 0.0 && medWhite <= this._discardPeakWhite * this.cfg.discard_drop_ratio_max;
         if (
+          this._discardPeakConfirmed &&
           this._discardPeakWhite >= this.cfg.discard_peak_white_min &&
           medWhite <= this.cfg.discard_empty_white_max &&
+          dropOk &&
           housingVisible &&
           !hasActiveCards
         ) {
@@ -4008,6 +4128,13 @@
       }
 
       if (this.cfg.enable_shoe_roi && this.shoeState) {
+        if (this.shoeState === "ABSENT" || this.shoeState === "OCCLUDED") {
+          if (this._shoeDisturbSince === null) this._shoeDisturbSince = now;
+          else if ((now - this._shoeDisturbSince) >= 1.2) this._lastShoeDisturbanceTs = now;
+        } else {
+          this._shoeDisturbSince = null;
+        }
+
         if (this.shoeState === "PRESENT") {
           this._shoeAbsentSince = null;
           this._shoeOccludedSince = null;
@@ -4064,6 +4191,7 @@
         }
       }
 
+      this.discardVeto = "";
       if (
         this.cfg.enable_discard_fallback &&
         this._discardEmptySince !== null &&
@@ -4071,9 +4199,22 @@
         (now - this._discardEmptySince) >= this.cfg.discard_empty_hold_sec &&
         !hasActiveCards
       ) {
-        this.lastTriggerReason = "discard_cleared";
-        this.resetForNewShoe(now);
-        return "discard_cleared";
+        const idleOk = this._lastActiveCardsTs < -1e8 || (now - this._lastActiveCardsTs) >= this.cfg.discard_idle_gap_sec;
+        const shoeVetoed = Boolean(
+          this.cfg.enable_shoe_roi &&
+          this.cfg.discard_require_shoe_disturbance &&
+          this._shoeConfirmedPresent &&
+          (now - this._lastShoeDisturbanceTs) > 30.0
+        );
+        if (!idleOk) {
+          this.discardVeto = "idle_gap";
+        } else if (shoeVetoed) {
+          this.discardVeto = "shoe_present";
+        } else {
+          this.lastTriggerReason = "discard_cleared";
+          this.resetForNewShoe(now);
+          return "discard_cleared";
+        }
       }
 
       return null;

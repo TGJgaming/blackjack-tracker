@@ -2391,7 +2391,45 @@ console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks
   console.log("   Test 38 PASSED");
 }
 
-console.log("\nALL 38 ENGINE TESTS PASSED SUCCESSFULLY!");
+// 39. Cross-sensor shoe_roi veto, sustained peak hold, shadowed stack & Soho burgundy felt
+{
+  console.log("39. Testing cross-sensor shoe_roi veto, sustained peak hold & Soho burgundy felt...");
+  // 1. Soho burgundy felt + shadowed card stack (V~142 inside dark acrylic housing)
+  const soho39 = Engine.createImage(120, 120, 3, 20);
+  fillRect(soho39, 0, 0, 120, 120, 20, 18, 102);
+  fillRect(soho39, 25, 20, 40, 75, 14, 14, 14);
+  fillRect(soho39, 30, 60, 30, 30, 132, 136, 142);
+  const dSoho = Engine.detectDiscardStack(soho39, [], []);
+  assert(dSoho.tealFrac >= 0.50, `Soho burgundy felt must be recognized, got ${dSoho.tealFrac}`);
+  assert(dSoho.whiteFrac >= 0.04, `Shadowed stack in dark housing must be detected, got ${dSoho.whiteFrac}`);
+
+  // 2. Cross-sensor shoe_roi veto blocks discard_cleared while shoe stays steadily PRESENT
+  const tr39 = new Engine.ShoeSwapTracker({
+    enabled: true,
+    enable_shoe_roi: true,
+    enable_discard_fallback: true,
+    discard_peak_hold_sec: 4.0,
+    discard_empty_hold_sec: 6.0,
+    discard_idle_gap_sec: 8.0,
+    discard_require_shoe_disturbance: true,
+    discard_min_cards: 45,
+  });
+  for (let i = 0; i < 16; i++) {
+    tr39.step({ ts: i * 0.4, shoe_state: "PRESENT", shoe_dark_frac: 0.45, shoe_teal_frac: 0.25, discard_white_frac: 0.06, discard_dark_frac: 0.20, discard_teal_frac: 0.35 }, { cardsSeen: 80, hasActiveCards: false });
+  }
+  assert.strictEqual(tr39._discardPeakConfirmed, true);
+  for (let i = 0; i < 20; i++) {
+    const r = tr39.step({ ts: 10.0 + i * 0.6, shoe_state: "PRESENT", shoe_dark_frac: 0.45, shoe_teal_frac: 0.25, discard_white_frac: 0.001, discard_dark_frac: 0.22, discard_teal_frac: 0.35 }, { cardsSeen: 80, hasActiveCards: false });
+    assert.strictEqual(r, null, "Must veto discard_cleared while shoe_roi is steadily PRESENT");
+  }
+  assert.strictEqual(tr39.discardVeto, "shoe_present");
+  assert.strictEqual(tr39.step({ ts: 25.0, shoe_state: "OCCLUDED", discard_white_frac: 0.001, discard_dark_frac: 0.22, discard_teal_frac: 0.35 }, { cardsSeen: 80, hasActiveCards: false }), null);
+  const rOk = tr39.step({ ts: 26.5, shoe_state: "OCCLUDED", discard_white_frac: 0.001, discard_dark_frac: 0.22, discard_teal_frac: 0.35 }, { cardsSeen: 80, hasActiveCards: false });
+  assert.strictEqual(rOk, "discard_cleared");
+  console.log("   Test 39 PASSED");
+}
+
+console.log("\nALL 39 ENGINE TESTS PASSED SUCCESSFULLY!");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

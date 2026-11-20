@@ -86,11 +86,15 @@ class ShoeDetectConfig:
     shoe_max_flicker_sec: float = 0.7
     shoe_absent_safety_sec: float = 12.0
     shoe_min_cards: int = 15
-    discard_peak_white_min: float = 0.022
+    discard_peak_white_min: float = 0.025
+    discard_peak_hold_sec: float = 4.0
     discard_empty_white_max: float = 0.007
-    discard_empty_hold_sec: float = 4.5
+    discard_drop_ratio_max: float = 0.22
+    discard_empty_hold_sec: float = 6.0
+    discard_idle_gap_sec: float = 8.0
     discard_housing_dark_min: float = 0.10
     discard_min_cards: int = 45
+    discard_require_shoe_disturbance: bool = True
     cooldown_sec: float = 30.0
 
 
@@ -217,11 +221,15 @@ class CompanionConfig:
             shoe_max_flicker_sec=max(0.1, float(sd_raw.get("shoe_max_flicker_sec", 0.7))),
             shoe_absent_safety_sec=max(4.0, float(sd_raw.get("shoe_absent_safety_sec", 12.0))),
             shoe_min_cards=max(0, int(sd_raw.get("shoe_min_cards", 15))),
-            discard_peak_white_min=max(0.005, float(sd_raw.get("discard_peak_white_min", 0.022))),
+            discard_peak_white_min=max(0.005, float(sd_raw.get("discard_peak_white_min", 0.025))),
+            discard_peak_hold_sec=max(0.0, float(sd_raw.get("discard_peak_hold_sec", 4.0))),
             discard_empty_white_max=max(0.001, float(sd_raw.get("discard_empty_white_max", 0.007))),
-            discard_empty_hold_sec=max(1.0, float(sd_raw.get("discard_empty_hold_sec", 4.5))),
+            discard_drop_ratio_max=max(0.05, min(0.8, float(sd_raw.get("discard_drop_ratio_max", 0.22)))),
+            discard_empty_hold_sec=max(1.0, float(sd_raw.get("discard_empty_hold_sec", 6.0))),
+            discard_idle_gap_sec=max(0.0, float(sd_raw.get("discard_idle_gap_sec", 8.0))),
             discard_housing_dark_min=max(0.02, float(sd_raw.get("discard_housing_dark_min", 0.10))),
             discard_min_cards=max(0, int(sd_raw.get("discard_min_cards", 45))),
+            discard_require_shoe_disturbance=bool(sd_raw.get("discard_require_shoe_disturbance", True)),
             cooldown_sec=max(5.0, float(sd_raw.get("cooldown_sec", 30.0))),
         )
         return cls(
@@ -310,10 +318,14 @@ class CompanionConfig:
                 "shoe_absent_safety_sec": self.shoe_detect.shoe_absent_safety_sec,
                 "shoe_min_cards": self.shoe_detect.shoe_min_cards,
                 "discard_peak_white_min": self.shoe_detect.discard_peak_white_min,
+                "discard_peak_hold_sec": self.shoe_detect.discard_peak_hold_sec,
                 "discard_empty_white_max": self.shoe_detect.discard_empty_white_max,
+                "discard_drop_ratio_max": self.shoe_detect.discard_drop_ratio_max,
                 "discard_empty_hold_sec": self.shoe_detect.discard_empty_hold_sec,
+                "discard_idle_gap_sec": self.shoe_detect.discard_idle_gap_sec,
                 "discard_housing_dark_min": self.shoe_detect.discard_housing_dark_min,
                 "discard_min_cards": self.shoe_detect.discard_min_cards,
+                "discard_require_shoe_disturbance": self.shoe_detect.discard_require_shoe_disturbance,
                 "cooldown_sec": self.shoe_detect.cooldown_sec,
             },
         }

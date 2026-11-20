@@ -1069,7 +1069,13 @@ class ShoeSwapTracker:
 
         self._discard_window: list[float] = []
         self._discard_peak_white: float = 0.0
+        self._discard_peak_above_since: float | None = None
+        self._discard_peak_confirmed: bool = False
         self._discard_empty_since: float | None = None
+        self._last_active_cards_ts: float = -1e9
+        self._shoe_disturb_since: float | None = None
+        self._last_shoe_disturbance_ts: float = -1e9
+        self.discard_veto: str = ""
 
         self._cooldown_until: float = -1e9
         self.last_trigger_reason: str = ""
@@ -1084,7 +1090,12 @@ class ShoeSwapTracker:
         self._shoe_swap_corroborated = False
         self._discard_window.clear()
         self._discard_peak_white = 0.0
+        self._discard_peak_above_since = None
+        self._discard_peak_confirmed = False
         self._discard_empty_since = None
+        self._shoe_disturb_since = None
+        self._last_shoe_disturbance_ts = -1e9
+        self.discard_veto = ""
         self._cooldown_until = now + self.cfg.cooldown_sec
 
     def on_undo_new_shoe(self, now: float) -> None:
@@ -1096,6 +1107,9 @@ class ShoeSwapTracker:
         self._shoe_swap_corroborated = False
         self._shoe_confirmed_present = True
         self._discard_empty_since = None
+        self._shoe_disturb_since = None
+        self._last_shoe_disturbance_ts = -1e9
+        self.discard_veto = "cooldown"
         self._cooldown_until = now + self.cfg.cooldown_sec
 
     def status_dict(self) -> dict[str, Any]:
@@ -1107,8 +1121,10 @@ class ShoeSwapTracker:
             "swapArmed": self._shoe_swap_armed,
             "discardWhite": round(self.discard_white_frac, 4),
             "discardPeak": round(self._discard_peak_white, 4),
+            "discardPeakConfirmed": self._discard_peak_confirmed,
             "discardDark": round(self.discard_dark_frac, 3),
             "discardTeal": round(self.discard_teal_frac, 3),
+            "discardVeto": self.discard_veto,
             "lastReason": self.last_trigger_reason,
         }
 
@@ -1123,6 +1139,8 @@ class ShoeSwapTracker:
     ) -> str | None:
         """Advance physical shoe & discard-tray state. Returns trigger reason or None."""
         now = obs.ts
+        if has_active_cards:
+            self._last_active_cards_ts = now
         if obs.shoe_state:
             self.shoe_state = obs.shoe_state
             self.shoe_dark_frac = obs.shoe_dark_frac
@@ -1135,7 +1153,7 @@ class ShoeSwapTracker:
         if not self.cfg.enabled or suppressed or now < self._cooldown_until:
             return None
 
-        # --- 1. Update movable discard-tray stack peak (only when live felt visible & no betting UI overlay) ---
+        # --- 1. Update movable discard-tray stack peak (15-frame median + sustained peak hold) ---
         discard_just_emptied = False
         if (
             self.cfg.enable_discard_fallback
@@ -1143,17 +1161,27 @@ class ShoeSwapTracker:
             and self.discard_teal_frac >= 0.12
         ):
             self._discard_window.append(self.discard_white_frac)
-            if len(self._discard_window) > 5:
+            if len(self._discard_window) > 15:
                 self._discard_window.pop(0)
             med_white = sorted(self._discard_window)[len(self._discard_window) // 2]
 
-            if med_white > self._discard_peak_white:
-                self._discard_peak_white = med_white
+            if med_white >= self.cfg.discard_peak_white_min:
+                if self._discard_peak_above_since is None:
+                    self._discard_peak_above_since = now
+                if (now - self._discard_peak_above_since) >= self.cfg.discard_peak_hold_sec:
+                    self._discard_peak_confirmed = True
+                    if med_white > self._discard_peak_white:
+                        self._discard_peak_white = med_white
+            else:
+                self._discard_peak_above_since = None
 
             housing_visible = self.discard_dark_frac >= self.cfg.discard_housing_dark_min
+            drop_ok = self._discard_peak_white > 0.0 and (med_white <= self._discard_peak_white * self.cfg.discard_drop_ratio_max)
             if (
-                self._discard_peak_white >= self.cfg.discard_peak_white_min
+                self._discard_peak_confirmed
+                and self._discard_peak_white >= self.cfg.discard_peak_white_min
                 and med_white <= self.cfg.discard_empty_white_max
+                and drop_ok
                 and housing_visible
                 and not has_active_cards
             ):
@@ -1165,6 +1193,14 @@ class ShoeSwapTracker:
 
         # --- 2. Primary: shoe_roi PRESENT -> ABSENT -> RETURNED ---
         if self.cfg.enable_shoe_roi and self.shoe_state:
+            if self.shoe_state in ("ABSENT", "OCCLUDED"):
+                if self._shoe_disturb_since is None:
+                    self._shoe_disturb_since = now
+                elif (now - self._shoe_disturb_since) >= 1.2:
+                    self._last_shoe_disturbance_ts = now
+            else:
+                self._shoe_disturb_since = None
+
             if self.shoe_state == "PRESENT":
                 self._shoe_absent_since = None
                 self._shoe_occluded_since = None
@@ -1220,7 +1256,8 @@ class ShoeSwapTracker:
                         self._shoe_absent_since = None
                         self._shoe_occluded_since = None
 
-        # --- 3. Standalone Fallback: discard_roi peak -> empty ---
+        # --- 3. Standalone Fallback: discard_roi peak -> empty (with cross-sensor shoe_roi veto & idle gap) ---
+        self.discard_veto = ""
         if (
             self.cfg.enable_discard_fallback
             and self._discard_empty_since is not None
@@ -1228,9 +1265,21 @@ class ShoeSwapTracker:
             and (now - self._discard_empty_since) >= self.cfg.discard_empty_hold_sec
             and not has_active_cards
         ):
-            self.last_trigger_reason = "discard_cleared"
-            self.reset_for_new_shoe(now)
-            return "discard_cleared"
+            idle_ok = (self._last_active_cards_ts < -1e8) or ((now - self._last_active_cards_ts) >= self.cfg.discard_idle_gap_sec)
+            shoe_vetoed = bool(
+                self.cfg.enable_shoe_roi
+                and self.cfg.discard_require_shoe_disturbance
+                and self._shoe_confirmed_present
+                and (now - self._last_shoe_disturbance_ts) > 30.0
+            )
+            if not idle_ok:
+                self.discard_veto = "idle_gap"
+            elif shoe_vetoed:
+                self.discard_veto = "shoe_present"
+            else:
+                self.last_trigger_reason = "discard_cleared"
+                self.reset_for_new_shoe(now)
+                return "discard_cleared"
 
         return None
 

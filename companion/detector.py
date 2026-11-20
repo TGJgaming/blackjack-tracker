@@ -71,67 +71,150 @@ class FrameObservation:
     discard_teal_frac: float = 0.0
 
 
-def detect_shoe_state(shoe_img: np.ndarray | None) -> tuple[str, float, float]:
+_UI_TPLS_CACHE: dict[str, list[np.ndarray]] = {}
+
+
+def _get_ui_templates(prefix: str) -> list[np.ndarray]:
+    if prefix in _UI_TPLS_CACHE:
+        return _UI_TPLS_CACHE[prefix]
+    ui_dir = Path(__file__).resolve().parent / "templates" / "ui"
+    tpls: list[np.ndarray] = []
+    if ui_dir.exists():
+        for p in sorted(ui_dir.glob(f"{prefix}*.png")):
+            im = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            if im is not None and im.size > 0:
+                tpls.append(im)
+    _UI_TPLS_CACHE[prefix] = tpls
+    return tpls
+
+
+def _match_ui_templates(roi_bgr: np.ndarray, tpls: list[np.ndarray], target_h: int = 72) -> float:
+    if roi_bgr is None or roi_bgr.size == 0 or roi_bgr.ndim != 3 or not tpls:
+        return 0.0
+    h, w = roi_bgr.shape[:2]
+    if h < 12 or w < 12:
+        return 0.0
+    nw = max(24, int(round(w * (target_h / float(h)))))
+    rg = cv2.resize(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY), (nw, target_h), interpolation=cv2.INTER_AREA)
+    best = 0.0
+    for tg in tpls:
+        if tg.shape[0] < 6 or tg.shape[1] < 6:
+            continue
+        for sc in (0.72, 0.84, 0.96, 1.08, 1.22):
+            sw = max(8, int(round(tg.shape[1] * sc)))
+            sh = max(8, int(round(tg.shape[0] * sc)))
+            if sw > nw or sh > target_h:
+                continue
+            st = cv2.resize(tg, (sw, sh), interpolation=cv2.INTER_AREA if sc < 1.0 else cv2.INTER_CUBIC)
+            res = cv2.matchTemplate(rg, st, cv2.TM_CCOEFF_NORMED)
+            _, mv, _, _ = cv2.minMaxLoc(res)
+            if np.isfinite(mv) and float(mv) > best:
+                best = float(mv)
+    return best
+
+
+def _felt_mask(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Match both Playtech teal felt and Soho deep burgundy/red felt (excluding pale skin tones)."""
+    teal = (h >= 78) & (h <= 108) & (s >= 55) & (v >= 55)
+    burgundy = ((h <= 7) | (h >= 168)) & (s >= 120) & (v >= 45) & (v <= 155)
+    return teal | burgundy
+
+
+def detect_shoe_state(
+    shoe_img: np.ndarray | None,
+    present_tpls: list[np.ndarray] | None = None,
+    absent_tpls: list[np.ndarray] | None = None,
+) -> tuple[str, float, float]:
     """Classify the right-side physical dealing shoe ROI into PRESENT | ABSENT | OCCLUDED.
 
-    - PRESENT: dark black shoe body occupies the ROI (`dark_frac >= 0.36`, `teal_frac <= 0.46`).
-    - ABSENT: shoe removed from its spot, exposing bright Playtech teal felt underneath
-      (`dark_frac <= 0.24` AND `teal_frac >= 0.50`).
-    - OCCLUDED: dealer hand/arm, shift-change dealer, or dark loading screen (no exposed teal felt).
+    Fuses optional SHOE_PRESENT / SHOE_ABSENT training templates with HSV dark/felt classification
+    (supporting both Playtech teal felt and Soho burgundy/red felt).
     """
     if shoe_img is None or shoe_img.size == 0 or shoe_img.ndim != 3:
         return "", 0.0, 0.0
     hsv = cv2.cvtColor(shoe_img, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     dark_frac = float(np.mean(v < 58))
-    teal_frac = float(np.mean((h >= 78) & (h <= 108) & (s >= 55) & (v >= 55)))
-    if dark_frac >= 0.36 and teal_frac <= 0.46:
+    felt_frac = float(np.mean(_felt_mask(h, s, v)))
+
+    p_tpls = _get_ui_templates("SHOE_PRESENT_") if present_tpls is None else present_tpls
+    a_tpls = _get_ui_templates("SHOE_ABSENT_") if absent_tpls is None else absent_tpls
+    p_conf = _match_ui_templates(shoe_img, p_tpls) if p_tpls else 0.0
+    a_conf = _match_ui_templates(shoe_img, a_tpls) if a_tpls else 0.0
+
+    if a_conf >= 0.82 and a_conf >= p_conf + 0.12 and felt_frac >= 0.25:
+        state = "ABSENT"
+    elif p_conf >= 0.78 and p_conf >= a_conf + 0.10 and dark_frac >= 0.25:
         state = "PRESENT"
-    elif dark_frac <= 0.24 and teal_frac >= 0.50:
+    elif dark_frac >= 0.36 and felt_frac <= 0.56:
+        state = "PRESENT"
+    elif dark_frac <= 0.24 and felt_frac >= 0.50:
         state = "ABSENT"
     else:
         state = "OCCLUDED"
-    return state, round(dark_frac, 4), round(teal_frac, 4)
+    return state, round(dark_frac, 4), round(felt_frac, 4)
 
 
-def detect_discard_stack(discard_img: np.ndarray | None) -> tuple[float, float, float]:
+def detect_discard_stack(
+    discard_img: np.ndarray | None,
+    empty_tpls: list[np.ndarray] | None = None,
+    full_tpls: list[np.ndarray] | None = None,
+) -> tuple[float, float, float]:
     """Position-invariant movable discard-tray stack detector inside a wide left-side ROI.
 
-    Returns `(white_stack_frac, dark_frac, teal_frac)`:
-    - `white_stack_frac`: fraction of ROI covered by compact neutral-white card-stack blobs
-      (invariant to where the dealer slid/angled the discard tray inside the zone, while
-      rejecting thin icon strokes like UNDO via solidity & minimum-area filtering).
-    - `dark_frac`: fraction of dark tray-housing pixels (`V < 58`), used to distinguish
-      an emptied tray sitting in the zone from a tray slid completely outside the ROI.
-    - `teal_frac`: fraction of Playtech teal felt pixels, proving live table visibility.
+    Combines:
+      1. Direct-lit white card edges (S<=50, V>=170) AND shadowed card edges inside/adjacent
+         to the dark acrylic tray housing (S<=85, V>=110..169 inside dilated V<65 housing).
+      2. Optional DISCARD_EMPTY / DISCARD_FULL training template matching to prevent shadowed
+         or thin stacks (e.g. 10-card stacks) from falsely reading empty.
+      3. Teal + burgundy felt detection so both All Bets BJ and Soho BJ tables are supported.
     """
     if discard_img is None or discard_img.size == 0 or discard_img.ndim != 3:
         return 0.0, 0.0, 0.0
     hsv = cv2.cvtColor(discard_img, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     dark_frac = float(np.mean(v < 58))
-    teal_frac = float(np.mean((h >= 78) & (h <= 108) & (s >= 55) & (v >= 55)))
+    felt_frac = float(np.mean(_felt_mask(h, s, v)))
 
-    white_mask = ((s <= 45) & (v >= 175)).astype(np.uint8) * 255
+    housing_zone = cv2.dilate((v < 65).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    bright_mask = (s <= 50) & (v >= 170)
+    shaded_mask = (s <= 85) & (v >= 110) & (v < 170)
+    white_mask = (bright_mask | shaded_mask).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
 
     total_px = float(discard_img.shape[0] * discard_img.shape[1])
     min_blob_px = max(6, int(round(total_px * 0.002)))
-    n_lbl, _, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
+    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
     stack_px = 0
     for i in range(1, n_lbl):
+        bx = int(stats[i, cv2.CC_STAT_LEFT])
+        by = int(stats[i, cv2.CC_STAT_TOP])
         bw = int(stats[i, cv2.CC_STAT_WIDTH])
         bh = int(stats[i, cv2.CC_STAT_HEIGHT])
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area < min_blob_px or bw < 2 or bh < 2:
             continue
         solidity = area / float(max(1, bw * bh))
-        if solidity >= 0.45:
+        if solidity < 0.45:
+            continue
+        blob_roi = labels[by : by + bh, bx : bx + bw] == i
+        if np.any(bright_mask[by : by + bh, bx : bx + bw] & blob_roi) or np.any(housing_zone[by : by + bh, bx : bx + bw] & blob_roi):
             stack_px += area
 
     white_stack_frac = stack_px / max(1.0, total_px)
-    return round(white_stack_frac, 4), round(dark_frac, 4), round(teal_frac, 4)
+
+    e_tpls = _get_ui_templates("DISCARD_EMPTY_") if empty_tpls is None else empty_tpls
+    f_tpls = _get_ui_templates("DISCARD_FULL_") if full_tpls is None else full_tpls
+    if e_tpls or f_tpls:
+        e_conf = _match_ui_templates(discard_img, e_tpls) if e_tpls else 0.0
+        f_conf = _match_ui_templates(discard_img, f_tpls) if f_tpls else 0.0
+        if e_conf >= 0.80 and (f_conf < 0.76 or e_conf >= f_conf + 0.08):
+            white_stack_frac = min(white_stack_frac, 0.004)
+        elif f_conf >= 0.76 and f_conf >= e_conf + 0.04:
+            white_stack_frac = max(white_stack_frac, 0.030)
+
+    return round(white_stack_frac, 4), round(dark_frac, 4), round(felt_frac, 4)
 
 
 @dataclass

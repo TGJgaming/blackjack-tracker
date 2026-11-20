@@ -192,3 +192,55 @@ def test_state_machine_emits_new_shoe_and_suppresses_in_keepalive_grace() -> Non
     assert ns[0]["reason"] == "shoe_swap"
     assert ns[0]["cardsSeen"] == 60
     assert ns[0]["hasPendingBet"] is False
+
+
+def test_discard_cross_sensor_veto_sustained_peak_and_soho_felt() -> None:
+    """Cross-sensor shoe_roi veto blocks false discard_cleared while shoe is steadily PRESENT; brief spikes do not latch peak; Soho red felt is supported."""
+    # 1. Soho deep burgundy felt + shadowed card stack inside dark tray housing
+    soho = np.full((120, 120, 3), (20, 18, 102), dtype=np.uint8)  # deep burgundy felt (H~178, S~208, V~102)
+    soho[20:95, 25:65] = (14, 14, 14)  # dark acrylic tray housing
+    soho[60:90, 30:60] = (132, 136, 142)  # shadowed card stack (V~142, below old V>=175 threshold!)
+    w_s, d_s, f_s = detect_discard_stack(soho, empty_tpls=[], full_tpls=[])
+    assert f_s >= 0.50, f"Soho burgundy felt must be recognized, got {f_s}"
+    assert d_s >= 0.10
+    assert w_s >= 0.04, f"Shadowed card stack inside dark housing must be detected, got {w_s}"
+
+    # 2. Brief 1.5s white spike must NOT confirm peak (requires discard_peak_hold_sec=4.0s)
+    cfg = ShoeDetectConfig(enable_shoe_roi=False, discard_peak_hold_sec=4.0, discard_empty_hold_sec=6.0, discard_min_cards=45)
+    tr = ShoeSwapTracker(cfg)
+    for t in [0.0, 0.5, 1.0, 1.5]:
+        tr.step(_obs(t, disc_white=0.05, disc_dark=0.20, disc_teal=0.35), cards_seen=80, has_active_cards=False, in_betting_overlay=False, suppressed=False)
+    assert tr._discard_peak_confirmed is False
+    for t in [2.0, 4.0, 6.0, 9.0, 12.0]:
+        res = tr.step(_obs(t, disc_white=0.001, disc_dark=0.22, disc_teal=0.35), cards_seen=80, has_active_cards=False, in_betting_overlay=False, suppressed=False)
+        assert res is None
+
+    # 3. Cross-sensor shoe_roi veto: shoe steadily PRESENT vetoes standalone discard_cleared
+    cfg_v = ShoeDetectConfig(
+        enable_shoe_roi=True,
+        enable_discard_fallback=True,
+        discard_peak_hold_sec=4.0,
+        discard_empty_hold_sec=6.0,
+        discard_idle_gap_sec=8.0,
+        discard_require_shoe_disturbance=True,
+        discard_min_cards=45,
+    )
+    tr_v = ShoeSwapTracker(cfg_v)
+    # Establish shoe PRESENT + sustained discard peak over 5s
+    for i in range(16):
+        t = float(i) * 0.4
+        tr_v.step(_obs(t, shoe_state="PRESENT", disc_white=0.06, disc_dark=0.20, disc_teal=0.35), cards_seen=80, has_active_cards=False, in_betting_overlay=False, suppressed=False)
+    assert tr_v._shoe_confirmed_present is True
+    assert tr_v._discard_peak_confirmed is True
+    # Now discard drops to empty for 10s while shoe stays rock-solid PRESENT -> MUST BE VETOED!
+    for i in range(20):
+        t = 10.0 + float(i) * 0.6
+        res = tr_v.step(_obs(t, shoe_state="PRESENT", disc_white=0.001, disc_dark=0.22, disc_teal=0.35), cards_seen=80, has_active_cards=False, in_betting_overlay=False, suppressed=False)
+        assert res is None
+    assert tr_v.discard_veto == "shoe_present"
+
+    # Once shoe sees a >=1.2s disturbance (e.g. dealer swaps shoe quickly), discard_cleared is allowed!
+    assert tr_v.step(_obs(25.0, shoe_state="OCCLUDED", disc_white=0.001, disc_dark=0.22, disc_teal=0.35), cards_seen=80, has_active_cards=False, in_betting_overlay=False, suppressed=False) is None
+    res_ok = tr_v.step(_obs(26.5, shoe_state="OCCLUDED", disc_white=0.001, disc_dark=0.22, disc_teal=0.35), cards_seen=80, has_active_cards=False, in_betting_overlay=False, suppressed=False)
+    assert res_ok == "discard_cleared"
+
