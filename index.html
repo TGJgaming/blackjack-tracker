@@ -98,6 +98,7 @@
   .seg button{flex:1;min-width:64px;padding:10px 8px;border-radius:11px;border:2px solid var(--line);background:var(--panel2);color:var(--text);font-weight:700;cursor:pointer}
   .seg button.on{border-color:var(--blue);background:#1d2a44}
   .seg button.W.on{border-color:#94a3b8;background:#1e293b;color:#f1f5f9}
+  .seg button.W.on.locked{border-color:#f59e0b;background:#2b2110;color:#fde68a;box-shadow:0 0 0 1px rgba(245,158,11,.35)}
   .seg button.BET.on{border-color:var(--green);background:#0f2f1c;color:#bbf7d0}
 
   /* Numpad */
@@ -511,7 +512,7 @@ function _flushPersistDraft(){
       dCards: d.dCards, dMeta: d.dMeta, bCards: d.bCards, bMeta: d.bMeta,
       feltSightings: Array.isArray(d.feltSightings) ? d.feltSightings : [],
       targetBox: d.targetBox, trackCommunityFelt: !!d.trackCommunityFelt, autoFlow: d.autoFlow,
-      playMode: d.playMode, manualBetOverride: !!d.manualBetOverride, stake: d.stake,
+      playMode: d.playMode, manualBetOverride: !!d.manualBetOverride, watchLocked: !!d.watchLocked, stake: d.stake,
       tookIns: d.tookIns, insWon: d.insWon, sideStakes: d.sideStakes, sideBetPnl: d.sideBetPnl, log: d.log
     }));
   }catch(e){}
@@ -543,7 +544,7 @@ function restoreDraft(){
       bCards: x.bCards || [], bMeta: Array.isArray(x.bMeta) ? x.bMeta : [],
       feltSightings: Array.isArray(x.feltSightings) ? x.feltSightings : [],
       targetBox: x.targetBox || 'P', trackCommunityFelt: !!(x.trackCommunityFelt && restoredMode === 'bet'), autoFlow: x.autoFlow !== false,
-      playMode: restoredMode, manualBetOverride: !!(x.manualBetOverride && restoredMode === 'bet'),
+      playMode: restoredMode, manualBetOverride: !!(x.manualBetOverride && restoredMode === 'bet'), watchLocked: !!(x.watchLocked && restoredMode === 'watch'),
       stake: (x.stake !== undefined ? x.stake : cfg().unit), tookIns: !!x.tookIns, insWon: !!x.insWon,
       sideStakes: Object.assign({}, cfg().defaultSideStakes || {}, x.sideStakes || {}),
       sideBetPnl: +x.sideBetPnl || 0, log: x.log || []
@@ -760,6 +761,7 @@ function freshDraft(){
     autoFlow: prev.autoFlow !== undefined ? prev.autoFlow : true,
     playMode: 'watch', // 'watch' | 'bet'
     manualBetOverride: false,
+    watchLocked: false,
     dealerGuessRemoved: false,
     stake: prev.stake !== undefined ? prev.stake : cfg().unit,
     tookIns: false,
@@ -2559,15 +2561,17 @@ function recordRound(outcomeType){
   const keepSync = draft.shoeSyncOpen;
   const keepMob = draft.mobDockMin;
   const keepView = draft.viewShoeId;
+  const keepWatchLock = !!draft.watchLocked;
   if(typeof _clearPlaceBetsRecheckTimers === 'function') _clearPlaceBetsRecheckTimers();
   draft = freshDraft();
   draft.autoFlow = keepAuto;
   draft.shoeSyncOpen = keepSync;
   draft.mobDockMin = keepMob;
   draft.viewShoeId = keepView;
+  draft.watchLocked = keepWatchLock;
   draft.lastTcTrigger = shoeAfter.tc;
-  draft.playMode = nextVerdict.units > 0 ? 'bet' : 'watch';
-  draft.stake = nextVerdict.units > 0 ? nextVerdict.recStake : cfg().unit;
+  draft.playMode = (!keepWatchLock && nextVerdict.units > 0) ? 'bet' : 'watch';
+  draft.stake = (!keepWatchLock && nextVerdict.units > 0) ? nextVerdict.recStake : cfg().unit;
   draft.lastMsg = outcomeType === 'WATCH'
     ? `👁️ Logged Watched Round #${s.rounds.length} (₱0 · ${totalCardsThisRound} cards tracked) · Next Shoe TC: ${shoeAfter.tc>=0?'+':''}${shoeAfter.tc.toFixed(2)}`
     : `✅ Logged Round #${s.rounds.length} (${loggedOutcome} · ${fmtSign(net)}) · Next Shoe TC: ${shoeAfter.tc>=0?'+':''}${shoeAfter.tc.toFixed(2)}`;
@@ -2590,6 +2594,7 @@ function startNewSession(){
   draft.playMode = 'watch';
   draft.trackCommunityFelt = false;
   draft.manualBetOverride = false;
+  draft.watchLocked = false;
   save();
   render();
 }
@@ -2614,6 +2619,7 @@ function startNewShoe(s, reason = 'cut'){
   draft.playMode = 'watch';
   draft.trackCommunityFelt = false;
   draft.manualBetOverride = false;
+  draft.watchLocked = false;
   draft.stake = cfg().unit;
   draft.viewShoeId = null;
   draft.lastMsg = `🔄 Archived Shoe #${prevShoeNum} (${reason==='cut'?'Cut Card Reached':'Early Switch'}) & started Fresh 8-Deck Shoe #${prevShoeNum + 1} (TC 0.00).`;
@@ -3008,7 +3014,7 @@ function renderPlay(){
       <!-- Round Mode & Settlement Controls -->
       <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
         <div class="seg">
-          <button class="W ${draft.playMode==='watch'?'on':''}" id="modeWatchBtn">👁️ Sit Out &amp; Watch (₱0)</button>
+          <button class="W ${draft.playMode==='watch'?'on':''} ${draft.playMode==='watch'&&draft.watchLocked?'locked':''}" id="modeWatchBtn" title="Double-click / double-tap to ${draft.watchLocked?'unlock':'lock'} Sit &amp; Watch mode">👁️ Sit Out &amp; Watch (₱0)${draft.watchLocked?' 🔒 LOCKED':''}</button>
           <button class="BET ${draft.playMode==='bet'?'on':''}" id="modeBetBtn">💵 Play / Bet This Hand</button>
         </div>
 
@@ -3437,13 +3443,25 @@ function renderPlay(){
     b.onclick = () => pushCardToDraft(+b.dataset.card);
   });
 
+  if(typeof window._lastWatchBtnTapTs !== 'number') window._lastWatchBtnTapTs = 0;
   document.getElementById('modeWatchBtn').onclick = () => {
+    const now = Date.now();
+    const isDoubleTap = (now - window._lastWatchBtnTapTs) <= 450;
+    window._lastWatchBtnTapTs = isDoubleTap ? 0 : now;
+    if(isDoubleTap){
+      draft.watchLocked = !draft.watchLocked;
+      draft.lastMsg = draft.watchLocked
+        ? '🔒 Sit Out & Watch LOCKED — will stay in Watch mode even when 1+ unit is recommended (double-tap to unlock).'
+        : '🔓 Sit Out & Watch unlocked — will auto-switch to Play mode when 1+ unit is recommended.';
+    }
     draft.playMode = 'watch';
     draft.trackCommunityFelt = false;
     draft.manualBetOverride = false;
     render();
   };
   document.getElementById('modeBetBtn').onclick = () => {
+    window._lastWatchBtnTapTs = 0;
+    draft.watchLocked = false;
     draft.playMode = 'bet';
     draft.manualBetOverride = (verdict.units === 0);
     if(verdict.units > 0) draft.stake = verdict.recStake;
