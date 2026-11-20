@@ -244,3 +244,47 @@ def test_discard_cross_sensor_veto_sustained_peak_and_soho_felt() -> None:
     res_ok = tr_v.step(_obs(26.5, shoe_state="OCCLUDED", disc_white=0.001, disc_dark=0.22, disc_teal=0.35), cards_seen=80, has_active_cards=False, in_betting_overlay=False, suppressed=False)
     assert res_ok == "discard_cleared"
 
+
+def test_live_shoe_baseline_and_stage_independent_swap() -> None:
+    """Live NCC resting-shoe baseline stays PRESENT under dimmed betting overlays, flags ABSENT on SHOE_ABSENT_1 (even with dark backup shoe in top half), and triggers in ANY stage even with active cards and dealer-arm occlusion."""
+    from detector import PlaytechDetector
+
+    cfg = CompanionConfig()
+    det = PlaytechDetector(cfg)
+    p1 = cv2.imread(str(COMP_DIR / "templates" / "ui" / "SHOE_PRESENT_1.png"))
+    a1 = cv2.imread(str(COMP_DIR / "templates" / "ui" / "SHOE_ABSENT_1.png"))
+    assert p1 is not None and a1 is not None
+
+    # 1. Lock live baseline over 2.0s on SHOE_PRESENT_1
+    for t in (0.0, 0.5, 1.0, 1.6, 2.0):
+        st, _, _ = det._classify_shoe_with_baseline(p1, t)
+        assert st == "PRESENT"
+    assert det._shoe_ref_gray is not None
+
+    # 2. Dimmed betting overlay (0.65x brightness) still reads PRESENT via brightness-invariant NCC
+    dimmed = np.clip(p1.astype(np.float32) * 0.65, 0, 255).astype(np.uint8)
+    st_dim, _, _ = det._classify_shoe_with_baseline(dimmed, 2.5)
+    assert st_dim == "PRESENT"
+
+    # 3. Shoe removed (SHOE_ABSENT_1, which has dark backup shoe in top half!) -> immediately ABSENT
+    st_abs, _, _ = det._classify_shoe_with_baseline(a1, 3.0)
+    assert st_abs == "ABSENT"
+
+    # 4. Always-on stage-independent trigger: mid-shoe join (cards_seen=2), LAST_BETS / active cards,
+    #    with a 2.0s OCCLUDED dealer-arm interruption while swapping -> MUST STILL ARM & TRIGGER!
+    tr = ShoeSwapTracker(ShoeDetectConfig())
+    assert tr.step(_obs(0.0, shoe_state="PRESENT", banner="LAST_BETS"), cards_seen=2, has_active_cards=True, in_betting_overlay=True, suppressed=False) is None
+    assert tr.step(_obs(2.2, shoe_state="PRESENT", banner="LAST_BETS"), cards_seen=2, has_active_cards=True, in_betting_overlay=True, suppressed=False) is None
+    assert tr.step(_obs(3.0, shoe_state="ABSENT", shoe_dark=0.1, shoe_teal=0.8, banner="NO_MORE_BETS"), cards_seen=2, has_active_cards=True, in_betting_overlay=False, suppressed=False) is None
+    assert tr.step(_obs(4.0, shoe_state="ABSENT", shoe_dark=0.1, shoe_teal=0.8), cards_seen=2, has_active_cards=True, in_betting_overlay=False, suppressed=False) is None
+    # 2.0s OCCLUDED dealer hands crossing empty spot does NOT wipe _shoe_absent_since
+    assert tr.step(_obs(4.5, shoe_state="OCCLUDED", shoe_dark=0.2, shoe_teal=0.2), cards_seen=2, has_active_cards=True, in_betting_overlay=False, suppressed=False) is None
+    assert tr.step(_obs(6.2, shoe_state="OCCLUDED", shoe_dark=0.2, shoe_teal=0.2), cards_seen=2, has_active_cards=True, in_betting_overlay=False, suppressed=False) is None
+    assert tr.step(_obs(6.6, shoe_state="ABSENT", shoe_dark=0.1, shoe_teal=0.8), cards_seen=2, has_active_cards=True, in_betting_overlay=False, suppressed=False) is None
+    assert tr._shoe_swap_armed is True
+    # New shoe returns while has_active_cards=True -> STILL TRIGGERS!
+    assert tr.step(_obs(7.0, shoe_state="PRESENT"), cards_seen=2, has_active_cards=True, in_betting_overlay=False, suppressed=False) is None
+    res = tr.step(_obs(8.3, shoe_state="PRESENT"), cards_seen=2, has_active_cards=True, in_betting_overlay=False, suppressed=False)
+    assert res == "shoe_swap"
+
+

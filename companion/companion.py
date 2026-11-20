@@ -5,10 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import logging
-from logging.handlers import RotatingFileHandler
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -34,6 +31,7 @@ from win_anchor import (
     WindowCapturer,
     WindowRect,
     detect_game_viewport_local,
+    detect_split_view_left_pane,
     disable_high_res_timer,
     enable_high_res_timer,
     find_target_window,
@@ -69,8 +67,8 @@ def _draw_preview(
     fh, fw = canvas.shape[:2]
     vx, vy, vw, vh = vp_local
 
-    # Highlight detected Playtech 16:9 game viewport inside Brave
-    if cfg.anchor_mode == "game_viewport":
+    # Highlight detected Playtech 16:9 game viewport inside Brave / iPad Split View
+    if cfg.anchor_mode in ("game_viewport", "ipad_split_left"):
         cv2.rectangle(canvas, (vx, vy), (vx + vw - 1, vy + vh - 1), (255, 255, 255), 1)
         ax, ay, aw, ah = vx, vy, vw, vh
     else:
@@ -116,77 +114,16 @@ def _draw_preview(
     disp_w, disp_h = max(320, int(round(cw * scale))), max(240, int(round(ch * scale)))
 
     win_name = "Playtech Companion Preview (Q=quit)"
-    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win_name, disp_w, disp_h)
+    has_gui = sys.platform == "win32" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if has_gui:
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win_name, disp_w, disp_h)
     cv2.imshow(win_name, combined)
     key = cv2.waitKey(1) & 0xFF
     return key not in (ord("q"), 27)
 
 
-LOG_PATH = COMPANION_DIR / "companion.log"
-PID_PATH = COMPANION_DIR / "companion.pid"
-
-
-class _TeeStream:
-    """Forwards print() output to both console (if attached) and companion.log (pythonw-safe)."""
-
-    def __init__(self, orig: Any, log_handler: RotatingFileHandler) -> None:
-        self._orig = orig
-        self._handler = log_handler
-
-    def write(self, data: str) -> int:
-        if not data:
-            return 0
-        if self._orig is not None:
-            try:
-                self._orig.write(data)
-            except Exception:
-                pass
-        for line in data.splitlines():
-            if line.strip():
-                rec = logging.LogRecord("bj_companion", logging.INFO, "", 0, line, (), None)
-                try:
-                    self._handler.emit(rec)
-                except Exception:
-                    pass
-        return len(data)
-
-    def flush(self) -> None:
-        if self._orig is not None:
-            try:
-                self._orig.flush()
-            except Exception:
-                pass
-        try:
-            self._handler.flush()
-        except Exception:
-            pass
-
-
-def _init_file_logging() -> None:
-    handler = RotatingFileHandler(LOG_PATH, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    sys.stdout = _TeeStream(sys.stdout, handler)  # type: ignore[assignment]
-    sys.stderr = _TeeStream(sys.stderr, handler)  # type: ignore[assignment]
-
-
-def read_tail_logs(max_lines: int = 120) -> str:
-    if not LOG_PATH.exists():
-        return "(no logs yet)"
-    try:
-        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-        return "\n".join(lines[-max(10, min(500, int(max_lines))):])
-    except Exception as exc:
-        return f"(failed reading log: {exc})"
-
-
 async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
-    stop_requested = False
-    restart_requested = False
-    try:
-        PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
-    except Exception:
-        pass
     detector = PlaytechDetector(cfg)
     sm = CompanionStateMachine(cfg)
     keepalive = WatchKeepaliveManager(cfg.keepalive)
@@ -217,8 +154,6 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     last_banner_img = empty
     last_pb_img = empty
     last_center_img = empty
-    last_shoe_img = empty
-    last_discard_img = empty
     ext_status_dirty = False
     bridge: CompanionBridge | None = None
     cached_tpl_counts: dict[str, dict[str, int]] = list_template_counts()
@@ -247,7 +182,6 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
             "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             "extConnected": bool(bridge is not None and bridge.has_extension_client),
             "keepalive": keepalive.to_status(time.monotonic()),
-            "shoeDetect": sm.shoe_tracker.status_dict(),
         }
 
     def _refresh_anchor_from_full(win: WindowRect) -> tuple[WindowRect, tuple[int, int, int, int], np.ndarray]:
@@ -301,8 +235,8 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
         s_img = _crop_norm(calib_snapshot, test_rois["shuffle_roi"])
         b_img = _crop_norm(calib_snapshot, test_rois["banner_roi"])
         pb_img = _crop_norm(calib_snapshot, test_rois["place_bets_roi"]) if "place_bets_roi" in test_rois else empty
-        sh_img = _crop_norm(calib_snapshot, test_rois["shoe_roi"]) if "shoe_roi" in test_rois else empty
-        dc_img = _crop_norm(calib_snapshot, test_rois["discard_roi"]) if "discard_roi" in test_rois else empty
+        shoe_img = _crop_norm(calib_snapshot, test_rois["shoe_roi"]) if "shoe_roi" in test_rois else empty
+        disc_img = _crop_norm(calib_snapshot, test_rois["discard_roi"]) if "discard_roi" in test_rois else empty
 
         center_probe_roi = (0.34, 0.25, 0.32, 0.28)
         needs_center_probe = ("place_bets_roi" not in test_rois) and (
@@ -312,6 +246,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
 
         prev_hash = detector._last_hud_hash
         detector._last_hud_hash = None
+        detector._last_shoe_scan_ts = -999.0
         obs = detector.process_crops(
             player_img=p_img,
             dealer_img=d_img,
@@ -321,9 +256,8 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
             hud_refreshed=True,
             center_img=c_probe_img,
             place_bets_img=pb_img,
-            force_dealer_scan=True,
-            shoe_img=sh_img,
-            discard_img=dc_img,
+            shoe_img=shoe_img if shoe_img.size else None,
+            discard_img=disc_img if disc_img.size else None,
         )
         detector._last_hud_hash = prev_hash
 
@@ -507,7 +441,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
 
         if mtype == "calib_grab":
             req_mode = msg.get("anchorMode")
-            if req_mode in ("game_viewport", "window", "toolbar"):
+            if req_mode in ("game_viewport", "ipad_split_left", "window", "toolbar"):
                 calib_anchor_mode = req_mode
             else:
                 calib_anchor_mode = cfg.anchor_mode
@@ -517,7 +451,11 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 return {"type": "calib_error", "error": "Casino window not found. Keep Newport/Playtech open (not minimized)."}
             win_cache = win
             win_bgr = capturer.grab_window(win)
-            vp_local = detect_game_viewport_local(win_bgr)
+            vp_local = (
+                detect_split_view_left_pane(win_bgr)
+                if calib_anchor_mode == "ipad_split_left"
+                else detect_game_viewport_local(win_bgr)
+            )
             calib_vp_local = vp_local
             calib_full_size = (win.width, win.height)
 
@@ -525,7 +463,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 tw = min(win_bgr.shape[1], 420)
                 th = min(win_bgr.shape[0], 160)
                 calib_snapshot = win_bgr[:th, :tw].copy()
-            elif calib_anchor_mode == "game_viewport":
+            elif calib_anchor_mode in ("game_viewport", "ipad_split_left"):
                 vx, vy, vw, vh = vp_local
                 calib_snapshot = win_bgr[vy : vy + vh, vx : vx + vw].copy()
             else:
@@ -554,8 +492,9 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 if k in cfg.rois:
                     cfg.rois[k] = normalize_roi(v)
             req_mode = msg.get("anchorMode")
-            if req_mode in ("game_viewport", "window"):
+            if req_mode in ("game_viewport", "ipad_split_left", "window"):
                 cfg.anchor_mode = req_mode
+            detector.reset_shoe_baseline()
             save_config(cfg)
             vp_smoother.reset()
             anchor_cache = None
@@ -588,7 +527,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 rx, ry, rw, rh = norm_r
                 cx_px = int(round((rx + rw * 0.5) * sw))
                 cy_px = int(round((ry + rh * 0.5) * sh))
-                if calib_anchor_mode == "game_viewport":
+                if calib_anchor_mode in ("game_viewport", "ipad_split_left"):
                     cx_px += int(calib_vp_local[0])
                     cy_px += int(calib_vp_local[1])
                 cfg.keepalive.reload_btn_offset = [cx_px, cy_px]
@@ -684,28 +623,6 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 "reloadBtnOffset": cfg.keepalive.reload_btn_offset,
             }
 
-        if mtype == "undo_new_shoe":
-            sm.on_undo_new_shoe(time.monotonic())
-            print("[ShoeDetect] Undo New Shoe received from tracker UI (30s cooldown active).")
-            return build_status(win_cache)
-
-        if mtype == "get_logs":
-            lines = int(msg.get("lines", 120))
-            return {"type": "companion_logs", "text": read_tail_logs(lines), "path": str(LOG_PATH)}
-
-        if mtype == "stop_companion":
-            nonlocal stop_requested
-            print("[Companion] Stop requested by tracker UI.")
-            stop_requested = True
-            return {"type": "companion_stopping", "action": "stop"}
-
-        if mtype == "restart_companion":
-            nonlocal restart_requested
-            print("[Companion] Restart requested by tracker UI.")
-            restart_requested = True
-            stop_requested = True
-            return {"type": "companion_stopping", "action": "restart"}
-
         return None
 
     def _on_ext_disconnect() -> None:
@@ -738,6 +655,8 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     was_felt_armed = False
     last_pb_img = np.empty((0, 0, 3), dtype=np.uint8)
     last_loading_img = np.empty((0, 0, 3), dtype=np.uint8)
+    last_shoe_img = np.empty((0, 0, 3), dtype=np.uint8)
+    last_discard_img = np.empty((0, 0, 3), dtype=np.uint8)
     last_armed_diag_ts = 0.0
     last_armed_diag_sig = ""
     grab_failures = 0
@@ -747,7 +666,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     next_felt_ts = next_hud_ts
 
     try:
-        while not stop_requested:
+        while True:
             now = time.monotonic()
             dt = max(1e-3, now - prev_tick)
             prev_tick = now
@@ -855,7 +774,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                             vp_local_cache[1] : vp_local_cache[1] + vp_local_cache[3],
                             vp_local_cache[0] : vp_local_cache[0] + vp_local_cache[2],
                         ]
-                        if cfg.anchor_mode == "game_viewport"
+                        if cfg.anchor_mode in ("game_viewport", "ipad_split_left")
                         else full_win
                     )
                     full_img = base_img
@@ -864,9 +783,9 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                     last_shuffle_img = _crop_norm(base_img, cfg.rois["shuffle_roi"])
                     last_banner_img = _crop_norm(base_img, cfg.rois["banner_roi"])
                     last_pb_img = _crop_norm(base_img, cfg.rois["place_bets_roi"]) if "place_bets_roi" in cfg.rois else empty
-                    last_center_img = _crop_norm(base_img, center_banner_roi) if need_center_probe else empty
                     last_shoe_img = _crop_norm(base_img, cfg.rois["shoe_roi"]) if "shoe_roi" in cfg.rois else empty
                     last_discard_img = _crop_norm(base_img, cfg.rois["discard_roi"]) if "discard_roi" in cfg.rois else empty
+                    last_center_img = _crop_norm(base_img, center_banner_roi) if need_center_probe else empty
                     comm_img = _crop_norm(base_img, cfg.rois["community_roi"]) if felt_armed else empty
                     dealer_felt_img = (
                         _crop_norm(base_img, cfg.rois["dealer_felt_roi"])
@@ -892,19 +811,11 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                             "banner_roi": cfg.rois["banner_roi"],
                         }
                         if "place_bets_roi" in cfg.rois:
-                            prx, pry, prw, prh = cfg.rois["place_bets_roi"]
-                            if prh < 0.07:
-                                pry = max(0.0, pry - (0.075 - prh) * 0.5)
-                                prh = 0.075
-                            if prw < 0.22:
-                                prx = max(0.0, prx - (0.22 - prw) * 0.5)
-                                prw = 0.22
-                            rois_to_grab["place_bets_roi"] = (prx, pry, min(1.0 - prx, prw), min(1.0 - pry, prh))
-                        if cfg.shoe_detect.enabled:
-                            if cfg.shoe_detect.enable_shoe_roi and "shoe_roi" in cfg.rois:
-                                rois_to_grab["shoe_roi"] = cfg.rois["shoe_roi"]
-                            if cfg.shoe_detect.enable_discard_fallback and "discard_roi" in cfg.rois:
-                                rois_to_grab["discard_roi"] = cfg.rois["discard_roi"]
+                            rois_to_grab["place_bets_roi"] = cfg.rois["place_bets_roi"]
+                        if "shoe_roi" in cfg.rois:
+                            rois_to_grab["shoe_roi"] = cfg.rois["shoe_roi"]
+                        if "discard_roi" in cfg.rois:
+                            rois_to_grab["discard_roi"] = cfg.rois["discard_roi"]
                         rois_to_grab["loading_probe"] = loading_probe_roi
                         if (need_center_probe and detector.is_center_scan_due(now, cards_active)) or keepalive.state in ("REFRESHING", "RECOVERING"):
                             rois_to_grab["center_probe"] = center_banner_roi
@@ -922,10 +833,10 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         last_shuffle_img = crops["shuffle_roi"]
                         last_banner_img = crops["banner_roi"]
                         last_pb_img = crops.get("place_bets_roi", empty)
-                        last_loading_img = crops.get("loading_probe", empty)
-                        last_center_img = crops.get("center_probe", empty)
                         last_shoe_img = crops.get("shoe_roi", empty)
                         last_discard_img = crops.get("discard_roi", empty)
+                        last_loading_img = crops.get("loading_probe", empty)
+                        last_center_img = crops.get("center_probe", empty)
                         comm_img = crops.get("community_roi", empty) if felt_armed else empty
                         dealer_felt_img = crops.get("dealer_felt_roi", empty) if felt_armed else empty
                         last_hud_ts = now
@@ -989,7 +900,6 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 if is_loading_screen:
                     obs = FrameObservation(ts=now, hud_refreshed=hud_due, loading_screen=True)
                 else:
-                    force_dealer_scan = sm.state == "DEALER_TURN" or ("BACK" in sm.d_debouncer.committed_ranks)
                     obs = detector.process_crops(
                         player_img=last_player_img,
                         dealer_img=last_dealer_img,
@@ -1005,14 +915,15 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         banner_refreshed=hud_due,
                         dealer_only=dealer_only_tick,
                         dealer_felt_img=dealer_felt_img,
-                        force_dealer_scan=force_dealer_scan,
-                        shoe_img=last_shoe_img,
-                        discard_img=last_discard_img,
+                        shoe_img=last_shoe_img if last_shoe_img.size else None,
+                        discard_img=last_discard_img if last_discard_img.size else None,
                     )
                 in_ka_reload = keepalive.state in ("REFRESHING", "RECOVERING")
                 if not in_ka_reload and not is_loading_screen:
                     events = sm.step(obs, keepalive_grace=in_grace_now)
                     if events:
+                        if any(ev.get("type") == "new_shoe" for ev in events):
+                            detector.reset_shoe_baseline()
                         await bridge.broadcast_many(events)
 
                 if hud_due:
@@ -1176,29 +1087,9 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
             cv2.destroyAllWindows()
         capturer.close()
         await bridge.stop()
-        try:
-            PID_PATH.unlink(missing_ok=True)
-        except Exception:
-            pass
-        if restart_requested:
-            flags = (
-                getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-                if os.name == "nt"
-                else 0
-            )
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve())],
-                cwd=str(COMPANION_DIR),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=flags,
-                close_fds=True,
-            )
 
 
 def main() -> None:
-    _init_file_logging()
     parser = argparse.ArgumentParser(description="Playtech All Bets Blackjack local desktop companion.")
     parser.add_argument("--config", type=Path, help="Optional path to custom config.json")
     parser.add_argument("--preview", action="store_true", help="Show live annotated ROI/detection preview window")
