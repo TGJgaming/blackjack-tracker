@@ -2285,6 +2285,14 @@ console.log("29. Testing strict dealer completeness & PLACE_BETS 0s/+3s rechecks
   fillRect(live37, 220, 260, 140, 60, 250, 250, 250);
   assert.strictEqual(Engine.detectLoadingScreen(live37), false, "Must NOT trigger on live green felt table");
 
+  const det37 = new Engine.PlaytechDetector(cfg, pack);
+  det37._ensureBankDecoded("ui");
+  const loadingTpls37 = (det37.banks.ui || []).filter((t) => t && (t.rank === "LOADING" || (t.name && t.name.startsWith("LOADING_ALLBETS"))));
+  assert.strictEqual(loadingTpls37.length, 1, "LOADING_ALLBETS_1.png must be loaded in detector.banks.ui");
+  const nonBlue37 = Engine.createImage(325, 556, 3, 45);
+  pasteImage(nonBlue37, loadingTpls37[0].bgr, 98, 206);
+  assert.strictEqual(Engine.detectLoadingScreen(nonBlue37, loadingTpls37), true, "Must detect LOADING_ALLBETS_1.png template even on non-blue background");
+
   const prevHostHook = globalThis.__ipadCompanionSetHostInfo;
   const prevExtHook = globalThis.__ipadCompanionSetExtConnected;
   const rt37 = new Engine.IpadCompanionRuntime();

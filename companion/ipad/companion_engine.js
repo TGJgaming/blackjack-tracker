@@ -1561,7 +1561,7 @@
     return [null, bestConf, null];
   }
 
-  function detectLoadingScreen(anchorBgr) {
+  function detectLoadingScreen(anchorBgr, loadingTpls = null) {
     if (!anchorBgr || anchorBgr.c !== 3 || anchorBgr.w < 40 || anchorBgr.h < 40) return false;
     const th = 140;
     const tw = Math.max(48, Math.min(260, Math.round(anchorBgr.w * (th / anchorBgr.h))));
@@ -1580,6 +1580,33 @@
       gVar += d * d;
     }
     if (Math.sqrt(gVar / Math.max(1, coreN)) < 8.5) return true;
+
+    // 2. Reliable template match for the Playtech "ALL BETS" loading logo in center band [x:0.10..0.90, y:0.25..0.68]
+    if (Array.isArray(loadingTpls) && loadingTpls.length > 0) {
+      const rx0 = Math.floor(anchorBgr.w * 0.10);
+      const ry0 = Math.floor(anchorBgr.h * 0.25);
+      const rw = Math.max(20, Math.floor(anchorBgr.w * 0.80));
+      const rh = Math.max(20, Math.floor(anchorBgr.h * 0.43));
+      const band = cropImage(anchorBgr, rx0, ry0, rw, rh);
+      const nh = 100;
+      const nw = Math.max(40, Math.round(rw * (nh / Math.max(1, rh))));
+      const bandGray = toGray(resizeImage(band, nw, nh));
+      const bandPrep = prepareSourceForMatch(bandGray, false);
+      for (const tpl of loadingTpls) {
+        const tGray = tpl && tpl.gray;
+        if (!tGray || tGray.w < 8 || tGray.h < 4) continue;
+        for (const sc of [0.30, 0.34, 0.38, 0.42, 0.48, 0.56]) {
+          const sw = Math.max(12, Math.round(tGray.w * sc));
+          const sh = Math.max(6, Math.round(tGray.h * sc));
+          if (sw > nw || sh > nh) continue;
+          const st = resizeImage(tGray, sw, sh);
+          const m = matchTemplateCCoeffNormed(bandGray, st, bandPrep);
+          for (let i = 0; i < m.data.length; i++) {
+            if (m.data[i] >= 0.72) return true;
+          }
+        }
+      }
+    }
 
     // 2. Playtech blurred-blue loading splash: cool blue wash (B > G, B - R > 14, B >= 45) + blurred top + splash sig
     const blueMask = new Uint8Array(coreN);
@@ -6190,7 +6217,13 @@
         this.sm.state === "DEALER_TURN" ||
         (this.sm.dDebouncer && this.sm.dDebouncer.committedRanks.includes("BACK"));
 
-      const isLoading = detectLoadingScreen(anchorImg);
+      if (this.detector && typeof this.detector._ensureBankDecoded === "function") {
+        this.detector._ensureBankDecoded("ui");
+      }
+      const loadingTpls = (this.detector && this.detector.banks && Array.isArray(this.detector.banks.ui))
+        ? this.detector.banks.ui.filter((t) => t && (t.rank === "LOADING" || (t.name && t.name.startsWith("LOADING_ALLBETS"))))
+        : [];
+      const isLoading = detectLoadingScreen(anchorImg, loadingTpls);
       this._lastLoadingScreen = isLoading;
       const inKaReload = Boolean(this.keepalive && ["REFRESHING", "RECOVERING"].includes(this.keepalive.state));
       const inKaGrace = Boolean(this.keepalive && typeof this.keepalive.inGracePeriod === "function" && this.keepalive.inGracePeriod(now));

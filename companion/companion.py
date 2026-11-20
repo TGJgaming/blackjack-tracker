@@ -792,7 +792,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         }
                         if "place_bets_roi" in cfg.rois:
                             rois_to_grab["place_bets_roi"] = cfg.rois["place_bets_roi"]
-                        if need_center_probe and detector.is_center_scan_due(now, cards_active):
+                        if (need_center_probe and detector.is_center_scan_due(now, cards_active)) or keepalive.state in ("REFRESHING", "RECOVERING"):
                             rois_to_grab["center_probe"] = center_banner_roi
                         if felt_armed:
                             rois_to_grab["community_roi"] = cfg.rois["community_roi"]
@@ -861,7 +861,13 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                 is_loading_screen = bool(
                     detect_loading_screen(full_img)
                     if full_img.size
-                    else detect_loading_screen_crops(last_shuffle_img, last_player_img, last_dealer_img)
+                    else detect_loading_screen_crops(
+                        last_shuffle_img,
+                        last_player_img,
+                        last_dealer_img,
+                        center_img=last_center_img,
+                        place_bets_img=last_pb_img,
+                    )
                 )
                 if is_loading_screen:
                     obs = FrameObservation(ts=now, hud_refreshed=hud_due, loading_screen=True)
