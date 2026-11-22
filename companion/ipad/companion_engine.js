@@ -3176,8 +3176,8 @@
     if (aConf >= 0.72 && aConf >= pConf + 0.08 && (feltFrac >= 0.25 || botFeltFrac >= 0.45)) state = "ABSENT";
     else if (pConf >= 0.70 && pConf >= aConf + 0.08 && darkFrac >= 0.22) state = "PRESENT";
     else if (darkFrac <= 0.24 && feltFrac >= 0.45) state = "ABSENT";
-    else if (botFeltFrac >= 0.65 && botDarkFrac <= 0.22 && feltFrac >= 0.35 && pConf < 0.70) state = "ABSENT";
     else if (darkFrac >= 0.28 && feltFrac <= 0.62) state = "PRESENT";
+    else if (botFeltFrac >= 0.65 && botDarkFrac <= 0.22 && feltFrac >= 0.35 && pConf < 0.70) state = "ABSENT";
     return {
       state,
       darkFrac: Number(darkFrac.toFixed(4)),

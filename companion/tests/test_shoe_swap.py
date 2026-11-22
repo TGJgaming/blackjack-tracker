@@ -287,4 +287,11 @@ def test_live_shoe_baseline_and_stage_independent_swap() -> None:
     res = tr.step(_obs(8.3, shoe_state="PRESENT"), cards_seen=2, has_active_cards=True, in_betting_overlay=False, suppressed=False)
     assert res == "shoe_swap"
 
+    # 5. Soho red/burgundy felt with shoe in upper half (dark~0.44, felt~0.56, bot_felt~0.96, no template) -> PRESENT (not false ABSENT!)
+    soho_shoe = np.full((60, 80, 3), (20, 18, 102), dtype=np.uint8)  # deep burgundy felt
+    soho_shoe[0:30, 5:75] = (14, 14, 14)  # dark dealing shoe in upper half
+    st_soho, d_soho, f_soho = detect_shoe_state(soho_shoe, present_tpls=[], absent_tpls=[])
+    assert st_soho == "PRESENT", f"Soho shoe must be PRESENT, got {st_soho} (dark={d_soho}, felt={f_soho})"
+
+
 

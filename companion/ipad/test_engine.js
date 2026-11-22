@@ -2478,6 +2478,13 @@ console.log("40. Testing live shoe NCC baseline, stage-independent trigger & cal
   assert.deepStrictEqual(rt40.cfg.shoe_roi, [0.7, 0.3, 0.2, 0.12]);
   assert.deepStrictEqual(rt40.cfg.discard_roi, [0.05, 0.35, 0.18, 0.18]);
   assert.strictEqual(rt40.detector._shoeRefGray, null, "calib_save_rois must reset live shoe baseline");
+
+  // 6. Soho red/burgundy felt with shoe in upper half (dark~0.44, felt~0.56, bot_felt~0.96, no template) -> PRESENT
+  const sohoShoe = Engine.createImage(80, 60, 3, 20);
+  fillRect(sohoShoe, 0, 0, 80, 60, 20, 18, 102);
+  fillRect(sohoShoe, 5, 0, 70, 30, 14, 14, 14);
+  const sohoShoeRes = Engine.detectShoeState(sohoShoe, [], []);
+  assert.strictEqual(sohoShoeRes.state, "PRESENT", `Soho shoe must be PRESENT, got ${sohoShoeRes.state}`);
   console.log("   Test 40 PASSED");
 }
 
