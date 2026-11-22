@@ -169,10 +169,10 @@ def detect_shoe_state(
         state = "PRESENT"
     elif dark_frac <= 0.24 and felt_frac >= 0.45:
         state = "ABSENT"
-    elif bot_felt >= 0.65 and bot_dark <= 0.22 and felt_frac >= 0.35 and p_conf < 0.70:
-        state = "ABSENT"
     elif dark_frac >= 0.28 and felt_frac <= 0.62:
         state = "PRESENT"
+    elif bot_felt >= 0.65 and bot_dark <= 0.22 and felt_frac >= 0.35 and p_conf < 0.70:
+        state = "ABSENT"
     else:
         state = "OCCLUDED"
     return state, round(dark_frac, 4), round(felt_frac, 4)

@@ -4753,7 +4753,7 @@ function handleCompanionMessage(msg){
     const pbTxt = (msg.placeBets && msg.placeBets.conf > 0) ? `PlaceBets: ${Math.round(msg.placeBets.conf*100)}% · ` : '';
     const fTxt = (cfCnt || dfCnt) ? ` · Felt: ${cfCnt} Comm [B], ${dfCnt} Dealer [D]` : '';
     const sd = msg.shoeDetect;
-    const sdTxt = sd ? ` · Shoe: ${sd.shoeState} (dark ${Math.round((sd.shoeDark||0)*100)}%, teal ${Math.round((sd.shoeTeal||0)*100)}%) · Discard: white ${((sd.discardWhite||0)*100).toFixed(1)}% (dark ${Math.round((sd.discardDark||0)*100)}%)` : '';
+    const sdTxt = sd ? ` · Shoe: ${sd.shoeState} (dark ${Math.round((sd.shoeDark||0)*100)}%, felt ${Math.round((sd.shoeTeal||0)*100)}%) · Discard: white ${((sd.discardWhite||0)*100).toFixed(1)}% (dark ${Math.round((sd.discardDark||0)*100)}%)` : '';
     _calib.status = `🧪 ${bState}${pbTxt}Matched ${pCnt} Player${sTxt} & ${dCnt} Dealer HUD card(s)${fTxt}${sdTxt}.`;
     renderCalibModal();
     return;
