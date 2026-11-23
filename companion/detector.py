@@ -163,15 +163,15 @@ def detect_shoe_state(
     p_conf = _match_ui_templates(shoe_img, p_tpls) if p_tpls else 0.0
     a_conf = _match_ui_templates(shoe_img, a_tpls) if a_tpls else 0.0
 
-    if a_conf >= 0.72 and a_conf >= p_conf + 0.08 and (felt_frac >= 0.25 or bot_felt >= 0.45):
+    if a_conf >= 0.86 and a_conf >= p_conf + 0.16 and felt_frac >= 0.38 and bot_dark <= 0.22:
         state = "ABSENT"
-    elif p_conf >= 0.70 and p_conf >= a_conf + 0.08 and dark_frac >= 0.22:
+    elif p_conf >= 0.72 and p_conf >= a_conf + 0.08 and dark_frac >= 0.22:
         state = "PRESENT"
-    elif dark_frac <= 0.24 and felt_frac >= 0.45:
+    elif dark_frac <= 0.22 and felt_frac >= 0.48:
         state = "ABSENT"
     elif dark_frac >= 0.28 and felt_frac <= 0.62:
         state = "PRESENT"
-    elif bot_felt >= 0.65 and bot_dark <= 0.22 and felt_frac >= 0.35 and p_conf < 0.70:
+    elif bot_felt >= 0.70 and bot_dark <= 0.20 and felt_frac >= 0.40 and dark_frac < 0.32:
         state = "ABSENT"
     else:
         state = "OCCLUDED"
@@ -2452,6 +2452,7 @@ class PlaytechDetector:
         force_dealer_scan: bool = False,
         shoe_img: np.ndarray | None = None,
         discard_img: np.ndarray | None = None,
+        use_shoe_baseline: bool = True,
     ) -> FrameObservation:
         """Analyze cropped ROIs and return detections for a single tick."""
         now = ts if ts is not None else time.monotonic()
@@ -2705,7 +2706,10 @@ class PlaytechDetector:
         ):
             self._last_shoe_scan_ts = now
             if shoe_img is not None and shoe_img.size:
-                shoe_state, shoe_dark, shoe_teal = self._classify_shoe_with_baseline(shoe_img, now)
+                if use_shoe_baseline:
+                    shoe_state, shoe_dark, shoe_teal = self._classify_shoe_with_baseline(shoe_img, now)
+                else:
+                    shoe_state, shoe_dark, shoe_teal = detect_shoe_state(shoe_img)
                 self._cached_shoe = (shoe_state, shoe_dark, shoe_teal)
             if discard_img is not None and discard_img.size:
                 disc_white, disc_dark, disc_teal = detect_discard_stack(discard_img)
@@ -2752,13 +2756,7 @@ class PlaytechDetector:
     def _classify_shoe_with_baseline(
         self, shoe_img: np.ndarray, now: float
     ) -> tuple[str, float, float]:
-        """Classify shoe_roi using both stateless template/HSV cues and a live resting-shoe NCC baseline.
-
-        Because NCC is invariant to uniform brightness/contrast shifts (e.g. dimmed betting overlays),
-        the live baseline reliably stays PRESENT while the shoe sits in place and immediately flags
-        ABSENT when the shoe leaves its spot — even if a dark table rim or backup shoe sits in the
-        upper half of shoe_roi.
-        """
+        """Classify shoe_roi using both stateless template/HSV cues and a live resting-shoe NCC baseline."""
         st, dark_frac, felt_frac = detect_shoe_state(shoe_img)
         cur_gray = _shoe_gray_48x36(shoe_img)
         hsv = cv2.cvtColor(shoe_img, cv2.COLOR_BGR2HSV)
@@ -2802,18 +2800,25 @@ class PlaytechDetector:
                 self._shoe_ref_bot_felt = 0.98 * self._shoe_ref_bot_felt + 0.02 * bot_felt
             return "PRESENT", dark_frac, felt_frac
 
-        if ref_ncc < 0.52:
-            felt_rose = (felt_frac >= self._shoe_ref_felt + 0.12) or (bot_felt >= self._shoe_ref_bot_felt + 0.15)
-            dark_dropped = (dark_frac <= self._shoe_ref_dark - 0.12) or (bot_dark <= self._shoe_ref_bot_dark - 0.15)
-            empty_still = (ref_ncc < 0.38) and (frame_ncc >= 0.82) and (felt_frac >= 0.20 or bot_felt >= 0.35)
-            if st == "ABSENT" or felt_rose or dark_dropped or empty_still:
+        if ref_ncc < 0.45:
+            # Genuine shoe removal: stateless ABSENT, OR felt rose AND dark dropped significantly
+            full_emptied = (felt_frac >= self._shoe_ref_felt + 0.18) and (dark_frac <= self._shoe_ref_dark - 0.10)
+            bot_emptied = (bot_felt >= self._shoe_ref_bot_felt + 0.22) and (bot_dark <= self._shoe_ref_bot_dark - 0.18)
+            if st == "ABSENT" or full_emptied or bot_emptied:
                 self._shoe_new_present_since = None
                 return "ABSENT", dark_frac, felt_frac
-            # New shoe placed back down at a slightly shifted angle/position
+            # New shoe placed back down (or table switched) at a different angle/position -> PRESENT & auto-relock
             if st == "PRESENT" and frame_ncc >= 0.88:
                 if getattr(self, "_shoe_new_present_since", None) is None:
                     self._shoe_new_present_since = now
                 elif (now - self._shoe_new_present_since) >= 1.0:
+                    if (now - self._shoe_new_present_since) >= 2.0:
+                        self._shoe_ref_gray = cur_gray.copy()
+                        self._shoe_ref_dark = dark_frac
+                        self._shoe_ref_felt = felt_frac
+                        self._shoe_ref_bot_dark = bot_dark
+                        self._shoe_ref_bot_felt = bot_felt
+                        self._shoe_new_present_since = None
                     return "PRESENT", dark_frac, felt_frac
             else:
                 self._shoe_new_present_since = None
