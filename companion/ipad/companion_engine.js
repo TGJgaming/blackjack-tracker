@@ -3173,11 +3173,11 @@
     const pConf = presentTpls && presentTpls.length ? _matchUiTemplatesJs(shoeImg, presentTpls) : 0.0;
     const aConf = absentTpls && absentTpls.length ? _matchUiTemplatesJs(shoeImg, absentTpls) : 0.0;
     let state = "OCCLUDED";
-    if (aConf >= 0.72 && aConf >= pConf + 0.08 && (feltFrac >= 0.25 || botFeltFrac >= 0.45)) state = "ABSENT";
-    else if (pConf >= 0.70 && pConf >= aConf + 0.08 && darkFrac >= 0.22) state = "PRESENT";
-    else if (darkFrac <= 0.24 && feltFrac >= 0.45) state = "ABSENT";
+    if (aConf >= 0.86 && aConf >= pConf + 0.16 && feltFrac >= 0.38 && botDarkFrac <= 0.22) state = "ABSENT";
+    else if (pConf >= 0.72 && pConf >= aConf + 0.08 && darkFrac >= 0.22) state = "PRESENT";
+    else if (darkFrac <= 0.22 && feltFrac >= 0.48) state = "ABSENT";
     else if (darkFrac >= 0.28 && feltFrac <= 0.62) state = "PRESENT";
-    else if (botFeltFrac >= 0.65 && botDarkFrac <= 0.22 && feltFrac >= 0.35 && pConf < 0.70) state = "ABSENT";
+    else if (botFeltFrac >= 0.70 && botDarkFrac <= 0.20 && feltFrac >= 0.40 && darkFrac < 0.32) state = "ABSENT";
     return {
       state,
       darkFrac: Number(darkFrac.toFixed(4)),
@@ -3549,7 +3549,7 @@
       return [allP, hands, Object.keys(hands).length >= 2, clusters, []];
     }
 
-    processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, shoeImg = null, discardImg = null, ts = null, forceDealerScan = false }) {
+    processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, shoeImg = null, discardImg = null, ts = null, forceDealerScan = false, useShoeBaseline = true }) {
       const now = ts !== null ? ts : performance.now() / 1000;
       const REFRESH_PERIOD = 8;
       const HUD_REFRESH_PERIOD = 4;
@@ -3733,7 +3733,11 @@
           return this._fallbackUiPrefixCache[prefix];
         };
         if (shoeImg && shoeImg.w > 0 && shoeImg.h > 0) {
-          shoeRes = this._classifyShoeWithBaseline(shoeImg, getUiPrefix("SHOE_PRESENT_"), getUiPrefix("SHOE_ABSENT_"), now);
+          const pTpls = getUiPrefix("SHOE_PRESENT_");
+          const aTpls = getUiPrefix("SHOE_ABSENT_");
+          shoeRes = useShoeBaseline
+            ? this._classifyShoeWithBaseline(shoeImg, pTpls, aTpls, now)
+            : detectShoeState(shoeImg, pTpls, aTpls);
           this._cachedShoe = shoeRes;
         }
         if (discardImg && discardImg.w > 0 && discardImg.h > 0) {
@@ -3821,17 +3825,24 @@
         return { state: "PRESENT", darkFrac: res.darkFrac, tealFrac: res.tealFrac };
       }
 
-      if (refNcc < 0.52) {
-        const feltRose = (res.tealFrac >= this._shoeRefFelt + 0.12) || (res.botFeltFrac >= this._shoeRefBotFelt + 0.15);
-        const darkDropped = (res.darkFrac <= this._shoeRefDark - 0.12) || (res.botDarkFrac <= this._shoeRefBotDark - 0.15);
-        const emptyStill = (refNcc < 0.38) && (frameNcc >= 0.82) && (res.tealFrac >= 0.20 || res.botFeltFrac >= 0.35);
-        if (res.state === "ABSENT" || feltRose || darkDropped || emptyStill) {
+      if (refNcc < 0.45) {
+        const fullEmptied = (res.tealFrac >= this._shoeRefFelt + 0.18) && (res.darkFrac <= this._shoeRefDark - 0.10);
+        const botEmptied = (res.botFeltFrac >= this._shoeRefBotFelt + 0.22) && (res.botDarkFrac <= this._shoeRefBotDark - 0.18);
+        if (res.state === "ABSENT" || fullEmptied || botEmptied) {
           this._shoeNewPresentSince = null;
           return { state: "ABSENT", darkFrac: res.darkFrac, tealFrac: res.tealFrac };
         }
         if (res.state === "PRESENT" && frameNcc >= 0.88) {
           if (this._shoeNewPresentSince == null) this._shoeNewPresentSince = now;
           else if ((now - this._shoeNewPresentSince) >= 1.0) {
+            if ((now - this._shoeNewPresentSince) >= 2.0) {
+              this._shoeRefGray = new Float32Array(curGray);
+              this._shoeRefDark = res.darkFrac;
+              this._shoeRefFelt = res.tealFrac;
+              this._shoeRefBotDark = res.botDarkFrac;
+              this._shoeRefBotFelt = res.botFeltFrac;
+              this._shoeNewPresentSince = null;
+            }
             return { state: "PRESENT", darkFrac: res.darkFrac, tealFrac: res.tealFrac };
           }
         } else {
@@ -6929,6 +6940,7 @@
           shoeImg: cropNorm(snap, shoeRoi),
           discardImg: cropNorm(snap, discRoi),
           forceDealerScan: true,
+          useShoeBaseline: false,
         });
 
         const toNormDets = (roi, dets) => {

@@ -258,6 +258,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
             place_bets_img=pb_img,
             shoe_img=shoe_img if shoe_img.size else None,
             discard_img=disc_img if disc_img.size else None,
+            use_shoe_baseline=False,
         )
         detector._last_hud_hash = prev_hash
 
