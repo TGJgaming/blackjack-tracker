@@ -2517,6 +2517,32 @@ console.log("41. Testing phantom suitless Q rejection & manual resync dealer+pla
   fillRect(cardNoSuit, 10, 32, 3, 2, 40, 40, 40); // 6 dark noise pixels so hasPipBody=true, suitConf~0
   const [detsNoSuit] = Engine.detectClusterCards(cardNoSuit, [0, 0, 40, 45], det41.banks.hud, det41.banks.suit, 0.74, false, 0.84, null);
   assert.strictEqual(detsNoSuit.filter((d) => d.rank === "Q").length, 0, "Suitless phantom Q without suitConf must be rejected");
+
+  // Verify elongated 1/11 pill-occluded Ace on dealer (firstCardX ~ 15) is recovered at high confidence
+  const aTpl = (det41.banks.hud || []).find((t) => t.rank === "A");
+  const hTpl = (det41.banks.suit || []).find((t) => t.rank === "H");
+  assert(aTpl && hTpl, "A and H templates must exist");
+  const dPillCard = Engine.createImage(54, 45, 3, 245);
+  fillRect(dPillCard, 0, 0, 15, 45, 25, 25, 30); // elongated (1/11) pill shifting left paper edge to x=15
+  for (let y = 0; y < aTpl.gray.h && y + 2 < 23; y++) {
+    for (let x = 0; x < aTpl.gray.w && x + 15 < 54; x++) {
+      const v = aTpl.gray.data[y * aTpl.gray.w + x];
+      const o = ((y + 2) * 54 + (x + 15)) * 3;
+      dPillCard.data[o] = v; dPillCard.data[o + 1] = v; dPillCard.data[o + 2] = v;
+    }
+  }
+  fillRect(dPillCard, 0, 14, 19, 24, 25, 25, 30); // pill overlaps bottom-left of A
+  for (let y = 0; y < hTpl.bgr.h && y + 27 < 45; y++) {
+    for (let x = 0; x < hTpl.bgr.w && x + 18 < 54; x++) {
+      const so = (y * hTpl.bgr.w + x) * 3;
+      const doff = ((y + 27) * 54 + (x + 18)) * 3;
+      dPillCard.data[doff] = hTpl.bgr.data[so];
+      dPillCard.data[doff + 1] = hTpl.bgr.data[so + 1];
+      dPillCard.data[doff + 2] = hTpl.bgr.data[so + 2];
+    }
+  }
+  const [detsPillA] = Engine.detectClusterCards(dPillCard, [0, 0, 54, 45], det41.banks.hud, det41.banks.suit, 0.74, true, 0.84, null);
+  assert(detsPillA.some((d) => d.rank === "A" && d.conf >= 0.88), `Elongated pill-occluded dealer A must be recovered >= 0.88, got ${JSON.stringify(detsPillA)}`);
   console.log("   Test 41 PASSED");
 }
 

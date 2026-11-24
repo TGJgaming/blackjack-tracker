@@ -2096,7 +2096,7 @@
     }
     kept.sort((a, b) => a.x - b.x);
 
-    // Locate Card 0's true left paper edge above the circular badge (badge ring can shift cluster left by 4-6px)
+    // Locate Card 0's true left paper edge above the score pill/badge (elongated pills like 1/11 can shift cluster left by 12-20px)
     let firstCardX = 0;
     const topBandH = Math.min(8, normTop.h);
     if (topBandH > 1) {
@@ -2106,7 +2106,7 @@
           if (normTop.data[y * normTop.w + x] > paperThr) wc++;
         }
         if (wc / (topBandH - 1) >= 0.45) {
-          firstCardX = Math.min(Math.max(0, cwNorm - 12), Math.min(10, x));
+          firstCardX = Math.min(Math.max(0, cwNorm - 12), Math.min(24, x));
           break;
         }
       }
@@ -2120,9 +2120,9 @@
       }
     }
     const topPaper = topPaperTot > 0 ? topPaperCnt / topPaperTot : 0;
-    let badgeProbe = cropImage(normTop, Math.max(0, firstCardX), 14, Math.min(10, cwNorm - Math.max(0, firstCardX)), 9);
+    let badgeProbe = cropImage(normTop, Math.max(0, firstCardX - 2), 14, Math.min(10, cwNorm - Math.max(0, firstCardX - 2)), 9);
     if (normBgr.h >= 38) {
-      const bx0 = Math.max(0, firstCardX - 2);
+      const bx0 = Math.max(0, firstCardX - 4);
       const bx1 = Math.min(cwNorm, firstCardX + 10);
       badgeProbe = toMinGray(cropImage(normBgr, bx0, 18, bx1 - bx0, 20));
     }
@@ -2130,7 +2130,7 @@
     for (let i = 0; i < badgeProbe.data.length; i++) {
       if (badgeProbe.data[i] < badgeDarkThr) badgeDarkCnt++;
     }
-    const leftBadgeIntrusion = !isDealer && topPaper >= 0.25 && badgeProbe.data.length > 0 && (badgeDarkCnt / badgeProbe.data.length) >= 0.25;
+    const leftBadgeIntrusion = topPaper >= 0.25 && badgeProbe.data.length > 0 && (badgeDarkCnt / badgeProbe.data.length) >= 0.22;
 
     // Masked left-badge recovery when Card 0's bottom-left corner is clipped or weakened by a circular score badge
     const card0Missing = (kept.length > 0 && kept[0].x >= firstCardX + 10) || (kept.length === 0 && cwNorm >= 12);
@@ -2238,7 +2238,7 @@
           if (sz.data[k] < badgeDarkThr) ltBadge++;
         }
         hasPipBody = sz.data.length > 0 && gtPaperPip / sz.data.length >= 0.30 && ltInkPip >= 5;
-        const hasBadgeOcclusion = !isDealer && d.x <= firstCardX + 6 && sz.data.length > 0 && ltBadge / sz.data.length >= 0.25 && d.conf >= Math.max(0.75, floorConf);
+        const hasBadgeOcclusion = d.x <= firstCardX + 6 && sz.data.length > 0 && ltBadge / sz.data.length >= 0.25 && d.conf >= Math.max(0.75, floorConf);
         if (!suit && hasBadgeOcclusion && cwNorm <= 44) {
           const [trSuit, trConf] = classifyTopRightSuit(normBgr, cwNorm, suitTemplates, paperHi);
           if (trSuit) {
