@@ -2436,12 +2436,11 @@ function startNewSession(){
   };
   S.sessions.push(s);
   S.activeId = s.id;
-  const keepWatchLock = !!(saveUndo && draft.watchLocked);
   draft = freshDraft();
   draft.playMode = 'watch';
   draft.trackCommunityFelt = false;
   draft.manualBetOverride = false;
-  draft.watchLocked = keepWatchLock;
+  draft.watchLocked = false;
   save();
   render();
 }
@@ -2520,11 +2519,12 @@ function startNewShoe(s, reason = 'cut', { saveUndo = false, cardsSeen = null } 
   } else {
     _autoShoeUndo = null;
   }
+  const keepWatchLock = !!(saveUndo && draft.watchLocked);
   draft = freshDraft();
   draft.playMode = 'watch';
   draft.trackCommunityFelt = false;
   draft.manualBetOverride = false;
-  draft.watchLocked = false;
+  draft.watchLocked = keepWatchLock;
   draft.stake = cfg().unit;
   draft.viewShoeId = null;
   draft.lastMsg = `🔄 Archived Shoe #${prevShoeNum} (${_shoeReasonLabel(reason)}) & started Fresh 8-Deck Shoe #${prevShoeNum + 1} (TC 0.00).`;
