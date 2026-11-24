@@ -2488,7 +2488,39 @@ console.log("40. Testing live shoe NCC baseline, stage-independent trigger & cal
   console.log("   Test 40 PASSED");
 }
 
-console.log("\nALL 40 ENGINE TESTS PASSED SUCCESSFULLY!");
+console.log("41. Testing phantom suitless Q rejection & manual resync dealer+player immediate re-emission...");
+{
+  const rt41 = new Engine.IpadCompanionRuntime({ onSavePack: () => {} });
+  // Ensure control resync invalidates detector caches and sets _forceNextHudScan
+  rt41.detector._lastDSig = { w: 10, h: 10, gw: 80, gh: 36, pxCnt: 100, brightCnt: 10, darkCnt: 10, bins: new Uint8Array(80 * 36) };
+  rt41.detector._cachedD = [[], null, 0, [], null];
+  const mockWs41 = { readyState: 1, onRawMessage: () => {} };
+  rt41.handleClientMessage(mockWs41, JSON.stringify({ type: "control", action: "resync" }));
+  assert.strictEqual(rt41.detector._lastDSig, null, "resync must invalidate detector _lastDSig");
+  assert.strictEqual(rt41._forceNextHudScan, true, "resync must force immediate dealer+player scan on next frame");
+
+  // Verify suitless Q on a synthetic 6-like cluster (with no suit ink) is NOT emitted
+  const det41 = rt41.detector;
+  det41._ensureBankDecoded("hud");
+  det41._ensureBankDecoded("suit");
+  const qTpl = (det41.banks.hud || []).find((t) => t.rank === "Q");
+  assert(qTpl, "Q template must exist");
+  // Build a 40x45 white card cluster containing Q's rank glyph at top-left, but NO suit glyph below it (only 6 dark noise pixels)
+  const cardNoSuit = Engine.createImage(40, 45, 3, 245);
+  for (let y = 0; y < qTpl.gray.h && y + 2 < 23; y++) {
+    for (let x = 0; x < qTpl.gray.w && x + 3 < 40; x++) {
+      const v = qTpl.gray.data[y * qTpl.gray.w + x];
+      const o = ((y + 2) * 40 + (x + 3)) * 3;
+      cardNoSuit.data[o] = v; cardNoSuit.data[o + 1] = v; cardNoSuit.data[o + 2] = v;
+    }
+  }
+  fillRect(cardNoSuit, 10, 32, 3, 2, 40, 40, 40); // 6 dark noise pixels so hasPipBody=true, suitConf~0
+  const [detsNoSuit] = Engine.detectClusterCards(cardNoSuit, [0, 0, 40, 45], det41.banks.hud, det41.banks.suit, 0.74, false, 0.84, null);
+  assert.strictEqual(detsNoSuit.filter((d) => d.rank === "Q").length, 0, "Suitless phantom Q without suitConf must be rejected");
+  console.log("   Test 41 PASSED");
+}
+
+console.log("\nALL 41 ENGINE TESTS PASSED SUCCESSFULLY!");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

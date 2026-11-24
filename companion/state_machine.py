@@ -2776,14 +2776,14 @@ class CompanionStateMachine:
                 return
             if len(hud_p) == len(comm_p):
                 for j in range(len(comm_p)):
-                    if not _same_bj_value(hud_p[j].rank, comm_p[j]) and hud_p[j].conf < 0.90:
+                    if not _same_bj_value(hud_p[j].rank, comm_p[j]) and hud_p[j].conf < 0.85:
                         return
         comm_d = [r for r in self.d_debouncer.committed_ranks if r != "BACK"]
         if len(d_real) < len(comm_d):
             return
         if len(d_real) == len(comm_d):
             for j in range(len(comm_d)):
-                if not _same_bj_value(d_real[j].rank, comm_d[j]) and d_real[j].conf < 0.90:
+                if not _same_bj_value(d_real[j].rank, comm_d[j]) and d_real[j].conf < 0.85:
                     return
 
         deb_hands = {

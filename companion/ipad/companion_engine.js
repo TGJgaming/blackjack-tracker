@@ -2257,12 +2257,16 @@
             continue;
           }
         }
-        const highConfPipOk = hasPipBody && d.conf >= Math.max(isDealer ? 0.75 : 0.86, isDealer ? 0.75 : minHudConf);
+        const highConfPipOk = hasPipBody && suitConf >= 0.35 && d.conf >= Math.max(isDealer ? 0.75 : 0.86, isDealer ? 0.75 : minHudConf);
         if (!suit && !hasBadgeOcclusion && !highConfPipOk && (!hasPipBody || suitConf < 0.42 || d.conf < Math.max(0.82, minHudConf - 0.02))) {
           if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
           continue;
         }
         if (d.rank === "4" && !hasBadgeOcclusion && d.conf < Math.max(0.82, minHudConf - 0.02)) {
+          if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
+          continue;
+        }
+        if (d.rank === "Q" && !suit && !hasBadgeOcclusion && (!hasPipBody || suitConf < 0.45 || d.conf < 0.88)) {
           if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
           continue;
         }
@@ -5553,7 +5557,7 @@
         return;
       }
 
-      const minRecConf = Math.max(0.86, this.cfg.min_hud_confidence + 0.02);
+      const minRecConf = Math.max(0.84, this.cfg.min_hud_confidence);
       const sortedKeys = Object.keys(handsInput).map(Number).sort((a, b) => a - b);
       for (const h of sortedKeys) {
         const cs = handsInput[h];
@@ -5601,7 +5605,7 @@
           for (let j = 0; j < commP.length; j++) {
             if (!sameBjValue(hudP[j].rank, commP[j])) {
               sameLenRankDiff = true;
-              if (hudP[j].conf < 0.90) return;
+              if (hudP[j].conf < 0.85) return;
             }
           }
         }
@@ -5612,7 +5616,7 @@
         for (let j = 0; j < commD.length; j++) {
           if (!sameBjValue(dReal[j].rank, commD[j])) {
             sameLenRankDiff = true;
-            if (dReal[j].conf < 0.90) return;
+            if (dReal[j].conf < 0.85) return;
           }
         }
       }
@@ -6510,8 +6514,10 @@
       const discardImg = this.cfg.discard_roi ? cropNorm(anchorImg, this.cfg.discard_roi) : null;
 
       const forceDealerScan =
+        Boolean(this._forceNextHudScan) ||
         this.sm.state === "DEALER_TURN" ||
         (this.sm.dDebouncer && this.sm.dDebouncer.committedRanks.includes("BACK"));
+      this._forceNextHudScan = false;
 
       if (this.detector && typeof this.detector._ensureBankDecoded === "function") {
         this.detector._ensureBankDecoded("ui");
@@ -6697,7 +6703,11 @@
         const action = msg.action || "";
         if (action === "pause") this.sm.paused = true;
         else if (action === "resume") this.sm.paused = false;
-        else if (action === "resync") this.sm.resyncRound();
+        else if (action === "resync") {
+          this.sm.resyncRound();
+          this.detector.invalidateCaches();
+          this._forceNextHudScan = true;
+        }
         this.broadcast(this.buildStatusPayload());
         return;
       }
