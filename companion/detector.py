@@ -88,28 +88,32 @@ def _get_ui_templates(prefix: str) -> list[np.ndarray]:
     return tpls
 
 
-def _match_ui_templates(roi_bgr: np.ndarray, tpls: list[np.ndarray], target_h: int = 72) -> float:
+def _match_ui_templates(roi_bgr: np.ndarray, tpls: list[np.ndarray], target_h: int = 36) -> float:
     if roi_bgr is None or roi_bgr.size == 0 or roi_bgr.ndim != 3 or not tpls:
         return 0.0
     h, w = roi_bgr.shape[:2]
     if h < 12 or w < 12:
         return 0.0
-    nw = max(24, int(round(w * (target_h / float(h)))))
+    nw = max(16, int(round(w * (target_h / float(h)))))
     rg = cv2.resize(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY), (nw, target_h), interpolation=cv2.INTER_AREA)
     best = 0.0
+    scale_ratio = target_h / 72.0
     for tg in tpls:
         if tg.shape[0] < 6 or tg.shape[1] < 6:
             continue
-        for sc in (0.72, 0.84, 0.96, 1.08, 1.22):
-            sw = max(8, int(round(tg.shape[1] * sc)))
-            sh = max(8, int(round(tg.shape[0] * sc)))
+        for sc in (0.82, 1.00, 1.18):
+            eff_sc = sc * scale_ratio
+            sw = max(6, int(round(tg.shape[1] * eff_sc)))
+            sh = max(6, int(round(tg.shape[0] * eff_sc)))
             if sw > nw or sh > target_h:
                 continue
-            st = cv2.resize(tg, (sw, sh), interpolation=cv2.INTER_AREA if sc < 1.0 else cv2.INTER_CUBIC)
+            st = cv2.resize(tg, (sw, sh), interpolation=cv2.INTER_AREA if eff_sc < 1.0 else cv2.INTER_CUBIC)
             res = cv2.matchTemplate(rg, st, cv2.TM_CCOEFF_NORMED)
             _, mv, _, _ = cv2.minMaxLoc(res)
             if np.isfinite(mv) and float(mv) > best:
                 best = float(mv)
+                if best >= 0.92:
+                    return best
     return best
 
 
@@ -592,6 +596,8 @@ def detect_best_single_with_scale(
                     best_conf = float(max_val)
                     best_tpl = tpl
                     best_scale = sc
+                    if best_conf >= 0.92:
+                        return best_tpl, best_conf, best_scale
 
     if best_tpl is not None and best_conf >= min_conf:
         return best_tpl, best_conf, best_scale
@@ -1809,13 +1815,11 @@ def _get_scaled_rank_tpl(
 
 
 _TOP_BANNER_SCALES = (
-    0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15,
-    1.21, 1.27, 1.33, 1.40, 1.48, 1.56, 1.65, 1.75, 1.85, 1.96, 2.08, 2.22, 2.38, 2.55,
+    0.55, 0.66, 0.78, 0.92, 1.06, 1.24, 1.45, 1.70, 2.00, 2.35,
 )
-_CENTER_BANNER_SCALES = (0.75, 0.88, 0.95, 1.0, 1.12, 1.25, 1.45, 1.65, 1.85, 2.05, 2.35)
+_CENTER_BANNER_SCALES = (0.75, 0.90, 1.05, 1.25, 1.50, 1.85, 2.25)
 _PLACE_BETS_SCALES = (
-    0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.12, 1.20,
-    1.28, 1.36, 1.45, 1.56, 1.68, 1.80, 1.85, 1.95, 2.08, 2.25, 2.45,
+    0.50, 0.62, 0.76, 0.92, 1.10, 1.32, 1.58, 1.90, 2.30,
 )
 
 
@@ -2504,15 +2508,26 @@ class PlaytechDetector:
             # 1. Top banner_roi check (WAIT / LAST_BETS / NO_MORE_BETS / SHUFFLE; also supports legacy tall banner_roi)
             has_sep_pb = place_bets_img is not None and place_bets_img.size > 0
             ban_sig_h = 32 if (not has_sep_pb and banner_img is not None and banner_img.size and banner_img.shape[0] >= 80) else 16
-            ban_sig = (
-                cv2.resize(_to_gray(banner_img), (64, ban_sig_h), interpolation=cv2.INTER_AREA).tobytes()
+            ban_arr = (
+                cv2.resize(_to_gray(banner_img), (64, ban_sig_h), interpolation=cv2.INTER_AREA)
                 if (banner_img is not None and banner_img.size)
-                else b""
+                else None
             )
-            if ban_sig == self._last_banner_sig:
+            prev_ban_arr = getattr(self, "_last_banner_arr", None)
+            last_ban_ts = getattr(self, "_last_banner_scan_ts", -999.0)
+            ban_unchanged = (
+                self._last_banner_sig is not None
+                and ban_arr is not None
+                and prev_ban_arr is not None
+                and prev_ban_arr.shape == ban_arr.shape
+                and float(np.mean(np.abs(ban_arr.astype(np.int16) - prev_ban_arr.astype(np.int16)))) < 2.2
+            ) or (ban_arr is None and prev_ban_arr is None and self._last_banner_sig == b"")
+            if ban_unchanged or (self._last_banner_sig is not None and (now - last_ban_ts) < 0.24 and not self._cached_top_banner[0]):
                 top_banner_state, top_banner_conf = self._cached_top_banner
             else:
-                self._last_banner_sig = ban_sig
+                self._last_banner_arr = ban_arr
+                self._last_banner_sig = ban_arr.tobytes() if ban_arr is not None else b""
+                self._last_banner_scan_ts = now
                 top_banner_state = ""
                 top_banner_conf = 0.0
                 if banner_img is not None and banner_img.size and self.banner_bank.banner_templates:
@@ -2556,15 +2571,26 @@ class PlaytechDetector:
                         top_banner_conf = bconf
                 self._cached_top_banner = (top_banner_state, top_banner_conf)
 
-            # 2. Independent shuffle_roi check (throttled during active cards so video noise doesn't choke FPS)
-            shuf_due = (not cards_present) or ((now - self._last_shuffle_scan_ts) >= 0.18)
+            # 2. Independent shuffle_roi check (throttled to ~1.6 Hz; skip redundant banner scan when overlapping banner_roi)
+            shuf_due = (now - self._last_shuffle_scan_ts) >= 0.60
             shuf_mode = (cards_present, bool(top_banner_state))
+            shuf_roi_cfg = self.cfg.rois.get("shuffle_roi", (0.30, 0.24, 0.40, 0.38))
+            shuf_overlaps_top = shuf_roi_cfg[1] < 0.05 and (banner_img is not None and banner_img.size > 0)
             if shuffle_img is not None and shuffle_img.size and shuf_due:
-                shuf_sig = cv2.resize(_to_gray(shuffle_img), (32, 20), interpolation=cv2.INTER_AREA).tobytes()
-                if shuf_sig == self._last_shuffle_sig and self._last_shuf_mode == shuf_mode:
+                shuf_arr = cv2.resize(_to_gray(shuffle_img), (32, 20), interpolation=cv2.INTER_AREA)
+                prev_shuf_arr = getattr(self, "_last_shuffle_arr", None)
+                shuf_unchanged = (
+                    self._last_shuffle_sig is not None
+                    and prev_shuf_arr is not None
+                    and prev_shuf_arr.shape == shuf_arr.shape
+                    and self._last_shuf_mode == shuf_mode
+                    and float(np.mean(np.abs(shuf_arr.astype(np.int16) - prev_shuf_arr.astype(np.int16)))) < 2.2
+                )
+                if shuf_unchanged:
                     shuf_on, shuf_conf, shuf_ban_state, shuf_ban_conf = self._cached_shuf
                 else:
-                    self._last_shuffle_sig = shuf_sig
+                    self._last_shuffle_arr = shuf_arr
+                    self._last_shuffle_sig = shuf_arr.tobytes()
                     self._last_shuf_mode = shuf_mode
                     self._last_shuffle_scan_ts = now
                     shuf_on = False
@@ -2575,7 +2601,7 @@ class PlaytechDetector:
                         shuf_conf = sconf
                     shuf_ban_state = ""
                     shuf_ban_conf = 0.0
-                    if not top_banner_state and self.banner_bank.banner_templates:
+                    if not top_banner_state and not shuf_overlaps_top and self.banner_bank.banner_templates:
                         shuf_tpls = (
                             [t for t in self.banner_bank.banner_templates if t.rank in ("SHUFFLE", "WAIT")]
                             if cards_present
@@ -2605,17 +2631,28 @@ class PlaytechDetector:
                     banner_conf = shuf_ban_conf
                     banner_source = "shuffle_roi"
 
-            # 3. Dedicated tight place_bets_roi check (runs clean full-res center probe when no cards present)
+            # 3. Dedicated tight place_bets_roi check (throttled ~3 Hz with fuzzy H.264 noise cache)
             pb_conf = 0.0
             if has_sep_pb and not cards_present and self.banner_bank.banner_templates:
                 pb_tpls = [t for t in self.banner_bank.banner_templates if t.rank == "PLACE_BETS"]
                 if pb_tpls:
-                    pb_sig = cv2.resize(_to_gray(place_bets_img), (48, 16), interpolation=cv2.INTER_AREA).tobytes()
-                    if pb_sig == self._last_pb_sig and not self._cached_pb[1]:
+                    last_pb_ts = getattr(self, "_last_pb_scan_ts", -999.0)
+                    pb_arr = cv2.resize(_to_gray(place_bets_img), (48, 16), interpolation=cv2.INTER_AREA)
+                    prev_pb_arr = getattr(self, "_last_pb_arr", None)
+                    pb_unchanged = (
+                        self._last_pb_sig is not None
+                        and prev_pb_arr is not None
+                        and prev_pb_arr.shape == pb_arr.shape
+                        and not self._cached_pb[1]
+                        and float(np.mean(np.abs(pb_arr.astype(np.int16) - prev_pb_arr.astype(np.int16)))) < 2.2
+                    )
+                    if pb_unchanged or (self._last_pb_sig is not None and (now - last_pb_ts) < 0.32 and not self._cached_pb[1]):
                         pb_conf, _ = self._cached_pb
                     else:
-                        self._last_pb_sig = pb_sig
-                        pb_min_conf = max(0.66, self.cfg.min_banner_confidence - 0.02)
+                        self._last_pb_arr = pb_arr
+                        self._last_pb_sig = pb_arr.tobytes()
+                        self._last_pb_scan_ts = now
+                        pb_min_conf = max(0.62, self.cfg.min_banner_confidence - 0.06)
                         ptpl, pconf = self._detect_banner_with_hint(
                             place_bets_img,
                             pb_tpls,

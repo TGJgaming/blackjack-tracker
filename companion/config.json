@@ -31,10 +31,10 @@
       0.0835
     ],
     "dealer_strip": [
-      0.1993,
-      0.3416,
-      0.1442,
-      0.1806
+      0.2309,
+      0.3851,
+      0.2207,
+      0.1065
     ],
     "community_roi": [
       0.4086,
@@ -67,10 +67,10 @@
       0.1264
     ],
     "shoe_roi": [
-      0.77,
-      0.52,
-      0.14,
-      0.11
+      0.7055,
+      0.4804,
+      0.1716,
+      0.1204
     ],
     "discard_roi": [
       0.11,
@@ -108,8 +108,8 @@
     "mode": "auto",
     "method": "ext_then_os",
     "prefer_left_window": true,
-    "min_watch_sec": 570.0,
-    "max_watch_sec": 630.0,
+    "min_watch_sec": 480.0,
+    "max_watch_sec": 540.0,
     "hard_warn_sec": 750.0,
     "round_over_delay_sec": 1.2,
     "place_bets_min_delay_sec": 0.35,
@@ -123,5 +123,27 @@
       100,
       76
     ]
+  },
+  "shoe_detect": {
+    "enabled": true,
+    "enable_shoe_roi": true,
+    "enable_discard_fallback": true,
+    "shoe_present_hold_sec": 2.0,
+    "shoe_absent_hold_sec": 3.5,
+    "shoe_return_hold_sec": 1.5,
+    "shoe_corroborated_absent_sec": 1.8,
+    "shoe_max_flicker_sec": 0.7,
+    "shoe_absent_safety_sec": 12.0,
+    "shoe_min_cards": 15,
+    "discard_peak_white_min": 0.025,
+    "discard_peak_hold_sec": 4.0,
+    "discard_empty_white_max": 0.007,
+    "discard_drop_ratio_max": 0.22,
+    "discard_empty_hold_sec": 6.0,
+    "discard_idle_gap_sec": 8.0,
+    "discard_housing_dark_min": 0.1,
+    "discard_min_cards": 45,
+    "discard_require_shoe_disturbance": true,
+    "cooldown_sec": 30.0
   }
 }

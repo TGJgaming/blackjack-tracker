@@ -201,6 +201,7 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
     vp_local_cache: tuple[int, int, int, int] = (0, 0, 1, 1)
     last_win_scan = 0.0
     last_vp_scan = 0.0
+    last_shoe_grab_ts = 0.0
     last_hud_ts = 0.0
     last_status_ts = 0.0
     last_ka_arm_log_ts = 0.0
@@ -896,10 +897,12 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         }
                         if "place_bets_roi" in cfg.rois:
                             rois_to_grab["place_bets_roi"] = cfg.rois["place_bets_roi"]
-                        if "shoe_roi" in cfg.rois:
-                            rois_to_grab["shoe_roi"] = cfg.rois["shoe_roi"]
-                        if "discard_roi" in cfg.rois:
-                            rois_to_grab["discard_roi"] = cfg.rois["discard_roi"]
+                        if (now - last_shoe_grab_ts) >= 0.60:
+                            last_shoe_grab_ts = now
+                            if "shoe_roi" in cfg.rois:
+                                rois_to_grab["shoe_roi"] = cfg.rois["shoe_roi"]
+                            if "discard_roi" in cfg.rois:
+                                rois_to_grab["discard_roi"] = cfg.rois["discard_roi"]
                         rois_to_grab["loading_probe"] = loading_probe_roi
                         if (need_center_probe and detector.is_center_scan_due(now, cards_active)) or keepalive.state in ("REFRESHING", "RECOVERING"):
                             rois_to_grab["center_probe"] = center_banner_roi
@@ -917,8 +920,10 @@ async def run_companion(cfg: CompanionConfig, preview: bool = False) -> None:
                         last_shuffle_img = crops["shuffle_roi"]
                         last_banner_img = crops["banner_roi"]
                         last_pb_img = crops.get("place_bets_roi", empty)
-                        last_shoe_img = crops.get("shoe_roi", empty)
-                        last_discard_img = crops.get("discard_roi", empty)
+                        if "shoe_roi" in crops:
+                            last_shoe_img = crops["shoe_roi"]
+                        if "discard_roi" in crops:
+                            last_discard_img = crops["discard_roi"]
                         last_loading_img = crops.get("loading_probe", empty)
                         last_center_img = crops.get("center_probe", empty)
                         comm_img = crops.get("community_roi", empty) if felt_armed else empty
