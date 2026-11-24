@@ -2646,7 +2646,7 @@ function renderPlay(){
     hdrExtra: `
       <span id="compPhasePill" class="pill ${draft.phaseBanner ? (['WAIT','DEALING'].includes(draft.phaseBanner)?'green':['PLACE_BETS','LAST_BETS','NO_MORE_BETS'].includes(draft.phaseBanner)?'amber':'blue') : ''}" style="${draft.phaseBanner ? '' : 'visibility:hidden'}" title="Detected Playtech Table Banner Phase">${draft.phaseBanner ? (draft.phaseBanner==='WAIT'?'WAIT · RECORDING':draft.phaseBanner==='DEALING'?'DEALING · RECORDING':draft.phaseBanner.replace(/_/g,' ')) : 'IDLE'}</span>
       <button class="btn xs ${compPillCls}" id="compToggleBtn" title="Toggle local desktop companion auto-tracking (ws://127.0.0.1:8765)">${compPillText}</button>
-      ${_comp.connected ? `<button class="btn xs ${getKeepaliveBadgeState().cls}" id="compKeepaliveBtn" title="${getKeepaliveBadgeState().title}">${getKeepaliveBadgeState().text}</button>${(_comp.keepalive && _comp.keepalive.enabled !== false && _comp.keepalive.mode !== 'off') ? `<button class="btn xs" id="compKeepaliveResetBtn" title="Reset Watch-mode inactivity timer">↺</button>` : ''}<button class="btn xs" id="compCalibBtn" title="Open fit-to-screen ROI & template calibrator">🎯 Calibrate</button><button class="btn xs" id="compPauseBtn" title="Pause/Resume companion">${_comp.paused?'▶ Resume':'⏸ Pause'}</button><button class="btn xs" id="compResyncBtn" title="Reset companion round sync">↻ Resync</button><button class="btn xs" id="compRestartBtn" title="Restart companion.py">↻ Restart</button><button class="btn xs" id="compStopBtn" title="Stop companion.py">⏹</button><button class="btn xs" id="compLogsBtn" title="View companion.log">📋</button>` : `<button class="btn xs good" id="compLaunchBtn" title="Launch Blackjack companion.py silently in background (tracker-companion://)">▶ Launch</button>`}
+      ${_comp.connected ? `<button class="btn xs ${getKeepaliveBadgeState().cls}" id="compKeepaliveBtn" title="${getKeepaliveBadgeState().title}">${getKeepaliveBadgeState().text}</button>${(_comp.keepalive && _comp.keepalive.enabled !== false && _comp.keepalive.mode !== 'off') ? `<button class="btn xs" id="compKeepaliveResetBtn" title="Reset Watch-mode inactivity timer">↺</button>` : ''}<button class="btn xs" id="compCalibBtn" title="Open fit-to-screen ROI & template calibrator">🎯 Calibrate</button><button class="btn xs" id="compPauseBtn" title="Pause/Resume companion">${_comp.paused?'▶ Resume':'⏸ Pause'}</button><button class="btn xs" id="compResyncBtn" title="Reset companion round sync">↻ Resync</button><button class="btn xs" id="compRestartBtn" title="Restart companion.py">↻ Restart</button><button class="btn xs" id="compStopBtn" title="Stop companion.py">⏹</button><button class="btn xs" id="compLogsBtn" title="View companion.log">📋</button>` : `<a class="btn xs good" id="compLaunchBtn" href="tracker-companion://start/blackjack" style="text-decoration:none" title="Launch Blackjack companion.py silently in background (tracker-companion://)">▶ Launch</a>`}
       <button class="btn xs ${cfg().soundAlert?'pinbtn on':''}" id="toggleSoundBtn" title="Sound alerts (Wong, Deviations, Insurance, +EV Side Bets, Splits, Banner Phase)">${cfg().soundAlert?'🔔 Sound On':'🔕 Sound Off'}</button>
       <button class="btn xs" id="newShoeBtn" title="Archive current shoe and reset 416 cards">🔄 New Shoe</button>
     `,
@@ -3217,14 +3217,10 @@ function renderPlay(){
   const compLaunchBtn = document.getElementById('compLaunchBtn');
   if(compLaunchBtn) compLaunchBtn.onclick = (e) => {
     e.currentTarget.blur();
-    const a = document.createElement('a');
-    a.href = 'tracker-companion://start/blackjack';
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    // Allow native <a href="tracker-companion://start/blackjack"> navigation to trigger protocol reliably
     compLaunchBtn.textContent = 'Starting…';
-    compLaunchBtn.disabled = true;
+    compLaunchBtn.style.pointerEvents = 'none';
+    compLaunchBtn.style.opacity = '0.7';
     let tries = 0;
     const poll = setInterval(() => {
       tries++;
@@ -3233,8 +3229,11 @@ function renderPlay(){
         return;
       }
       connectCompanion(true);
-      if(tries >= 10){
+      if(tries >= 20){
         clearInterval(poll);
+        compLaunchBtn.textContent = '▶ Launch';
+        compLaunchBtn.style.pointerEvents = '';
+        compLaunchBtn.style.opacity = '';
         if(draft){
           draft.lastMsg = '⚠ Still offline — first time using ▶ Launch? Run install_launcher_protocol.ps1 once in PowerShell.';
           render();

@@ -10,6 +10,12 @@ from typing import Any
 import cv2
 import numpy as np
 
+# Disable OpenCV OpenCL GPU dispatch to prevent GPU queue stalls and contention with Brave video decoding.
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
+
 from config import COMPANION_DIR, CompanionConfig, RANK_TO_VAL
 
 
@@ -1493,8 +1499,9 @@ def _detect_cluster_cards(
     sub_peaks: list[tuple[float, CardDetection]] = []
     sub_floor = 0.42 if (is_dealer and sub_out is not None) else floor_conf
     roi_h, roi_w = norm_top.shape[:2]
+    _loc_kernel = np.ones((3, 3), np.uint8)
     for tpl in rank_templates:
-        for tsc in (0.90, 0.96, 1.0, 1.05, 1.10):
+        for tsc in (0.93, 1.0, 1.07):
             entry = _get_scaled_rank_tpl_entry(tpl, tsc, masked=False)
             if entry is None:
                 continue
@@ -1504,8 +1511,18 @@ def _detect_cluster_cards(
             max_x_for_tpl = eff_right - max(min_tail, sw)
             if max_x_for_tpl < 0:
                 continue
-            res = cv2.matchTemplate(norm_top, scaled, cv2.TM_CCOEFF_NORMED)
-            ys, xs = np.where(res >= sub_floor)
+            # Match only over the valid top-y & x window so OpenCV skips wasted rows/cols
+            sub_h = min(roi_h, sh + 8)
+            sub_w = min(roi_w, max_x_for_tpl + sw)
+            res = cv2.matchTemplate(norm_top[:sub_h, :sub_w], scaled, cv2.TM_CCOEFF_NORMED)
+            if res.size == 0 or float(res.max()) < sub_floor:
+                continue
+            # Evaluate ONLY 2D local maxima instead of every pixel on the correlation hill
+            if res.shape[0] >= 3 and res.shape[1] >= 3:
+                loc_max = cv2.dilate(res, _loc_kernel)
+                ys, xs = np.where((res >= sub_floor) & (res >= loc_max - 1e-6))
+            else:
+                ys, xs = np.where(res >= sub_floor)
             for y_pos, x_pos in zip(ys.tolist(), xs.tolist()):
                 if y_pos > 8 or x_pos > max_x_for_tpl:
                     continue
@@ -1568,7 +1585,7 @@ def _detect_cluster_cards(
     )
 
     # Masked left-badge recovery when card 0's bottom-left corner is clipped or weakened by a score pill/badge
-    card0_missing = (kept and kept[0].x >= first_card_x + 10) or (not kept and cw_norm >= 12)
+    card0_missing = (kept and kept[0].x >= first_card_x + 10) or (not kept and left_badge_intrusion and cw_norm >= 12)
     card0_weak_under_badge = left_badge_intrusion and kept and kept[0].x <= first_card_x + 6 and kept[0].conf < 0.88
     if card0_missing or card0_weak_under_badge:
         gap_w = kept[0].x if card0_missing and kept else min(first_card_x + 22, cw_norm)
@@ -1580,48 +1597,58 @@ def _detect_cluster_cards(
             mask_ink_thr = min(135, ink_thr + 5)
             mask_min_contrast = max(44, min_contrast - 5)
             for tpl in rank_templates:
-                for tsc in (0.90, 0.96, 1.0, 1.05):
+                for tsc in (0.95, 1.03):
                     entry = _get_scaled_rank_tpl_entry(tpl, tsc, masked=True)
                     if entry is None:
                         continue
-                    _, sw, sh, tm_base, t_norm, mask = entry
+                    scaled_u8, sw, sh, tm_base, t_norm, mask = entry
                     if sw > norm_top.shape[1] or sh > norm_top.shape[0] or tm_base is None or mask is None:
                         continue
                     min_lx = max(0, first_card_x - 1)
                     max_lx = min(first_card_x + 6, max(min_lx + 1, gap_w - 10), norm_top.shape[1] - sw + 1)
-                    for y0 in range(0, min(6, norm_top.shape[0] - sh + 1)):
-                        for x0 in range(min_lx, max_lx):
-                            if card0_missing and kept and abs(x0 - kept[0].x) < 11:
-                                continue
-                            p = norm_top[y0 : y0 + sh, x0 : x0 + sw]
-                            pm_raw = p[mask]
-                            if (
-                                pm_raw.size == 0
-                                or float(np.mean(pm_raw > mask_paper_thr)) < 0.24
-                                or (int(pm_raw.max()) - int(pm_raw.min())) < mask_min_contrast
-                                or float(np.mean(pm_raw < mask_ink_thr)) < 0.07
-                                or (is_dimmed_cl and int(pm_raw.min()) >= dim_max_ink)
-                                or _is_back_column(x0, sw)
-                            ):
-                                continue
-                            pm = pm_raw.astype(np.float32)
-                            pm -= float(pm.mean())
-                            denom = float(np.linalg.norm(pm)) * t_norm
-                            sc_masked = float(np.dot(pm, tm_base) / denom) if denom > 1e-5 else 0.0
-                            prio = sc_masked + (0.015 if tpl.rank == "10" else 0.0)
-                            if sc_masked >= mask_thr and (best_left is None or prio > best_left[0]):
-                                best_left = (
-                                    prio,
-                                    CardDetection(
-                                        rank=tpl.rank,
-                                        val=tpl.val,
-                                        conf=sc_masked,
-                                        x=int(x0),
-                                        y=int(y0),
-                                        w=sw,
-                                        h=sh,
-                                    ),
-                                )
+                    max_ly = min(6, norm_top.shape[0] - sh + 1)
+                    if max_lx <= min_lx or max_ly <= 0:
+                        continue
+                    # Fast C++ masked template match over all (y0, x0) in one SIMD call
+                    sub_y1 = min(norm_top.shape[0], max_ly - 1 + sh)
+                    sub_x1 = min(norm_top.shape[1], max_lx - 1 + sw)
+                    sub_top = norm_top[0:sub_y1, min_lx:sub_x1]
+                    if sub_top.shape[0] < sh or sub_top.shape[1] < sw:
+                        continue
+                    mask_u8 = mask.astype(np.uint8) * 255
+                    res_m = cv2.matchTemplate(sub_top, scaled_u8, cv2.TM_CCOEFF_NORMED, mask=mask_u8)
+                    _, sc_masked, _, max_loc = cv2.minMaxLoc(res_m)
+                    if not np.isfinite(sc_masked) or float(sc_masked) < mask_thr:
+                        continue
+                    x0 = min_lx + int(max_loc[0])
+                    y0 = int(max_loc[1])
+                    if card0_missing and kept and abs(x0 - kept[0].x) < 11:
+                        continue
+                    p = norm_top[y0 : y0 + sh, x0 : x0 + sw]
+                    pm_raw = p[mask]
+                    if (
+                        pm_raw.size == 0
+                        or float(np.mean(pm_raw > mask_paper_thr)) < 0.24
+                        or (int(pm_raw.max()) - int(pm_raw.min())) < mask_min_contrast
+                        or float(np.mean(pm_raw < mask_ink_thr)) < 0.07
+                        or (is_dimmed_cl and int(pm_raw.min()) >= dim_max_ink)
+                        or _is_back_column(x0, sw)
+                    ):
+                        continue
+                    prio = float(sc_masked) + (0.015 if tpl.rank == "10" else 0.0)
+                    if best_left is None or prio > best_left[0]:
+                        best_left = (
+                            prio,
+                            CardDetection(
+                                rank=tpl.rank,
+                                val=tpl.val,
+                                conf=float(sc_masked),
+                                x=int(x0),
+                                y=int(y0),
+                                w=sw,
+                                h=sh,
+                            ),
+                        )
             if best_left is not None:
                 if card0_missing:
                     kept.insert(0, best_left[1])
@@ -1815,7 +1842,7 @@ def _get_scaled_rank_tpl(
 
 
 _TOP_BANNER_SCALES = (
-    0.55, 0.66, 0.78, 0.92, 1.06, 1.24, 1.45, 1.70, 2.00, 2.35,
+    0.55, 0.66, 0.78, 0.85, 0.92, 1.00, 1.08, 1.16, 1.28, 1.45, 1.70, 2.00, 2.35,
 )
 _CENTER_BANNER_SCALES = (0.75, 0.90, 1.05, 1.25, 1.50, 1.85, 2.25)
 _PLACE_BETS_SCALES = (
@@ -2463,32 +2490,53 @@ class PlaytechDetector:
         now = ts if ts is not None else time.monotonic()
 
         if player_refreshed:
-            p_sig = (
-                cv2.resize(_to_min_gray(player_img), (96, 32), interpolation=cv2.INTER_AREA).tobytes()
+            p_arr = (
+                cv2.resize(_to_min_gray(player_img), (96, 32), interpolation=cv2.INTER_AREA)
                 if player_img.size
-                else b""
+                else None
             )
-            if p_sig == self._last_p_sig:
+            prev_p_arr = getattr(self, "_last_p_arr", None)
+            p_unchanged = (
+                self._last_p_sig is not None
+                and p_arr is not None
+                and prev_p_arr is not None
+                and prev_p_arr.shape == p_arr.shape
+                and float(np.mean(np.abs(p_arr.astype(np.int16) - prev_p_arr.astype(np.int16)))) < 1.5
+                and int(np.max(np.abs(p_arr.astype(np.int16) - prev_p_arr.astype(np.int16)))) < 14
+            ) or (p_arr is None and prev_p_arr is None and self._last_p_sig == b"")
+            if p_unchanged:
                 p_cards, p_hands, split_detected = self._cached_p
             else:
-                self._last_p_sig = p_sig
+                self._last_p_arr = p_arr
+                self._last_p_sig = p_arr.tobytes() if p_arr is not None else b""
                 p_cards, p_hands, split_detected = self._detect_hud_strip(player_img, is_dealer=False)
                 self._cached_p = (p_cards, p_hands, split_detected)
         else:
             p_cards, p_hands, split_detected = self._cached_p
 
         if dealer_refreshed:
-            d_sig = (
-                cv2.resize(_to_min_gray(dealer_img), (80, 36), interpolation=cv2.INTER_AREA).tobytes()
+            d_arr = (
+                cv2.resize(_to_min_gray(dealer_img), (80, 36), interpolation=cv2.INTER_AREA)
                 if dealer_img.size
-                else b""
+                else None
             )
-            if not force_dealer_scan and d_sig == self._last_d_sig:
+            prev_d_arr = getattr(self, "_last_d_arr", None)
+            d_unchanged = (
+                not force_dealer_scan
+                and self._last_d_sig is not None
+                and d_arr is not None
+                and prev_d_arr is not None
+                and prev_d_arr.shape == d_arr.shape
+                and float(np.mean(np.abs(d_arr.astype(np.int16) - prev_d_arr.astype(np.int16)))) < 1.5
+                and int(np.max(np.abs(d_arr.astype(np.int16) - prev_d_arr.astype(np.int16)))) < 14
+            ) or (not force_dealer_scan and d_arr is None and prev_d_arr is None and self._last_d_sig == b"")
+            if d_unchanged:
                 d_cards = self._cached_d
                 d_sub_cards = self._cached_d_sub
                 d_badge_total, d_badge_conf, d_badge_hint = self._cached_d_badge
             else:
-                self._last_d_sig = d_sig
+                self._last_d_arr = d_arr
+                self._last_d_sig = d_arr.tobytes() if d_arr is not None else b""
                 d_sub_cards = []
                 d_cards, _, _ = self._detect_hud_strip(dealer_img, is_dealer=True, sub_out=d_sub_cards)
                 d_badge_total, d_badge_conf, d_badge_hint = detect_dealer_badge_total(
@@ -2631,10 +2679,14 @@ class PlaytechDetector:
                     banner_conf = shuf_ban_conf
                     banner_source = "shuffle_roi"
 
-            # 3. Dedicated tight place_bets_roi check (throttled ~3 Hz with fuzzy H.264 noise cache)
+            # 3. Dedicated tight center place_bets_roi check (PLACE_BETS, NO_MORE_BETS, LAST_BETS)
             pb_conf = 0.0
             if has_sep_pb and not cards_present and self.banner_bank.banner_templates:
-                pb_tpls = [t for t in self.banner_bank.banner_templates if t.rank == "PLACE_BETS"]
+                pb_tpls = [
+                    t
+                    for t in self.banner_bank.banner_templates
+                    if t.rank in ("PLACE_BETS", "NO_MORE_BETS", "LAST_BETS")
+                ]
                 if pb_tpls:
                     last_pb_ts = getattr(self, "_last_pb_scan_ts", -999.0)
                     pb_arr = cv2.resize(_to_gray(place_bets_img), (48, 16), interpolation=cv2.INTER_AREA)
@@ -2648,6 +2700,7 @@ class PlaytechDetector:
                     )
                     if pb_unchanged or (self._last_pb_sig is not None and (now - last_pb_ts) < 0.32 and not self._cached_pb[1]):
                         pb_conf, _ = self._cached_pb
+                        center_rank = getattr(self, "_cached_pb_rank", "PLACE_BETS" if pb_conf > 0 else "")
                     else:
                         self._last_pb_arr = pb_arr
                         self._last_pb_sig = pb_arr.tobytes()
@@ -2660,14 +2713,21 @@ class PlaytechDetector:
                             _PLACE_BETS_SCALES,
                             hint_key="place_bets",
                         )
-                        pb_conf = pconf if ptpl is not None else 0.0
+                        center_rank = ptpl.rank if ptpl is not None else ""
+                        center_conf = pconf if ptpl is not None else 0.0
+                        self._cached_pb_rank = center_rank
+                        self._cached_pb_conf = center_conf
+                        pb_conf = center_conf if center_rank == "PLACE_BETS" else 0.0
                         self._cached_pb = (pb_conf, False)
-                    if pb_conf > 0.0 and not banner_state:
-                        banner_state = "PLACE_BETS"
-                        banner_conf = pb_conf
+                    center_conf_val = getattr(self, "_cached_pb_conf", pb_conf)
+                    if center_rank and center_conf_val > 0.0 and not banner_state:
+                        banner_state = center_rank
+                        banner_conf = center_conf_val
                         banner_source = "place_bets_roi"
             else:
                 self._cached_pb = (0.0, cards_present)
+                self._cached_pb_rank = ""
+                self._cached_pb_conf = 0.0
 
             # 4. Fallback throttled center probe (only when top, shuffle, and place_bets_roi are empty)
             center_due = self.is_center_scan_due(now, cards_present)
