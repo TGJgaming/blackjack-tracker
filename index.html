@@ -189,6 +189,8 @@
   .bead.L{background:#3a1515;color:#fecaca;border:1px solid #ef4444}
   .bead.P{background:#1e293b;color:#cbd5e1;border:1px solid #64748b}
   .bead.WATCH{background:#141821;color:#64748b;border:1px dashed #334155}
+  .bead.watched{border-style:dashed;opacity:.88}
+  .bead.watched::after{content:'';position:absolute;top:2px;right:2px;width:4px;height:4px;border-radius:50%;background:#38bdf8}
 
   /* Strategy chart table */
   .strat-tbl{width:100%;border-collapse:collapse;font-size:12px;text-align:center}
@@ -2266,6 +2268,34 @@ function computeSplitTotals(baseUnitStake){
   return { perHand, netMain, totalRisked, wins, losses, pushes };
 }
 
+function computeWatchOutcome(hands, dCards){
+  if(!Array.isArray(hands) || !hands.length || !Array.isArray(dCards) || dCards.length < 2) return null;
+  const validHands = hands.filter(h => Array.isArray(h.cards) && h.cards.length >= 2);
+  if(!validHands.length) return null;
+  const dEval = evalHand(dCards, false);
+  const dealerDone = dEval.isBJ || dEval.isBust || dEval.sum >= 17;
+  if(!dealerDone) return null;
+  const isSplit = hands.length > 1;
+  const resList = validHands.map(h => {
+    const pe = evalHand(h.cards, isSplit);
+    if(pe.isBust) return 'LOSS';
+    if(pe.isBJ) return dEval.isBJ ? 'PUSH' : 'BJ';
+    if(dEval.isBJ) return 'LOSS';
+    if(dEval.isBust) return 'WIN';
+    if(pe.sum > dEval.sum) return 'WIN';
+    if(pe.sum < dEval.sum) return 'LOSS';
+    return 'PUSH';
+  });
+  if(resList.length === 1) return resList[0];
+  let w = 0, p = 0, l = 0;
+  for(const r of resList){ if(r === 'WIN' || r === 'BJ') w++; else if(r === 'PUSH') p++; else l++; }
+  const parts = [];
+  if(w) parts.push(`${w}W`);
+  if(p) parts.push(`${p}P`);
+  if(l) parts.push(`${l}L`);
+  return `SPLIT ${parts.join('-')}`;
+}
+
 function recordRound(outcomeType){
   // outcomeType: 'WATCH' | 'WIN' | 'BJ' | 'DBL_WIN' | 'PUSH' | 'LOSS' | 'DBL_LOSS' | 'FOLD' | 'SPLIT_BET'
   const s = active();
@@ -2289,10 +2319,12 @@ function recordRound(outcomeType){
   let loggedStake = baseStake;
   let loggedOutcome = outcomeType;
   let splitHandsData = null;
+  let watchResult = null;
 
   if(outcomeType === 'WATCH'){
     mainPnl = 0;
     loggedStake = 0;
+    watchResult = computeWatchOutcome(draft.hands, draft.dCards);
     if(isSplit) splitHandsData = draft.hands.map(h => ({ cards: [...h.cards], cardMeta: [...(h.cardMeta||[])], res: 'WATCH', stake: 0, pnl: 0 }));
   } else if(isSplit || outcomeType === 'SPLIT_BET'){
     const sp = computeSplitTotals(baseStake);
@@ -2344,6 +2376,7 @@ function recordRound(outcomeType){
     tcAtDeal: Math.round(shoeAtDeal.tc * 100) / 100,
     edgeAtDeal: Math.round(shoeAtDeal.liveEdge * 10000) / 10000,
     outcome: loggedOutcome,
+    watchResult,
     stake: loggedStake,
     insPnl,
     sidePnl,
@@ -2833,17 +2866,20 @@ function renderPlay(){
         </div>
       ` : ''}
 
-      <div class="row" style="margin-top:8px">
-        <button class="btn xs ${draft.targetBox==='P'?'primary':''}" id="hitMyHandBtn" title="Focus Your Hand to add a Hit card (Hotkey: H)">+ Hit ${isSplit ? `H${draft.activeHand+1}` : 'My Hand'} <span class="kbd">H</span></button>
-        ${canDblNow ? `<button class="btn xs ${curHand.dbl?'amber':''}" id="dblToggleBtn" title="Toggle 2x Double on active hand (Hotkey: X)">${curHand.dbl?'⚡ 2x Dbl On':'⚡ 2x Dbl'} <span class="kbd">X</span></button>` : ''}
-        ${canSplitNow ? `<button class="btn xs purple" id="splitPairBtn" title="Split active pair into 2 hands (Hotkey: S)">✂️ Split <span class="kbd">S</span></button>` : ''}
-        ${isSplit ? `<button class="btn xs" id="nextSplitBtn" title="Switch to next split hand (Hotkey: Tab)">Next H → <span class="kbd">Tab</span></button>` : ''}
-        ${isSplit ? `<button class="btn xs" id="unsplitBtn" title="Merge split back into single hand">↩ Unsplit</button>` : ''}
-        <button class="btn xs ${draft.targetBox==='D'?'amber':''}" id="focusDealerBtn" title="Enter Dealer hole/draw cards to Auto-Score (Hotkey: D)">+ Dealer <span class="kbd">D</span></button>
-        <button class="btn xs ${draft.targetBox==='B'?'purple':''}" id="focusExtraBtn" title="Toggle community extra focus / felt tracking (Hotkey: B)">${feltTrackingLive ? '🟢 Felt On' : '+ Extra'} <span class="kbd">B</span></button>
-        <span class="sp"></span>
-        <button class="btn xs" id="undoCardBtn" title="Undo last card (-)">⌫ Undo</button>
-        <button class="btn xs danger" id="clearCardsBtn" title="Clear current round cards (Esc / .)">✕ Clear</button>
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-top:8px">
+        <div class="row" style="flex:1;min-width:0">
+          <button class="btn xs ${draft.targetBox==='P'?'primary':''}" id="hitMyHandBtn" title="Focus Your Hand to add a Hit card (Hotkey: H)">+ Hit ${isSplit ? `H${draft.activeHand+1}` : 'My Hand'} <span class="kbd">H</span></button>
+          ${canDblNow ? `<button class="btn xs ${curHand.dbl?'amber':''}" id="dblToggleBtn" title="Toggle 2x Double on active hand (Hotkey: X)">${curHand.dbl?'⚡ 2x Dbl On':'⚡ 2x Dbl'} <span class="kbd">X</span></button>` : ''}
+          ${canSplitNow ? `<button class="btn xs purple" id="splitPairBtn" title="Split active pair into 2 hands (Hotkey: S)">✂️ Split <span class="kbd">S</span></button>` : ''}
+          ${isSplit ? `<button class="btn xs" id="nextSplitBtn" title="Switch to next split hand (Hotkey: Tab)">Next H → <span class="kbd">Tab</span></button>` : ''}
+          ${isSplit ? `<button class="btn xs" id="unsplitBtn" title="Merge split back into single hand">↩ Unsplit</button>` : ''}
+          <button class="btn xs ${draft.targetBox==='D'?'amber':''}" id="focusDealerBtn" title="Enter Dealer hole/draw cards to Auto-Score (Hotkey: D)">+ Dealer <span class="kbd">D</span></button>
+          <button class="btn xs ${draft.targetBox==='B'?'purple':''}" id="focusExtraBtn" title="Toggle community extra focus / felt tracking (Hotkey: B)">${feltTrackingLive ? '🟢 Felt On' : '+ Extra'} <span class="kbd">B</span></button>
+        </div>
+        <div style="display:flex;gap:6px;flex-shrink:0;white-space:nowrap">
+          <button class="btn xs" id="undoCardBtn" title="Undo last card (-)">⌫ Undo</button>
+          <button class="btn xs danger" id="clearCardsBtn" title="Clear current round cards (Esc / .)">✕ Clear</button>
+        </div>
       </div>
 
       <!-- 10-Key Blackjack Numpad (A=1, 2..9, 0=10/J/Q/K) -->
@@ -3085,8 +3121,27 @@ function renderPlay(){
   const beadsHTML = s.rounds.length === 0
     ? `<span class="small mut">No rounds logged in this shoe yet.</span>`
     : s.rounds.map((r, i) => {
-        const cls = r.outcome === 'WATCH' ? 'WATCH' : (r.outcome === 'BJ' ? 'BJ' : (r.net > 0 ? 'W' : (r.net < 0 ? 'L' : 'P')));
-        const lbl = r.outcome === 'WATCH' ? '👁️' : (r.outcome === 'BJ' ? 'BJ' : (r.net > 0 ? 'W' : (r.net < 0 ? 'L' : 'P')));
+        if(r.outcome === 'WATCH'){
+          const wr = r.watchResult || computeWatchOutcome(
+            r.splitHands && r.splitHands.length ? r.splitHands : [{ cards: r.pCards || [] }],
+            r.dCards || []
+          );
+          let cls = 'WATCH', lbl = '👁️';
+          if(wr === 'BJ'){ cls = 'BJ watched'; lbl = 'BJ'; }
+          else if(wr === 'WIN'){ cls = 'W watched'; lbl = 'W'; }
+          else if(wr === 'LOSS'){ cls = 'L watched'; lbl = 'L'; }
+          else if(wr === 'PUSH'){ cls = 'P watched'; lbl = 'P'; }
+          else if(wr && wr.startsWith('SPLIT ')){
+            const wMatch = wr.match(/(\d+)W/), lMatch = wr.match(/(\d+)L/);
+            const wN = wMatch ? +wMatch[1] : 0, lN = lMatch ? +lMatch[1] : 0;
+            cls = `${wN > lN ? 'W' : (lN > wN ? 'L' : 'P')} watched`;
+            lbl = wr.replace('SPLIT ', '');
+          }
+          const wrTxt = wr ? `Watched: ${wr}` : 'Watched';
+          return `<span class="bead ${cls}" title="Round #${i+1}: ${wrTxt} (₱0) · Deal TC ${r.tcAtDeal>=0?'+':''}${r.tcAtDeal}">${lbl}</span>`;
+        }
+        const cls = r.outcome === 'BJ' ? 'BJ' : (r.net > 0 ? 'W' : (r.net < 0 ? 'L' : 'P'));
+        const lbl = r.outcome === 'BJ' ? 'BJ' : (r.net > 0 ? 'W' : (r.net < 0 ? 'L' : 'P'));
         return `<span class="bead ${cls}" title="Round #${i+1}: ${r.outcome} (${fmtSign(r.net)}) · Deal TC ${r.tcAtDeal>=0?'+':''}${r.tcAtDeal}">${lbl}</span>`;
       }).join('');
 
@@ -3793,7 +3848,16 @@ function renderHistory(){
                   <td>${pDisp}</td>
                   <td>${(r.dCards||[]).map((c,ci)=>fC(c,(r.dMeta||[])[ci])).join(' ') || '—'}</td>
                   <td class="small mut">${(r.bCards||[]).map((c,ci)=>fC(c,(r.bMeta||[])[ci])).join(' ') || '—'}</td>
-                  <td><span class="pill ${r.outcome==='WATCH'?'':r.net>0?'green':r.net<0?'red':'blue'}">${r.outcome}</span>${hitBadges}</td>
+                  <td>${(() => {
+                    if(r.outcome !== 'WATCH') return `<span class="pill ${r.net>0?'green':r.net<0?'red':'blue'}">${r.outcome}</span>`;
+                    const wr = r.watchResult || computeWatchOutcome(
+                      r.splitHands && r.splitHands.length ? r.splitHands : [{ cards: r.pCards || [] }],
+                      r.dCards || []
+                    );
+                    if(!wr) return `<span class="pill" style="border-style:dashed;opacity:.8">WATCH</span>`;
+                    const wrCls = (wr === 'WIN' || wr === 'BJ') ? 'green' : (wr === 'LOSS' ? 'red' : 'blue');
+                    return `<span class="pill ${wrCls}" style="border-style:dashed">${wr}</span> <span class="pill" style="border-style:dashed;opacity:.7">WATCH</span>`;
+                  })()}${hitBadges}</td>
                   <td class="r">${fmt(r.stake)}</td>
                   <td class="r ${r.net>0?'pos':r.net<0?'neg':''}">${fmtSign(r.net)}</td>
                 </tr>
