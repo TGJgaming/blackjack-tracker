@@ -2269,23 +2269,30 @@ function computeSplitTotals(baseUnitStake){
 }
 
 function computeWatchOutcome(hands, dCards){
-  if(!Array.isArray(hands) || !hands.length || !Array.isArray(dCards) || dCards.length < 2) return null;
+  if(!Array.isArray(hands) || !hands.length) return null;
   const validHands = hands.filter(h => Array.isArray(h.cards) && h.cards.length >= 2);
   if(!validHands.length) return null;
-  const dEval = evalHand(dCards, false);
-  const dealerDone = dEval.isBJ || dEval.isBust || dEval.sum >= 17;
-  if(!dealerDone) return null;
+  const dList = Array.isArray(dCards) ? dCards : [];
+  const dEval = dList.length ? evalHand(dList, false) : { sum: 0, isBJ: false, isBust: false };
+  const dealerDone = dList.length >= 2 && (dEval.isBJ || dEval.isBust || dEval.sum >= 17);
   const isSplit = hands.length > 1;
-  const resList = validHands.map(h => {
+  const resList = [];
+  for(const h of validHands){
     const pe = evalHand(h.cards, isSplit);
-    if(pe.isBust) return 'LOSS';
-    if(pe.isBJ) return dEval.isBJ ? 'PUSH' : 'BJ';
-    if(dEval.isBJ) return 'LOSS';
-    if(dEval.isBust) return 'WIN';
-    if(pe.sum > dEval.sum) return 'WIN';
-    if(pe.sum < dEval.sum) return 'LOSS';
-    return 'PUSH';
-  });
+    if(pe.isBust){ resList.push('LOSS'); continue; }
+    if(pe.isBJ){
+      if(dList.length >= 2) resList.push(dEval.isBJ ? 'PUSH' : 'BJ');
+      else if(dList.length === 1 && dList[0] !== 1 && dList[0] !== 0) resList.push('BJ');
+      else return null;
+      continue;
+    }
+    if(!dealerDone) return null;
+    if(dEval.isBJ) resList.push('LOSS');
+    else if(dEval.isBust) resList.push('WIN');
+    else if(pe.sum > dEval.sum) resList.push('WIN');
+    else if(pe.sum < dEval.sum) resList.push('LOSS');
+    else resList.push('PUSH');
+  }
   if(resList.length === 1) return resList[0];
   let w = 0, p = 0, l = 0;
   for(const r of resList){ if(r === 'WIN' || r === 'BJ') w++; else if(r === 'PUSH') p++; else l++; }
@@ -3126,7 +3133,7 @@ function renderPlay(){
             r.splitHands && r.splitHands.length ? r.splitHands : [{ cards: r.pCards || [] }],
             r.dCards || []
           );
-          let cls = 'WATCH', lbl = '👁️';
+          let cls = 'WATCH', lbl = '?';
           if(wr === 'BJ'){ cls = 'BJ watched'; lbl = 'BJ'; }
           else if(wr === 'WIN'){ cls = 'W watched'; lbl = 'W'; }
           else if(wr === 'LOSS'){ cls = 'L watched'; lbl = 'L'; }
