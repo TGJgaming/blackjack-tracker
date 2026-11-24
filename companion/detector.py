@@ -1548,21 +1548,20 @@ def _detect_cluster_cards(
             kept.append(cand)
         kept.sort(key=lambda d: d.x)
 
-    # Locate Card 0's true left paper edge above the circular badge (badge ring can shift cluster left by 4-6px)
+    # Locate Card 0's true left paper edge above the score pill/badge (elongated pills like 1/11 can shift cluster left by 12-20px)
     top_white_cols = np.where(np.mean(norm_top[1:8, :] > paper_thr, axis=0) >= 0.45)[0]
-    first_card_x = min(max(0, cw_norm - 12), min(10, int(top_white_cols[0]))) if len(top_white_cols) else 0
-    badge_probe = norm_top[14:23, max(0, first_card_x) : min(cw_norm, first_card_x + 10)]
+    first_card_x = min(max(0, cw_norm - 12), min(24, int(top_white_cols[0]))) if len(top_white_cols) else 0
+    badge_probe = norm_top[14:23, max(0, first_card_x - 2) : min(cw_norm, first_card_x + 10)]
     if norm_bgr.shape[0] >= 38:
-        badge_probe = _to_min_gray(norm_bgr[18:38, max(0, first_card_x - 2) : min(cw_norm, first_card_x + 10)])
+        badge_probe = _to_min_gray(norm_bgr[18:38, max(0, first_card_x - 4) : min(cw_norm, first_card_x + 10)])
     top_paper = float(np.mean(norm_top[1:8, first_card_x : min(cw_norm, first_card_x + 14)] > paper_thr))
     left_badge_intrusion = (
-        not is_dealer
-        and top_paper >= 0.25
+        top_paper >= 0.25
         and badge_probe.size > 0
-        and float(np.mean(badge_probe < badge_dark_thr)) >= 0.25
+        and float(np.mean(badge_probe < badge_dark_thr)) >= 0.22
     )
 
-    # Masked left-badge recovery when card 0's bottom-left corner is clipped or weakened by a circular score badge
+    # Masked left-badge recovery when card 0's bottom-left corner is clipped or weakened by a score pill/badge
     card0_missing = (kept and kept[0].x >= first_card_x + 10) or (not kept and cw_norm >= 12)
     card0_weak_under_badge = left_badge_intrusion and kept and kept[0].x <= first_card_x + 6 and kept[0].conf < 0.88
     if card0_missing or card0_weak_under_badge:
@@ -1668,10 +1667,9 @@ def _detect_cluster_cards(
                 and float(np.mean(sz > pip_paper_thr)) >= 0.30
                 and int(np.sum(sz < pip_ink_thr)) >= 5
             )
-            # Score badge on player Card 0 covers lower-left (rows 26:45) with dark badge pixels
+            # Score badge/pill on Card 0 covers lower-left (rows 26:45) with dark badge pixels
             has_badge_occlusion = (
-                not is_dealer
-                and d.x <= first_card_x + 6
+                d.x <= first_card_x + 6
                 and sz.size > 0
                 and float(np.mean(sz < badge_dark_thr)) >= 0.25
                 and d.conf >= max(0.75, floor_conf)
