@@ -2396,11 +2396,12 @@ function startNewSession(){
   };
   S.sessions.push(s);
   S.activeId = s.id;
+  const keepWatchLock = !!(saveUndo && draft.watchLocked);
   draft = freshDraft();
   draft.playMode = 'watch';
   draft.trackCommunityFelt = false;
   draft.manualBetOverride = false;
-  draft.watchLocked = false;
+  draft.watchLocked = keepWatchLock;
   save();
   render();
 }

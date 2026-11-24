@@ -1695,7 +1695,7 @@ def _detect_cluster_cards(
                     if suit is None and (not has_pip_body or d.conf < max(0.82, min_hud_conf - 0.02)):
                         _record_sub(d, suit, has_pip_body)
                         continue
-            high_conf_pip_ok = has_pip_body and d.conf >= max(0.75 if is_dealer else 0.86, 0.75 if is_dealer else min_hud_conf)
+            high_conf_pip_ok = has_pip_body and suit_conf >= 0.35 and d.conf >= max(0.75 if is_dealer else 0.86, 0.75 if is_dealer else min_hud_conf)
             if suit is None and not has_badge_occlusion and not high_conf_pip_ok:
                 if not has_pip_body or suit_conf < 0.42 or d.conf < max(0.82, min_hud_conf - 0.02):
                     _record_sub(d, suit, has_pip_body)
@@ -1704,6 +1704,9 @@ def _detect_cluster_cards(
                 _record_sub(d, suit, has_pip_body)
                 continue
             if d.rank == "4" and not has_badge_occlusion and d.conf < max(0.82, min_hud_conf - 0.02):
+                _record_sub(d, suit, has_pip_body)
+                continue
+            if d.rank == "Q" and suit is None and not has_badge_occlusion and (not has_pip_body or suit_conf < 0.45 or d.conf < 0.88):
                 _record_sub(d, suit, has_pip_body)
                 continue
         out.append(
