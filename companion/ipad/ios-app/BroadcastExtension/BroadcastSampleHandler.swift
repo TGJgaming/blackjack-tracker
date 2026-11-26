@@ -234,7 +234,7 @@ private final class LoopbackFrameSender {
 
 /// Lightweight ReplayKit Broadcast Upload Extension (`RPBroadcastSampleHandler`).
 /// Strictly engineered to stay well below iPadOS's 50 MB extension limit:
-/// - Throttles capture to 20 FPS and skips duplicate static frames between 0.45s heartbeats
+/// - Throttles capture to 30 FPS and skips duplicate static frames between 0.45s heartbeats
 /// - Remaps `RPVideoSampleOrientationKey` to EXIF `CIImage.oriented(_:)` (swapping `.left` <-> `.right`) and normalizes extent origin
 /// - Downscales incoming `CMSampleBuffer` to <= 1280x960 using 8-bit hardware CIContext
 /// - Writes RGBA bytes directly into `SharedFrameRing` (when App Group exists) OR
@@ -256,7 +256,7 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
     private var seq: UInt32 = 0
     private var frameCount: UInt64 = 0
     private var lastFrameTs: CFTimeInterval = 0
-    private let minFrameInterval: CFTimeInterval = 1.0 / 20.0
+    private let minFrameInterval: CFTimeInterval = 1.0 / 30.0
     private let duplicateHeartbeatInterval: CFTimeInterval = 0.45
     private var hasSentFrame = false
     private var lastSentFrameHash: UInt64 = 0
@@ -288,9 +288,28 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
         let pixelCount = byteCount / 4
         guard pixelCount > 0, width > 0, height > 0 else { return 0 }
         var h: UInt64 = 14695981039346656037
-        // 1. Dense sample across the full vertical game band (x: full width, y: 12%..88% height)
-        // so small 13x15 dealer rank glyphs or 5x7 badge digits on either left or right Split View
-        // panes (or Stage Manager) never fall between sample points.
+        // 1. High-density 4x4 grid over the left-pane HUD card & score-badge zone (x: 0..62%, y: 20%..85%)
+        // so ultra-brief 13x15 dealer rank glyphs or 5x7 score badge digits can never fall between sample points.
+        let hy0 = max(0, min(height - 1, Int(Double(height) * 0.20)))
+        let hy1 = max(hy0 + 1, min(height, Int(Double(height) * 0.85)))
+        let hx1 = max(1, min(width, Int(Double(width) * 0.62)))
+        var hy = hy0
+        while hy < hy1 {
+            let rowBase = hy * width
+            var hx = 0
+            while hx < hx1 {
+                let idx = rowBase + hx
+                if idx < pixelCount {
+                    let word = raw.loadUnaligned(fromByteOffset: idx * 4, as: UInt32.self)
+                    h ^= UInt64(word)
+                    h &*= 1099511628211
+                }
+                hx += 4
+            }
+            hy += 4
+        }
+        // 2. Medium sample across the full vertical game band (x: full width, y: 12%..88% height)
+        // for Stage Manager / right-pane layouts and banners.
         let y0 = max(0, min(height - 1, Int(Double(height) * 0.12)))
         let y1 = max(y0 + 1, min(height, Int(Double(height) * 0.88)))
         let yStep = max(1, (y1 - y0) / 96)
@@ -310,7 +329,7 @@ final class BroadcastSampleHandler: RPBroadcastSampleHandler {
             }
             y += yStep
         }
-        // 2. Coarse full-frame sweep for overall screen changes (banners/toolbars)
+        // 3. Coarse full-frame sweep for overall screen changes (banners/toolbars)
         let stride = max(1, pixelCount / 4096)
         var i = 0
         while i < pixelCount {

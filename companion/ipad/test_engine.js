@@ -2546,7 +2546,178 @@ console.log("41. Testing phantom suitless Q rejection & manual resync dealer+pla
   console.log("   Test 41 PASSED");
 }
 
-console.log("\nALL 41 ENGINE TESTS PASSED SUCCESSFULLY!");
+// ---------------------------------------------------------------------------
+// 42. H.264 +-2 jitter cache stability on dealer_strip + shoe throttle decoupling
+// ---------------------------------------------------------------------------
+console.log("42. Testing H.264 +-2 dealer cache stability, thin-glyph invalidation & shoe throttle decoupling...");
+{
+  const det42 = new Engine.PlaytechDetector(Engine.defaultConfig(), DEFAULT_COMPANION_PACK);
+  const pImg = Engine.createImage(240, 80, 3, 40);
+  const dImg = Engine.createImage(180, 72, 3, 40);
+  const shoeImg = Engine.createImage(90, 60, 3, 30);
+  const discImg = Engine.createImage(90, 60, 3, 30);
+  let dScanCalls = 0;
+  let shoeCalls = 0;
+  const origHud = det42.detectHudStrip.bind(det42);
+  det42.detectHudStrip = function (img, isD) {
+    if (isD) dScanCalls++;
+    return origHud(img, isD);
+  };
+  const origShoe = det42._classifyShoeWithBaseline.bind(det42);
+  det42._classifyShoeWithBaseline = function (...args) {
+    shoeCalls++;
+    return origShoe(...args);
+  };
+
+  // Initial scan at t=1.0
+  det42.processCrops({ playerImg: pImg, dealerImg: dImg, shoeImg, discardImg: discImg, ts: 1.0, inDealerTurn: true });
+  assert.strictEqual(dScanCalls, 1, "Initial dealer scan must run once");
+  assert.strictEqual(shoeCalls, 1, "Initial shoe scan must run once");
+
+  // 10 frames with realistic +-2 H.264 noise at 30 FPS during DEALER_TURN -> 0 redundant dealer rescans & 0 redundant shoe scans
+  for (let f = 1; f <= 10; f++) {
+    const noisyD = Engine.createImage(dImg.w, dImg.h, 3, 40);
+    for (let p = 0, n = dImg.w * dImg.h; p < n; p++) {
+      const delta = ((p + f) % 3 === 0) ? (((p + f) & 1) ? 2 : -2) : 0;
+      const v = 40 + delta;
+      const o = p * 3;
+      noisyD.data[o] = v;
+      noisyD.data[o + 1] = v;
+      noisyD.data[o + 2] = v;
+    }
+    det42.processCrops({
+      playerImg: pImg,
+      dealerImg: noisyD,
+      shoeImg,
+      discardImg: discImg,
+      ts: 1.0 + f * 0.033,
+      forceDealerScan: false,
+      inDealerTurn: true,
+    });
+  }
+  assert.strictEqual(dScanCalls, 1, `+-2 H.264 noise must reuse dealer cache (got ${dScanCalls} scans)`);
+  assert.strictEqual(shoeCalls, 1, `Shoe scan must stay throttled during DEALER_TURN (got ${shoeCalls} scans)`);
+
+  // Stamp a thin white card + dark '7' stroke onto dealerImg -> must immediately invalidate dealer cache
+  const changedD = Engine.createImage(dImg.w, dImg.h, 3, 40);
+  fillRect(changedD, 80, 12, 24, 42, 240, 240, 240);
+  fillRect(changedD, 84, 15, 8, 2, 20, 20, 20);
+  fillRect(changedD, 89, 17, 2, 10, 20, 20, 20);
+  det42.processCrops({
+    playerImg: pImg,
+    dealerImg: changedD,
+    shoeImg,
+    discardImg: discImg,
+    ts: 1.40,
+    forceDealerScan: false,
+    inDealerTurn: true,
+  });
+  assert.strictEqual(dScanCalls, 2, "New card on dealer_strip must immediately bust H.264 cache and rescan");
+  console.log("   Test 42 PASSED");
+}
+
+// ---------------------------------------------------------------------------
+// 43. Non-destructive flushPendingOnWipe B1 (0.78) -> B2 (0.72) rescue
+// ---------------------------------------------------------------------------
+console.log("43. Testing non-destructive flushPendingOnWipe B1 (0.78) -> B2 (0.72) flashed dealer card rescue...");
+{
+  const cfg43 = Engine.defaultConfig({ confirm_frames: 3, clear_frames: 3, min_hud_confidence: 0.84 });
+  const sm43 = new Engine.CompanionStateMachine(cfg43);
+  sm43.setSyncState({ playMode: "watch" });
+
+  // Establish Player 10+9 (19) and Dealer 6 + BACK
+  const pPair = [
+    { rank: "10", val: 0, conf: 0.94, x: 10, y: 2, w: 12, h: 15, suit: "S", hand_index: 0 },
+    { rank: "9", val: 9, conf: 0.94, x: 30, y: 2, w: 12, h: 15, suit: "H", hand_index: 0 },
+  ];
+  const dUp = [
+    { rank: "6", val: 6, conf: 0.94, x: 10, y: 2, w: 12, h: 15, suit: "C", hand_index: 0 },
+    { rank: "BACK", val: null, conf: 0.92, x: 30, y: 2, w: 12, h: 15, suit: null, hand_index: 0 },
+  ];
+  for (let i = 0; i < 3; i++) {
+    sm43.step({ ts: 1.0 + i * 0.05, player_cards: pPair, player_hands: { 0: pPair }, dealer_cards: dUp, banner_state: "WAIT", banner_conf: 0.95 });
+  }
+  assert.deepStrictEqual(sm43.dDebouncer.committedRanks, ["6", "BACK"]);
+
+  // Single 1-frame flash: Dealer reveals 9 (0.74, below B1's 0.78!) and draws K (0.85) right before instant PLACE_BETS wipe!
+  // With the old destructive B1 bug, B1 failed on slot 1 (0.74 < 0.78) and cleared _pendingTail, killing B2 and losing BOTH cards!
+  const dFlash = [
+    { rank: "6", val: 6, conf: 0.94, x: 10, y: 2, w: 12, h: 15, suit: "C", hand_index: 0 },
+    { rank: "9", val: 9, conf: 0.74, x: 30, y: 2, w: 12, h: 15, suit: null, hand_index: 0 },
+    { rank: "K", val: 0, conf: 0.85, x: 50, y: 2, w: 12, h: 15, suit: "D", hand_index: 0 },
+  ];
+  sm43.step({ ts: 1.20, player_cards: pPair, player_hands: { 0: pPair }, dealer_cards: dFlash, banner_state: "WAIT", banner_conf: 0.95 });
+  // Instant wipe into PLACE_BETS
+  const wipeEvts = sm43.step({ ts: 1.25, player_cards: [], player_hands: {}, dealer_cards: [], banner_state: "PLACE_BETS", banner_conf: 0.95 });
+  const rescuedCards = wipeEvts.filter((e) => e.type === "card" && e.target === "D" && e.source === "hud");
+  assert.strictEqual(rescuedCards.length, 2, `B2 must rescue both 9@0.74 and K@0.85 after B1 preserves pending tail, got ${JSON.stringify(rescuedCards)}`);
+  assert.strictEqual(rescuedCards[0].rankLabel, "9");
+  assert.strictEqual(rescuedCards[1].rankLabel, "K");
+  console.log("   Test 43 PASSED");
+}
+
+// ---------------------------------------------------------------------------
+// 44. Fade-in dealer cluster extension, blurred-suit crisp tail & badge corroboration
+// ---------------------------------------------------------------------------
+console.log("44. Testing dealer fade-in cluster extension, blurred-suit crisp tail & score-badge corroboration...");
+{
+  const det44 = new Engine.PlaytechDetector(Engine.defaultConfig(), DEFAULT_COMPANION_PACK);
+  det44._ensureBankDecoded("hud");
+  det44._ensureBankDecoded("suit");
+
+  // (a) Fade-in trailing dealer card at minGray=150 (below primary 155, above relaxed 142/148) next to 2 bright cards
+  const fadeStrip = Engine.createImage(140, 60, 3, 35);
+  fillRect(fadeStrip, 8, 8, 28, 45, 240, 240, 240);
+  fillRect(fadeStrip, 40, 8, 28, 45, 240, 240, 240);
+  fillRect(fadeStrip, 72, 8, 28, 45, 150, 150, 150); // semi-transparent fading 3rd dealer card
+  const clusters44 = Engine.findWhiteCardClusters(fadeStrip, true);
+  const maxClRight = Math.max(...clusters44.map((c) => c[0] + c[2]));
+  assert(maxClRight >= 98, `Relaxed dealer pass must extend to include fade-in 3rd card (maxRight=${maxClRight})`);
+
+  // (b) Blurred-suit crisp rightmost dealer card (K@>=0.86 with clean white lower paper but no sharp suit ink)
+  const kTpl = (det44.banks.hud || []).find((t) => t.rank === "K");
+  assert(kTpl, "K template must exist");
+  const blurredTail = Engine.createImage(34, 45, 3, 245);
+  for (let y = 0; y < kTpl.gray.h && y + 2 < 23; y++) {
+    for (let x = 0; x < kTpl.gray.w && x + 3 < 34; x++) {
+      const v = kTpl.gray.data[y * kTpl.gray.w + x];
+      const o = ((y + 2) * 34 + (x + 3)) * 3;
+      blurredTail.data[o] = v; blurredTail.data[o + 1] = v; blurredTail.data[o + 2] = v;
+    }
+  }
+  const [tailDets] = Engine.detectClusterCards(blurredTail, [0, 0, 34, 45], det44.banks.hud, det44.banks.suit, 0.74, true, 0.84, null);
+  assert(tailDets.some((d) => d.rank === "K" && d.conf >= 0.86), `Crisp rightmost dealer K with blurred suit must be accepted, got ${JSON.stringify(tailDets)}`);
+
+  // (c) Score-badge corroboration promotes a 0.68 dealer_sub_cards face card ('J') when badge total matches (10 + J = 20)
+  const sm44 = new Engine.CompanionStateMachine(Engine.defaultConfig({ confirm_frames: 3, clear_frames: 3 }));
+  sm44.setSyncState({ playMode: "watch" });
+  const pH = [
+    { rank: "8", val: 8, conf: 0.95, x: 10, y: 2, w: 12, h: 15, suit: "S", hand_index: 0 },
+    { rank: "10", val: 0, conf: 0.95, x: 30, y: 2, w: 12, h: 15, suit: "H", hand_index: 0 },
+  ];
+  const d1 = [{ rank: "10", val: 0, conf: 0.95, x: 10, y: 2, w: 12, h: 15, suit: "C", hand_index: 0 }];
+  for (let i = 0; i < 3; i++) {
+    sm44.step({ ts: 2.0 + i * 0.05, player_cards: pH, player_hands: { 0: pH }, dealer_cards: d1, banner_state: "WAIT", banner_conf: 0.95 });
+  }
+  // Flash frame: dealer_sub_cards has J@0.68 and dealer_badge_total reads 20@0.80
+  sm44.step({
+    ts: 2.20,
+    player_cards: pH,
+    player_hands: { 0: pH },
+    dealer_cards: d1,
+    dealer_sub_cards: [{ rank: "J", val: 0, conf: 0.68, x: 30, y: 2, w: 12, h: 15, suit: null, hand_index: 0 }],
+    dealer_badge_total: 20,
+    dealer_badge_conf: 0.80,
+    banner_state: "WAIT",
+    banner_conf: 0.95,
+  });
+  const evts44 = sm44.step({ ts: 2.25, player_cards: [], player_hands: {}, dealer_cards: [], banner_state: "PLACE_BETS", banner_conf: 0.95 });
+  const corrobCard = evts44.find((e) => e.type === "card" && e.target === "D" && e.slot === 1);
+  assert(corrobCard && corrobCard.rankLabel === "J" && corrobCard.source === "hud", `Badge corroboration must preserve visual face card J (got ${JSON.stringify(corrobCard)})`);
+  console.log("   Test 44 PASSED");
+}
+
+console.log("\nALL 44 ENGINE TESTS PASSED SUCCESSFULLY!");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

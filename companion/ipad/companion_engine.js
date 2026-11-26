@@ -48,12 +48,10 @@
   const BANNER_TOKENS = ["NO_MORE_BETS", "PLACE_BETS", "LAST_BETS", "SHUFFLE", "WAIT"];
   const SUIT_TOKENS = new Set(["S", "H", "C", "D"]);
   const TOP_BANNER_SCALES = [
-    0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15,
-    1.21, 1.27, 1.33, 1.40, 1.48, 1.56, 1.65, 1.75, 1.85, 1.96, 2.08, 2.22, 2.38, 2.55,
+    0.55, 0.66, 0.78, 0.85, 0.92, 1.00, 1.08, 1.16, 1.28, 1.45, 1.70, 2.00, 2.35,
   ];
   const PLACE_BETS_SCALES = [
-    0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.12, 1.20,
-    1.28, 1.36, 1.45, 1.56, 1.68, 1.80, 1.85, 1.95, 2.08, 2.25, 2.45,
+    0.50, 0.62, 0.76, 0.92, 1.10, 1.32, 1.58, 1.90, 2.30,
   ];
 
   function normalizeRotationDeg(deg) {
@@ -101,8 +99,8 @@
       window_titles: base.window_titles || ["Live Games", "All Bets Blackjack", "epicworld", "Playtech"],
       anchor_mode: anchorMode,
       frame_rotation: normalizeRotationDeg(base.frame_rotation || 0),
-      fps: Number(base.fps || 10.0),
-      burst_fps: Number(base.burst_fps || 20.0),
+      fps: Number(base.fps || 15.0),
+      burst_fps: Number(base.burst_fps || 30.0),
       confirm_frames: Math.max(1, Number(base.confirm_frames ?? 3)),
       clear_frames: Math.max(2, Number(base.clear_frames ?? 4)),
       shuffle_hold_sec: Number(base.shuffle_hold_sec || 2.0),
@@ -251,6 +249,33 @@
       out[j + 2] = rgba[p];     // R
     }
     return { w: width, h: height, c: 3, data: out };
+  }
+
+  function fromRGBARect(rgba, w, h, x0, y0, rw, rh) {
+    const width = Math.max(0, w | 0);
+    const height = Math.max(0, h | 0);
+    const expected = width * height * 4;
+    if (!rgba || width === 0 || height === 0 || rgba.length < expected) {
+      return createImage(0, 0, 3);
+    }
+    const cx0 = Math.max(0, Math.min(width, x0 | 0));
+    const cy0 = Math.max(0, Math.min(height, y0 | 0));
+    const cx1 = Math.max(cx0, Math.min(width, (x0 + rw) | 0));
+    const cy1 = Math.max(cy0, Math.min(height, (y0 + rh) | 0));
+    const cw = cx1 - cx0;
+    const ch = cy1 - cy0;
+    if (cw <= 0 || ch <= 0) return createImage(0, 0, 3);
+    const out = new Uint8Array(cw * ch * 3);
+    let j = 0;
+    for (let y = cy0; y < cy1; y++) {
+      let p = (y * width + cx0) * 4;
+      for (let x = 0; x < cw; x++, p += 4, j += 3) {
+        out[j] = rgba[p + 2];     // B
+        out[j + 1] = rgba[p + 1]; // G
+        out[j + 2] = rgba[p];     // R
+      }
+    }
+    return { w: cw, h: ch, c: 3, data: out };
   }
 
   function toGray(img) {
@@ -1494,12 +1519,21 @@
     }
     const mean = sum / mCount;
     const tmBase = new Float32Array(mCount);
+    const maskYs = new Int16Array(mCount);
+    const maskXs = new Int16Array(mCount);
     let normSq = 0;
-    for (let i = 0, k = 0; i < mask.length; i++) {
-      if (mask[i]) {
-        const v = d[i] - mean;
-        tmBase[k++] = v;
-        normSq += v * v;
+    for (let y = 0, k = 0; y < sh; y++) {
+      const rowOff = y * sw;
+      for (let x = 0; x < sw; x++) {
+        const i = rowOff + x;
+        if (mask[i]) {
+          const v = d[i] - mean;
+          tmBase[k] = v;
+          maskYs[k] = y;
+          maskXs[k] = x;
+          normSq += v * v;
+          k++;
+        }
       }
     }
     const tNorm = Math.sqrt(normSq);
@@ -1507,7 +1541,7 @@
       tpl._scaleCache.set(key, null);
       return null;
     }
-    const res = { scaled, sw, sh, mask, mCount, tmBase, tNorm };
+    const res = { scaled, sw, sh, mask, mCount, tmBase, tNorm, maskYs, maskXs };
     tpl._scaleCache.set(key, res);
     return res;
   }
@@ -1559,13 +1593,16 @@
         bestConf = m.maxVal;
         bestTpl = tpl;
         bestScale = sc;
+        if (bestConf >= 0.92) {
+          return [bestTpl, bestConf, bestScale];
+        }
       }
     }
     if (bestTpl && bestConf >= minConf) return [bestTpl, bestConf, bestScale];
     return [null, bestConf, null];
   }
 
-  function detectLoadingScreen(anchorBgr, loadingTpls = null) {
+  function detectLoadingScreen(anchorBgr, loadingTpls = null, allowTemplateScan = true) {
     if (!anchorBgr || anchorBgr.c !== 3 || anchorBgr.w < 40 || anchorBgr.h < 40) return false;
     const th = 140;
     const tw = Math.max(48, Math.min(260, Math.round(anchorBgr.w * (th / anchorBgr.h))));
@@ -1586,7 +1623,7 @@
     if (Math.sqrt(gVar / Math.max(1, coreN)) < 8.5) return true;
 
     // 2. Reliable template match for the Playtech "ALL BETS" loading logo in center band [x:0.08..0.92, y:0.20..0.72]
-    if (Array.isArray(loadingTpls) && loadingTpls.length > 0) {
+    if (allowTemplateScan && Array.isArray(loadingTpls) && loadingTpls.length > 0) {
       const rx0 = Math.floor(anchorBgr.w * 0.08);
       const ry0 = Math.floor(anchorBgr.h * 0.20);
       const rw = Math.max(20, Math.floor(anchorBgr.w * 0.84));
@@ -1600,14 +1637,10 @@
         const tGray = tpl && tpl.gray;
         if (!tGray || tGray.w < 8 || tGray.h < 4) continue;
         for (const sc of [0.24, 0.28, 0.32, 0.36, 0.42, 0.48, 0.56, 0.66]) {
-          const sw = Math.max(12, Math.round(tGray.w * sc));
-          const sh = Math.max(6, Math.round(tGray.h * sc));
-          if (sw > nw || sh > nh) continue;
-          const st = resizeImage(tGray, sw, sh);
-          const m = matchTemplateCCoeffNormed(bandGray, st, bandPrep);
-          for (let i = 0; i < m.data.length; i++) {
-            if (m.data[i] >= 0.72) return true;
-          }
+          const entry = getScaledTplGray(tpl, sc, false);
+          if (!entry || entry.sw > nw || entry.sh > nh) continue;
+          const m = matchPreparedTemplate(bandPrep, entry.scaled, entry.tZero, entry.tNorm);
+          if (Number.isFinite(m.maxVal) && m.maxVal >= 0.72) return true;
         }
       }
     }
@@ -1838,10 +1871,14 @@
       return combined;
     }
     const totalW = primary.reduce((s, c) => s + c[2], 0);
-    if (!primary.length || totalW < roiBgr.w * 0.28) {
+    const maxRight = primary.length ? Math.max(...primary.map((c) => c[0] + c[2])) : 0;
+    if (!primary.length || totalW < roiBgr.w * 0.28 || maxRight < roiBgr.w - 8) {
       const relaxed = runPass(142, 145, 148, null);
       const relW = relaxed.reduce((s, c) => s + c[2], 0);
-      if (relW > totalW) return relaxed;
+      const relRight = relaxed.length ? Math.max(...relaxed.map((c) => c[0] + c[2])) : 0;
+      if (relW > totalW || (relaxed.length > primary.length && relRight >= maxRight + 6) || relRight >= maxRight + 7) {
+        return relaxed;
+      }
     }
     return primary;
   }
@@ -2032,13 +2069,34 @@
     }
     if (effRight < 14) return [[], clusterHasBack];
 
+    const isBackColumn = (x0, swCheck) => {
+      if (!isDealer || normBgr.c !== 3) return false;
+      const xEnd = Math.min(cwNorm, x0 + Math.max(swCheck, 12));
+      const yEnd = Math.min(normBgr.h, 31);
+      if (xEnd <= x0 || yEnd <= 17) return false;
+      const d = normBgr.data;
+      const tot = (yEnd - 17) * (xEnd - x0);
+      let redCnt = 0, whiteCnt = 0;
+      for (let py = 17; py < yEnd; py++) {
+        let off = (py * cwNorm + x0) * 3;
+        for (let px = x0; px < xEnd; px++, off += 3) {
+          const b = d[off], g = d[off + 1], r = d[off + 2];
+          const mxBg = b > g ? b : g;
+          if (r - mxBg > 32) redCnt++;
+          const mn = b < g ? (b < r ? b : r) : (g < r ? g : r);
+          if (mn > 165) whiteCnt++;
+        }
+      }
+      return (redCnt / tot) > 0.22 && (whiteCnt / tot) < 0.55;
+    };
+
     const topPrep = prepareSourceForMatch(normTop, false);
     const minTail = isDealer ? 11 : (!clusterHasBack && !edgeClipped ? 14 : 12);
     const peaks = [];
     const subPeaks = [];
     const subFloor = isDealer ? 0.42 : floorConf;
     for (const tpl of rankTemplates) {
-      for (const tsc of [0.90, 0.96, 1.0, 1.05, 1.10]) {
+      for (const tsc of [0.93, 1.0, 1.07]) {
         const entry = getScaledTplGray(tpl, tsc, true);
         if (!entry) continue;
         const { scaled, sw, sh, tZero, tNorm } = entry;
@@ -2046,12 +2104,36 @@
         const maxXForTpl = effRight - Math.max(minTail, sw);
         if (maxXForTpl < 0) continue;
         const m = matchPreparedTemplate(topPrep, scaled, tZero, tNorm, maxXForTpl + 1, 9);
+        if (!Number.isFinite(m.maxVal) || m.maxVal < subFloor) continue;
         const yLim = Math.min(9, m.h);
         const xLim = Math.min(maxXForTpl, m.w - 1);
+        const md = m.data;
+        const mw = m.w;
+        const useLocMax = yLim >= 3 && xLim >= 2;
         for (let yPos = 0; yPos < yLim; yPos++) {
+          const rowOff = yPos * mw;
           for (let xPos = 0; xPos <= xLim; xPos++) {
-            const conf = m.data[yPos * m.w + xPos];
+            const conf = md[rowOff + xPos];
             if (conf < subFloor || !Number.isFinite(conf)) continue;
+            // Evaluate ONLY 2D 3x3 local maxima instead of every pixel on the correlation hill
+            if (useLocMax) {
+              const cmp = conf + 1e-6;
+              let isPeak = true;
+              const ny0 = yPos > 0 ? yPos - 1 : 0;
+              const ny1 = yPos + 1 < yLim ? yPos + 1 : yLim - 1;
+              const nx0 = xPos > 0 ? xPos - 1 : 0;
+              const nx1 = xPos < xLim ? xPos + 1 : xLim;
+              for (let ny = ny0; ny <= ny1 && isPeak; ny++) {
+                const nRow = ny * mw;
+                for (let nx = nx0; nx <= nx1; nx++) {
+                  if (md[nRow + nx] > cmp) {
+                    isPeak = false;
+                    break;
+                  }
+                }
+              }
+              if (!isPeak) continue;
+            }
             let pMin = 255, pMax = 0, gtPaper = 0, ltInk = 0;
             const pData = normTop.data;
             const ntW = normTop.w;
@@ -2072,12 +2154,14 @@
               if (contrastSpan < (isDealerTail ? 58 : minContrast)) continue;
               if (gtPaper / nPatch < (isDealerTail ? 0.20 : 0.26) || ltInk / nPatch < (isDealerTail ? 0.06 : 0.07)) continue;
               if (isDimmedCl && pMin >= dimMaxInk) continue;
+              if (isBackColumn(xPos, sw)) continue;
               const prio = conf + (tpl.rank === "10" ? 0.015 : 0.0);
               peaks.push([
                 prio,
                 { rank: tpl.rank, val: tpl.val, conf, x: xPos, y: yPos, w: sw, h: sh, suit: null, hand_index: 0, cwNorm },
               ]);
             } else if (isDealer && contrastSpan >= 36 && gtPaper / nPatch >= 0.14 && ltInk / nPatch >= 0.04) {
+              if (isBackColumn(xPos, sw)) continue;
               subPeaks.push([
                 conf,
                 { rank: tpl.rank, val: tpl.val, conf, x: xPos, y: yPos, w: sw, h: sh, suit: null, hand_index: 0, cwNorm },
@@ -2133,7 +2217,7 @@
     const leftBadgeIntrusion = topPaper >= 0.25 && badgeProbe.data.length > 0 && (badgeDarkCnt / badgeProbe.data.length) >= 0.22;
 
     // Masked left-badge recovery when Card 0's bottom-left corner is clipped or weakened by a circular score badge
-    const card0Missing = (kept.length > 0 && kept[0].x >= firstCardX + 10) || (kept.length === 0 && cwNorm >= 12);
+    const card0Missing = (kept.length > 0 && kept[0].x >= firstCardX + 10) || (kept.length === 0 && leftBadgeIntrusion && cwNorm >= 12);
     const card0WeakUnderBadge = leftBadgeIntrusion && kept.length > 0 && kept[0].x <= firstCardX + 6 && kept[0].conf < 0.88;
     if (card0Missing || card0WeakUnderBadge) {
       const gapW = (card0Missing && kept.length > 0) ? kept[0].x : Math.min(firstCardX + 22, cwNorm);
@@ -2152,57 +2236,47 @@
         const maskPaperThr = Math.max(88, Math.round(paperThr * 0.96));
         const maskInkThr = Math.min(135, inkThr + 5);
         const maskMinContrast = Math.max(44, minContrast - 5);
+        const ntW = normTop.w;
+        const ntData = normTop.data;
         for (const tpl of rankTemplates) {
-          for (const tsc of [0.90, 0.96, 1.0, 1.05]) {
+          for (const tsc of [0.95, 1.03]) {
             const entry = getScaledRankTplMasked(tpl, tsc);
             if (!entry) continue;
-            const { sw, sh, mask, mCount, tmBase, tNorm } = entry;
-            if (sw > normTop.w || sh > normTop.h) continue;
+            const { sw, sh, mCount, tmBase, tNorm, maskYs, maskXs } = entry;
+            if (sw > ntW || sh > normTop.h) continue;
             const minLx = Math.max(0, firstCardX - 1);
-            const maxLx = Math.min(firstCardX + 6, Math.max(minLx + 1, gapW - 10), normTop.w - sw + 1);
+            const maxLx = Math.min(firstCardX + 6, Math.max(minLx + 1, gapW - 10), ntW - sw + 1);
             const maxY0 = Math.min(6, normTop.h - sh + 1);
+            const invM = 1.0 / mCount;
             for (let y0 = 0; y0 < maxY0; y0++) {
+              const baseRow = y0 * ntW;
               for (let x0 = minLx; x0 < maxLx; x0++) {
                 if (card0Missing && kept.length > 0 && Math.abs(x0 - kept[0].x) < 11) continue;
-                let pMin = 255, pMax = 0, gtP = 0, ltI = 0, sumP = 0;
-                for (let py = 0; py < sh; py++) {
-                  const sRow = (y0 + py) * normTop.w + x0;
-                  const mRow = py * sw;
-                  for (let px = 0; px < sw; px++) {
-                    if (!mask[mRow + px]) continue;
-                    const v = normTop.data[sRow + px];
-                    sumP += v;
-                    if (v < pMin) pMin = v;
-                    if (v > pMax) pMax = v;
-                    if (v > maskPaperThr) gtP++;
-                    if (v < maskInkThr) ltI++;
-                  }
+                let pMin = 255, pMax = 0, gtP = 0, ltI = 0, sumP = 0, sumSqP = 0, dot = 0;
+                const baseOff = baseRow + x0;
+                for (let k = 0; k < mCount; k++) {
+                  const v = ntData[baseOff + maskYs[k] * ntW + maskXs[k]];
+                  sumP += v;
+                  sumSqP += v * v;
+                  dot += v * tmBase[k];
+                  if (v < pMin) pMin = v;
+                  if (v > pMax) pMax = v;
+                  if (v > maskPaperThr) gtP++;
+                  if (v < maskInkThr) ltI++;
                 }
                 if (
-                  gtP / mCount < 0.24 ||
+                  gtP * invM < 0.24 ||
                   (pMax - pMin) < maskMinContrast ||
-                  ltI / mCount < 0.07 ||
+                  ltI * invM < 0.07 ||
                   (isDimmedCl && pMin >= dimMaxInk)
                 ) {
                   continue;
                 }
-                const pMean = sumP / mCount;
-                let dot = 0, pNormSq = 0;
-                for (let py = 0, k = 0; py < sh; py++) {
-                  const sRow = (y0 + py) * normTop.w + x0;
-                  const mRow = py * sw;
-                  for (let px = 0; px < sw; px++) {
-                    if (!mask[mRow + px]) continue;
-                    const dv = normTop.data[sRow + px] - pMean;
-                    dot += dv * tmBase[k];
-                    pNormSq += dv * dv;
-                    k++;
-                  }
-                }
-                const denom = Math.sqrt(pNormSq) * tNorm;
-                const scMasked = denom > 1e-5 ? dot / denom : 0.0;
+                // Since tmBase is zero-mean, dot(v - pMean, tmBase) === dot(v, tmBase)
+                const pVar = sumSqP - sumP * sumP * invM;
+                const scMasked = pVar > 1e-5 ? dot / (Math.sqrt(pVar) * tNorm) : 0.0;
                 const prio = scMasked + (tpl.rank === "10" ? 0.015 : 0.0);
-                if (scMasked >= maskThr && (!bestLeft || prio > bestLeft[0])) {
+                if (scMasked >= maskThr && (!bestLeft || prio > bestLeft[0]) && !isBackColumn(x0, sw)) {
                   bestLeft = [
                     prio,
                     { rank: tpl.rank, val: tpl.val, conf: scMasked, x: x0, y: y0, w: sw, h: sh, suit: null, hand_index: 0, cwNorm },
@@ -2224,7 +2298,8 @@
 
     const out = [];
     const rejectedCands = [];
-    for (const d of kept) {
+    for (let kIdx = 0; kIdx < kept.length; kIdx++) {
+      const d = kept[kIdx];
       let [suit, suitConf] = classifySuit(normBgr, d.x, d.w, cwNorm, suitTemplates, paperHi);
       let hasPipBody = false;
       if (suitTemplates && suitTemplates.length) {
@@ -2237,7 +2312,8 @@
           if (sz.data[k] < pipInkThr) ltInkPip++;
           if (sz.data[k] < badgeDarkThr) ltBadge++;
         }
-        hasPipBody = sz.data.length > 0 && gtPaperPip / sz.data.length >= 0.30 && ltInkPip >= 5;
+        const paperPipFrac = sz.data.length > 0 ? gtPaperPip / sz.data.length : 0;
+        hasPipBody = paperPipFrac >= 0.30 && ltInkPip >= 5;
         const hasBadgeOcclusion = d.x <= firstCardX + 6 && sz.data.length > 0 && ltBadge / sz.data.length >= 0.25 && d.conf >= Math.max(0.75, floorConf);
         if (!suit && hasBadgeOcclusion && cwNorm <= 44) {
           const [trSuit, trConf] = classifyTopRightSuit(normBgr, cwNorm, suitTemplates, paperHi);
@@ -2246,9 +2322,15 @@
             suitConf = trConf;
           }
         }
+        const isRightmostDealer = isDealer && kIdx === kept.length - 1;
+        const crispBlurredTailOk =
+          isRightmostDealer &&
+          d.rank !== "Q" &&
+          paperPipFrac >= 0.34 &&
+          d.conf >= (d.rank === "4" ? 0.88 : 0.86);
         if (!clusterHasBack && !edgeClipped && !hasBadgeOcclusion) {
           const remRight = effRight - d.x;
-          if (remRight < 15 && (d.conf < Math.max(isDealer ? 0.74 : 0.84, isDealer ? minHudConf - 0.10 : minHudConf) || (!suit && !hasPipBody))) {
+          if (remRight < 15 && (d.conf < Math.max(isDealer ? 0.74 : 0.84, isDealer ? minHudConf - 0.10 : minHudConf) || (!suit && !hasPipBody && !crispBlurredTailOk))) {
             if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
             continue;
           }
@@ -2257,7 +2339,7 @@
             continue;
           }
         }
-        const highConfPipOk = hasPipBody && suitConf >= 0.35 && d.conf >= Math.max(isDealer ? 0.75 : 0.86, isDealer ? 0.75 : minHudConf);
+        const highConfPipOk = (hasPipBody && suitConf >= 0.35 && d.conf >= Math.max(isDealer ? 0.75 : 0.86, isDealer ? 0.75 : minHudConf)) || crispBlurredTailOk;
         if (!suit && !hasBadgeOcclusion && !highConfPipOk && (!hasPipBody || suitConf < 0.42 || d.conf < Math.max(0.82, minHudConf - 0.02))) {
           if (isDealer) rejectedCands.push(Object.assign({}, d, { suit, hasPipBody: !!hasPipBody }));
           continue;
@@ -2397,6 +2479,21 @@
       if (ad > maxD) maxD = ad;
     }
     return maxD;
+  }
+
+  function roiSigMeanDiff(sigA, sigB) {
+    if (!sigA || !sigB) return 255.0;
+    if (sigA.w !== sigB.w || sigA.h !== sigB.h || sigA.gw !== sigB.gw || sigA.gh !== sigB.gh) {
+      return 255.0;
+    }
+    const a = sigA.bins, b = sigB.bins, n = a.length;
+    if (n === 0) return 0.0;
+    let sumD = 0;
+    for (let i = 0; i < n; i++) {
+      const d = a[i] - b[i];
+      sumD += d < 0 ? -d : d;
+    }
+    return sumD / n;
   }
 
   function hudRoiSigChanged(sigA, sigB, tol = 2) {
@@ -3090,25 +3187,26 @@
     return (h >= 78 && h <= 108 && s >= 55 && v >= 55) || ((h <= 7 || h >= 168) && s >= 120 && v >= 45 && v <= 155);
   }
 
-  function _matchUiTemplatesJs(roiBgr, tpls, targetH = 72) {
+  function _matchUiTemplatesJs(roiBgr, tpls, targetH = 36) {
     if (!roiBgr || roiBgr.w < 12 || roiBgr.h < 12 || roiBgr.c !== 3 || !Array.isArray(tpls) || !tpls.length) {
       return 0.0;
     }
-    const nw = Math.max(24, Math.round(roiBgr.w * (targetH / roiBgr.h)));
+    const nw = Math.max(16, Math.round(roiBgr.w * (targetH / roiBgr.h)));
     const rg = toGray(resizeImage(roiBgr, nw, targetH));
     const prep = prepareSourceForMatch(rg, false);
+    const scaleRatio = targetH / 72.0;
     let best = 0.0;
     for (const tpl of tpls) {
       const tg = tpl && tpl.gray;
       if (!tg || tg.w < 6 || tg.h < 6) continue;
-      for (const sc of [0.72, 0.84, 0.96, 1.08, 1.22]) {
-        const sw = Math.max(8, Math.round(tg.w * sc));
-        const sh = Math.max(8, Math.round(tg.h * sc));
-        if (sw > nw || sh > targetH) continue;
-        const st = resizeImage(tg, sw, sh);
-        const m = matchTemplateCCoeffNormed(rg, st, prep);
-        for (let i = 0; i < m.data.length; i++) {
-          if (m.data[i] > best) best = m.data[i];
+      for (const sc of [0.82, 1.00, 1.18]) {
+        const effSc = sc * scaleRatio;
+        const entry = getScaledTplGray(tpl, effSc, false);
+        if (!entry || entry.sw > nw || entry.sh > targetH) continue;
+        const m = matchPreparedTemplate(prep, entry.scaled, entry.tZero, entry.tNorm);
+        if (Number.isFinite(m.maxVal) && m.maxVal > best) {
+          best = m.maxVal;
+          if (best >= 0.92) return best;
         }
       }
     }
@@ -3298,6 +3396,7 @@
       this._lastBannerSig = null;
       this._cachedTopBanner = ["", 0.0];
       this._bannerSigAge = 0;
+      this._lastBannerScanTs = null;
       this._lastShuffleSig = null;
       this._lastShufMode = "";
       this._cachedShuf = ["", 0.0];
@@ -3305,8 +3404,12 @@
       this._lastShuffleScanTs = null;
       this._lastShuffleFullScanTs = null;
       this._lastPbSig = null;
-      this._cachedPb = 0.0;
+      this._cachedPb = ["", 0.0];
       this._pbSigAge = 0;
+      this._lastPbScanTs = null;
+      this._lastShoeScanTs = null;
+      this._lastShoeSig = null;
+      this._lastDiscardSig = null;
     }
 
     loadPack(pack) {
@@ -3553,7 +3656,7 @@
       return [allP, hands, Object.keys(hands).length >= 2, clusters, []];
     }
 
-    processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, shoeImg = null, discardImg = null, ts = null, forceDealerScan = false, useShoeBaseline = true }) {
+    processCrops({ playerImg, dealerImg, shuffleImg, bannerImg, placeBetsImg, shoeImg = null, discardImg = null, ts = null, forceDealerScan = false, forceUiScan = false, inDealerTurn = false, useShoeBaseline = true }) {
       const now = ts !== null ? ts : performance.now() / 1000;
       const REFRESH_PERIOD = 8;
       const HUD_REFRESH_PERIOD = 4;
@@ -3562,8 +3665,11 @@
       const pSig = computeRoiSignature(playerImg, 96, 32, true);
       const pChanged = hudRoiSigChanged(pSig, this._lastPSig, 2);
       const pDiff = roiSigDiff(pSig, this._lastPSig);
+      const pMeanDiff = roiSigMeanDiff(pSig, this._lastPSig);
+      const pNoiseOnly = this._lastPSig && !pChanged && (pDiff === 0 || this._pSigAge < HUD_REFRESH_PERIOD);
+      const pH264Quiet = this._lastPSig && pMeanDiff < 1.5 && pDiff < 14 && !hudRoiSigChanged(pSig, this._lastPSig, 13);
       let pCards, pHands, splitDetected;
-      if (this._lastPSig && !pChanged && (pDiff === 0 || this._pSigAge < HUD_REFRESH_PERIOD)) {
+      if (pNoiseOnly || pH264Quiet) {
         [pCards, pHands, splitDetected] = this._cachedP;
         if (pDiff > 0) this._pSigAge++;
       } else {
@@ -3574,11 +3680,17 @@
       }
 
       const dSig = computeRoiSignature(dealerImg, 80, 36, true);
-      const dChanged = hudRoiSigChanged(dSig, this._lastDSig, 1);
       const dDiff = roiSigDiff(dSig, this._lastDSig);
+      const dMeanDiff = roiSigMeanDiff(dSig, this._lastDSig);
+      // Dealer strip is small/cheap and holds the cards that matter most:
+      // - Explicit forceDealerScan (manual resync / calib_test_detect) always rescans.
+      // - During DEALER_TURN, tolerate only tight ±1..2 H.264 noise (meanDiff < 1.2, maxDiff <= 4, no bright/dark pixel shift).
+      // - Otherwise tolerate ±1..2 H.264 jitter (meanDiff < 1.5, maxDiff <= 8) while catching thin 1-digit glyphs via brightCnt/darkCnt shifts.
+      const dMaxTol = inDealerTurn ? 4 : 8;
+      const dMeanTol = inDealerTurn ? 1.2 : 1.5;
+      const dH264Quiet = !forceDealerScan && this._lastDSig && dMeanDiff < dMeanTol && dDiff <= dMaxTol && !hudRoiSigChanged(dSig, this._lastDSig, dMaxTol);
       let dCards, dBadgeTotal, dBadgeConf, dSubCards, dBadgeHint;
-      // Dealer strip is small/cheap and holds the few cards that matter: only reuse the cache when pixels are identical and not force-scanning.
-      if (!forceDealerScan && this._lastDSig && !dChanged && dDiff === 0) {
+      if (dH264Quiet) {
         [dCards, dBadgeTotal, dBadgeConf, dSubCards, dBadgeHint] = this._cachedD;
       } else {
         this._lastDSig = dSig;
@@ -3590,6 +3702,7 @@
       }
 
       const cardsPresent = pCards.length > 0 || dCards.length > 0;
+      const dealerBusy = Boolean(inDealerTurn && dCards.length > 0);
       const bannerTpls = this.banks.banner || [];
       let bannerState = "";
       let bannerConf = 0.0;
@@ -3598,11 +3711,14 @@
       if (bannerImg && bannerImg.w > 0 && bannerTpls.length) {
         const banSig = computeRoiSignature(bannerImg, 48, 12, false);
         const banDiff = roiSigDiff(banSig, this._lastBannerSig);
-        if (this._lastBannerSig && (banDiff === 0 || (banDiff <= SIG_TOL && this._bannerSigAge < REFRESH_PERIOD))) {
+        const banMeanDiff = roiSigMeanDiff(banSig, this._lastBannerSig);
+        const banThrottled = this._lastBannerScanTs !== null && (now - this._lastBannerScanTs) < 0.24 && !this._cachedTopBanner[0];
+        if (this._lastBannerSig && (banDiff === 0 || banMeanDiff < 2.2 || banThrottled || (banDiff <= SIG_TOL && this._bannerSigAge < REFRESH_PERIOD))) {
           [bannerState, bannerConf] = this._cachedTopBanner;
           if (banDiff > 0) this._bannerSigAge++;
         } else {
           this._lastBannerSig = banSig;
+          this._lastBannerScanTs = now;
           this._bannerSigAge = 0;
           const [btpl, bconf] = this._detectBannerWithHint(
             bannerImg,
@@ -3622,24 +3738,36 @@
 
       let shufOn = false;
       let shufConf = 0.0;
-      const shufDue = !cardsPresent || this._lastShuffleScanTs === null || (now - this._lastShuffleScanTs) >= 0.25;
-      if (shuffleImg && shuffleImg.w > 0 && bannerTpls.length && !bannerState) {
+      const shufRoiCfg = this.cfg.shuffle_roi || [0.30, 0.24, 0.40, 0.38];
+      const shufOverlapsTop = shufRoiCfg[1] < 0.05 && Boolean(bannerImg && bannerImg.w > 0);
+      const hasSepPb = Boolean(placeBetsImg && placeBetsImg.w > 0);
+      const shufDue = !dealerBusy && (this._lastShuffleScanTs === null || (now - this._lastShuffleScanTs) >= 0.60);
+      if (shuffleImg && shuffleImg.w > 0 && bannerTpls.length && !bannerState && !shufOverlapsTop) {
         const shufMode = cardsPresent ? "cards" : "empty";
         if (shufDue) {
           const shufSig = computeRoiSignature(shuffleImg, 32, 16, false);
           const shufDiff = roiSigDiff(shufSig, this._lastShuffleSig);
+          const shufMeanDiff = roiSigMeanDiff(shufSig, this._lastShuffleSig);
           const modeSame = this._lastShufMode === shufMode;
           this._lastShuffleScanTs = now;
-          const needFullFallback = !cardsPresent && (this._lastShuffleFullScanTs === null || (now - this._lastShuffleFullScanTs) >= 0.85);
-          if (this._lastShuffleSig && modeSame && !needFullFallback && (shufDiff === 0 || (shufDiff <= SIG_TOL && this._shufSigAge < REFRESH_PERIOD))) {
+          const shufPriorityTpls = bannerTpls.filter((t) => t.rank === "SHUFFLE" || t.rank === "WAIT");
+          const needFullFallback =
+            !cardsPresent &&
+            !hasSepPb &&
+            (this._lastShuffleFullScanTs === null || (now - this._lastShuffleFullScanTs) >= 0.85);
+          if (
+            this._lastShuffleSig &&
+            modeSame &&
+            !needFullFallback &&
+            (shufDiff === 0 || shufMeanDiff < 2.2 || (shufDiff <= SIG_TOL && this._shufSigAge < REFRESH_PERIOD))
+          ) {
             if (shufDiff > 0) this._shufSigAge++;
           } else {
             this._lastShuffleSig = shufSig;
             this._lastShufMode = shufMode;
             this._shufSigAge = 0;
-            const shufPriorityTpls = bannerTpls.filter((t) => t.rank === "SHUFFLE" || t.rank === "WAIT");
             let shufTpls;
-            if (cardsPresent) {
+            if (cardsPresent || hasSepPb) {
               shufTpls = shufPriorityTpls;
             } else if (needFullFallback || !shufPriorityTpls.length) {
               shufTpls = bannerTpls;
@@ -3663,12 +3791,15 @@
 
       let pbConf = 0.0;
       let pbRank = "";
-      if (placeBetsImg && placeBetsImg.w > 0 && bannerTpls.length && !bannerState) {
+      if (hasSepPb && bannerTpls.length && !bannerState && !dealerBusy) {
         const pbTpls = bannerTpls.filter((t) => t.rank === "PLACE_BETS" || t.rank === "LAST_BETS" || t.rank === "NO_MORE_BETS");
         if (pbTpls.length) {
           const pbSig = computeRoiSignature(placeBetsImg, 36, 12, false);
           const pbDiff = roiSigDiff(pbSig, this._lastPbSig);
-          if (this._lastPbSig && (pbDiff === 0 || (pbDiff <= SIG_TOL && this._pbSigAge < REFRESH_PERIOD))) {
+          const pbMeanDiff = roiSigMeanDiff(pbSig, this._lastPbSig);
+          const cachedPbRank = Array.isArray(this._cachedPb) ? this._cachedPb[0] : (this._cachedPb > 0 ? "PLACE_BETS" : "");
+          const pbThrottled = this._lastPbScanTs !== null && (now - this._lastPbScanTs) < 0.32 && !cachedPbRank;
+          if (this._lastPbSig && (pbDiff === 0 || pbMeanDiff < 2.2 || pbThrottled || (pbDiff <= SIG_TOL && this._pbSigAge < REFRESH_PERIOD))) {
             if (Array.isArray(this._cachedPb)) {
               [pbRank, pbConf] = this._cachedPb;
             } else {
@@ -3678,6 +3809,7 @@
             if (pbDiff > 0) this._pbSigAge++;
           } else {
             this._lastPbSig = pbSig;
+            this._lastPbScanTs = now;
             this._pbSigAge = 0;
             const [ptpl, pconf] = this._detectBannerWithHint(
               placeBetsImg,
@@ -3696,7 +3828,7 @@
             bannerSource = "place_bets_roi";
           }
         }
-      } else if (!placeBetsImg || placeBetsImg.w === 0) {
+      } else if (!hasSepPb) {
         this._lastPbSig = null;
         this._cachedPb = ["", 0.0];
       }
@@ -3708,11 +3840,12 @@
         shufConf = Math.max(shufConf, bannerConf);
       }
 
-      // Dual-ROI physical shoe & movable discard-tray metrics (throttled ~2.5 Hz)
+      // Dual-ROI physical shoe & movable discard-tray metrics (throttled ~2.5 Hz; 1.3 Hz during DEALER_TURN)
       let shoeRes = this._cachedShoe || { state: "", darkFrac: 0.0, tealFrac: 0.0 };
       let discRes = this._cachedDiscard || { whiteFrac: 0.0, darkFrac: 0.0, tealFrac: 0.0 };
       const lastShoeTs = this._lastShoeScanTs ?? -999.0;
-      if ((shoeImg || discardImg) && (forceDealerScan || (now - lastShoeTs) >= 0.35)) {
+      const shoeInterval = dealerBusy ? 0.75 : 0.40;
+      if ((shoeImg || discardImg) && (forceUiScan || (now - lastShoeTs) >= shoeInterval)) {
         this._lastShoeScanTs = now;
         this._ensureBankDecoded("ui");
         const getUiPrefix = (prefix) => {
@@ -4067,7 +4200,7 @@
       return [emitted, false];
     }
 
-    flushPendingOnWipe(minConf = 0.80) {
+    flushPendingOnWipe(minConf = 0.80, clearState = true) {
       if (!this.committedRanks.length) return [];
       const merged = new Map();
       for (const [idx, entry] of this._pendingTail.entries()) {
@@ -4092,6 +4225,8 @@
           if (canRescue(idx, det)) {
             this.committedRanks[idx] = det.rank;
             emitted.push([idx, det]);
+            this._pendingTail.delete(idx);
+            this._slotCands.delete(idx);
           }
         }
       }
@@ -4102,12 +4237,16 @@
           if (!det || !canRescue(idx, det)) break;
           this.committedRanks.push(det.rank);
           emitted.push([idx, det]);
+          this._pendingTail.delete(idx);
+          this._slotCands.delete(idx);
         }
       }
 
-      this._wipeDets = [];
-      this._pendingTail.clear();
-      this._slotCands.clear();
+      if (clearState) {
+        this._wipeDets = [];
+        this._pendingTail.clear();
+        this._slotCands.clear();
+      }
       return emitted;
     }
   }
@@ -4653,6 +4792,35 @@
           this._bestSubDealerTail.set(slotIdx, list);
         }
       }
+      // Score-badge corroboration: if the live dealer score badge matches committed + a moderate-conf (>=0.65)
+      // trailing candidate (from dealer_cards or dealer_sub_cards), promote that exact visual rank into _bestDealerTail.
+      if (Number.isInteger(bTot) && bTot >= 4 && bTot <= 26 && bConf >= 0.62) {
+        const commReal = this.dDebouncer.committedRanks.filter((r) => r !== "BACK");
+        if (commReal.length >= 1) {
+          const backIdx = this.dDebouncer.committedRanks.indexOf("BACK");
+          const nextSlot = backIdx >= 0 ? backIdx : this.dDebouncer.committedRanks.length;
+          const candsAtSlot = [];
+          if (nextSlot < dList.length && dList[nextSlot]) candsAtSlot.push(dList[nextSlot]);
+          const subAtSlot = this._bestSubDealerTail.get(nextSlot);
+          if (Array.isArray(subAtSlot) && subAtSlot.length) candsAtSlot.push(...subAtSlot);
+          let bestCorrob = null;
+          for (const cd of candsAtSlot) {
+            if (!cd || !cd.rank || cd.rank === "BACK" || cd.val === null || cd.val === undefined) continue;
+            if ((cd.conf || 0) < 0.65) continue;
+            const [totIfAdded] = evalBjRanks([...commReal, cd.rank]);
+            if (totIfAdded === bTot && (!bestCorrob || (cd.conf || 0) > (bestCorrob.conf || 0))) {
+              bestCorrob = cd;
+            }
+          }
+          if (bestCorrob) {
+            const promoted = Object.assign({}, bestCorrob, { conf: Math.max(bestCorrob.conf || 0, 0.84) });
+            const prevBest = this._bestDealerTail.get(nextSlot);
+            if (!prevBest || promoted.conf > prevBest.conf) {
+              this._bestDealerTail.set(nextSlot, promoted);
+            }
+          }
+        }
+      }
     }
 
     _emitDealerCards(pairs, events, source = "hud") {
@@ -4686,8 +4854,8 @@
 
     _finalizeClearedRound(now = Date.now() / 1000) {
       const events = [];
-      // Fallback B1: standard wipe rescue
-      const rescuedD = this.dDebouncer.flushPendingOnWipe(Math.max(0.78, this.cfg.min_hud_confidence - 0.06));
+      // Fallback B1: standard wipe rescue (preserve pending tail for Fallback B2 if dealer remains incomplete)
+      const rescuedD = this.dDebouncer.flushPendingOnWipe(Math.max(0.78, this.cfg.min_hud_confidence - 0.06), false);
       if (rescuedD.length) {
         this._emitDealerCards(rescuedD, events);
       }
@@ -4729,7 +4897,7 @@
 
       // Fallback B2: lower-confidence wipe rescue if dealer hand is still incomplete
       if (isDealerStillIncomplete()) {
-        const rescuedLow = this.dDebouncer.flushPendingOnWipe(0.72);
+        const rescuedLow = this.dDebouncer.flushPendingOnWipe(0.72, true);
         if (rescuedLow.length) {
           this._emitDealerCards(rescuedLow, events);
         }
@@ -6155,7 +6323,7 @@
       this.detector = new PlaytechDetector(this.cfg, initialPack);
       this.sm = new CompanionStateMachine(this.cfg);
       this.keepalive = new WatchKeepaliveManager(this.cfg);
-      this.smoother = new ViewportSmoother(0.35, 18);
+      this.smoother = new ViewportSmoother(0.35, 90);
 
       this.clients = new Set();
       this._unrotatedRawFrame = null;
@@ -6267,8 +6435,8 @@
         }
       };
 
-      const effFps = Math.max(24, Number(this.cfg.burst_fps) || Number(this.cfg.fps) || 24);
-      const intervalMs = Math.max(33, Math.round(1000 / effFps));
+      const effFps = Math.max(30, Number(this.cfg.burst_fps) || Number(this.cfg.fps) || 30);
+      const intervalMs = Math.max(30, Math.round(1000 / effFps));
       const pollOnce = () => {
         if (this._busy || this.clients.size === 0) return;
         this._busy = true;
@@ -6384,7 +6552,7 @@
           } finally {
             done();
             if (scheduleFollowUp && this._loopTimer) {
-              setTimeout(pollOnce, 16);
+              setTimeout(pollOnce, 8);
             }
           }
         };
@@ -6491,19 +6659,8 @@
       return [false, "alert_fallback"];
     }
 
-    ingestFrameBgr(frameBgr, now = performance.now() / 1000) {
-      if (!frameBgr || frameBgr.w === 0 || frameBgr.h === 0) return [];
-      this._unrotatedRawFrame = frameBgr;
-      const rot = normalizeRotationDeg(this.cfg.frame_rotation || 0);
-      const procFrame = rot !== 0 ? rotateImage(frameBgr, rot) : frameBgr;
-      const wasBroadcastActive = this.broadcastActive;
-      this.latestRawFrame = procFrame;
-      this.latestFrameTs = now;
-      this.broadcastActive = true;
-
-      const [ax, ay, aw, ah] = this.smoother.resolveAnchor(procFrame, this.cfg.anchor_mode);
-      const anchorImg = cropImage(procFrame, ax, ay, aw, ah);
-      if (anchorImg.w === 0 || anchorImg.h === 0) return [];
+    _processAnchorBgr(anchorImg, now, wasBroadcastActive) {
+      if (!anchorImg || anchorImg.w === 0 || anchorImg.h === 0) return [];
 
       const playerImg = cropNorm(anchorImg, this.cfg.player_strip);
       const dealerImg = cropNorm(anchorImg, this.cfg.dealer_strip);
@@ -6513,39 +6670,46 @@
       const shoeImg = this.cfg.shoe_roi ? cropNorm(anchorImg, this.cfg.shoe_roi) : null;
       const discardImg = this.cfg.discard_roi ? cropNorm(anchorImg, this.cfg.discard_roi) : null;
 
-      const forceDealerScan =
-        Boolean(this._forceNextHudScan) ||
+      const inDealerTurn =
         this.sm.state === "DEALER_TURN" ||
-        (this.sm.dDebouncer && this.sm.dDebouncer.committedRanks.includes("BACK"));
+        Boolean(this.sm.dDebouncer && this.sm.dDebouncer.committedRanks.includes("BACK"));
+      const forceDealerScan = Boolean(this._forceNextHudScan);
       this._forceNextHudScan = false;
 
-      if (this.detector && typeof this.detector._ensureBankDecoded === "function") {
-        this.detector._ensureBankDecoded("ui");
-      }
-      let loadingTpls = (this.detector && this.detector.banks && Array.isArray(this.detector.banks.ui))
-        ? this.detector.banks.ui.filter((t) => t && (t.rank === "LOADING" || (t.name && t.name.startsWith("LOADING_ALLBETS"))))
-        : [];
-      if (!loadingTpls.length) {
-        if (!this._fallbackLoadingTpls) {
-          const defPack = PRELOADED_PACK || (typeof globalThis.DEFAULT_COMPANION_PACK === "object" ? globalThis.DEFAULT_COMPANION_PACK : null);
-          const rawUi = (defPack && defPack.templates && Array.isArray(defPack.templates.ui)) ? defPack.templates.ui : [];
-          this._fallbackLoadingTpls = [];
-          for (const item of rawUi) {
-            if (!item || !item.name || !item.name.startsWith("LOADING_ALLBETS")) continue;
-            const bgr = item.bgrB64 && item.w && item.h
-              ? { w: item.w, h: item.h, c: 3, data: b64ToUint8(item.bgrB64) }
-              : (item.bgr && item.bgr.data ? item.bgr : null);
-            if (!bgr) continue;
-            const entry = createTemplateEntry("ui", item.name, bgr, item.dataB64 || "");
-            if (entry) this._fallbackLoadingTpls.push(entry);
-          }
-        }
-        loadingTpls = this._fallbackLoadingTpls;
-      }
-      const isLoading = detectLoadingScreen(anchorImg, loadingTpls);
-      this._lastLoadingScreen = isLoading;
       const inKaReload = Boolean(this.keepalive && ["REFRESHING", "RECOVERING"].includes(this.keepalive.state));
-      const inKaGrace = Boolean(this.keepalive && typeof this.keepalive.inGracePeriod === "function" && this.keepalive.inGracePeriod(now));
+      const inKaGrace = Boolean(this.keepalive && typeof this.keepalive.inGrace === "function" && this.keepalive.inGrace(now));
+      const inActiveRound = ["DEALING", "PLAYER_TURN", "DEALER_TURN"].includes(this.sm.state);
+      const lastLoadTplTs = this._lastLoadingTplScanTs ?? -999.0;
+      const allowLoadingTpl = inKaReload || (!inActiveRound && (now - lastLoadTplTs) >= 0.45);
+      let loadingTpls = null;
+      if (allowLoadingTpl) {
+        this._lastLoadingTplScanTs = now;
+        if (this.detector && typeof this.detector._ensureBankDecoded === "function") {
+          this.detector._ensureBankDecoded("ui");
+        }
+        loadingTpls = (this.detector && this.detector.banks && Array.isArray(this.detector.banks.ui))
+          ? this.detector.banks.ui.filter((t) => t && (t.rank === "LOADING" || (t.name && t.name.startsWith("LOADING_ALLBETS"))))
+          : [];
+        if (!loadingTpls.length) {
+          if (!this._fallbackLoadingTpls) {
+            const defPack = PRELOADED_PACK || (typeof globalThis.DEFAULT_COMPANION_PACK === "object" ? globalThis.DEFAULT_COMPANION_PACK : null);
+            const rawUi = (defPack && defPack.templates && Array.isArray(defPack.templates.ui)) ? defPack.templates.ui : [];
+            this._fallbackLoadingTpls = [];
+            for (const item of rawUi) {
+              if (!item || !item.name || !item.name.startsWith("LOADING_ALLBETS")) continue;
+              const bgr = item.bgrB64 && item.w && item.h
+                ? { w: item.w, h: item.h, c: 3, data: b64ToUint8(item.bgrB64) }
+                : (item.bgr && item.bgr.data ? item.bgr : null);
+              if (!bgr) continue;
+              const entry = createTemplateEntry("ui", item.name, bgr, item.dataB64 || "");
+              if (entry) this._fallbackLoadingTpls.push(entry);
+            }
+          }
+          loadingTpls = this._fallbackLoadingTpls;
+        }
+      }
+      const isLoading = detectLoadingScreen(anchorImg, loadingTpls, allowLoadingTpl);
+      this._lastLoadingScreen = isLoading;
 
       const prevSmState = this.sm.state;
       const prevKaState = this.keepalive.state;
@@ -6575,6 +6739,7 @@
               discardImg,
               ts: now,
               forceDealerScan,
+              inDealerTurn,
             }),
             { loading_screen: false }
           );
@@ -6627,12 +6792,58 @@
       return allEvents;
     }
 
+    ingestFrameBgr(frameBgr, now = performance.now() / 1000) {
+      if (!frameBgr || frameBgr.w === 0 || frameBgr.h === 0) return [];
+      this._pendingRawRgba = null;
+      this._unrotatedRawFrame = frameBgr;
+      const rot = normalizeRotationDeg(this.cfg.frame_rotation || 0);
+      const procFrame = rot !== 0 ? rotateImage(frameBgr, rot) : frameBgr;
+      const wasBroadcastActive = this.broadcastActive;
+      this.latestRawFrame = procFrame;
+      this.latestFrameTs = now;
+      this.broadcastActive = true;
+
+      const [ax, ay, aw, ah] = this.smoother.resolveAnchor(procFrame, this.cfg.anchor_mode);
+      const anchorImg = cropImage(procFrame, ax, ay, aw, ah);
+      return this._processAnchorBgr(anchorImg, now, wasBroadcastActive);
+    }
+
     ingestRGBA(rgbaBytes, width, height, now = performance.now() / 1000) {
-      const bgr = fromRGBA(rgbaBytes, width, height);
+      const w = Math.max(0, width | 0);
+      const h = Math.max(0, height | 0);
+      if (!rgbaBytes || w === 0 || h === 0 || rgbaBytes.length < w * h * 4) return [];
+      const rot = normalizeRotationDeg(this.cfg.frame_rotation || 0);
+      const sm = this.smoother;
+      const canFastCrop =
+        rot === 0 &&
+        this.cfg.anchor_mode !== "window" &&
+        sm &&
+        sm._cachedRect &&
+        sm._cachedArgs &&
+        sm._cachedArgs[0] === w &&
+        sm._cachedArgs[1] === h &&
+        sm._cachedArgs[2] === this.cfg.anchor_mode &&
+        sm._framesSinceDetect < sm.cacheInterval;
+      if (canFastCrop) {
+        sm._framesSinceDetect++;
+        const [ax, ay, aw, ah] = sm._cachedRect;
+        const anchorImg = fromRGBARect(rgbaBytes, w, h, ax, ay, aw, ah);
+        const wasBroadcastActive = this.broadcastActive;
+        this._pendingRawRgba = { rgba: rgbaBytes, w, h };
+        this.latestFrameTs = now;
+        this.broadcastActive = true;
+        return this._processAnchorBgr(anchorImg, now, wasBroadcastActive);
+      }
+      const bgr = fromRGBA(rgbaBytes, w, h);
       return this.ingestFrameBgr(bgr, now);
     }
 
     _buildCalibSnapshot(reqAnchor) {
+      if (this._pendingRawRgba) {
+        const { rgba, w, h } = this._pendingRawRgba;
+        this._pendingRawRgba = null;
+        this._unrotatedRawFrame = fromRGBA(rgba, w, h);
+      }
       const rot = normalizeRotationDeg(this.cfg.frame_rotation || 0);
       if (this._unrotatedRawFrame) {
         this.latestRawFrame = rot !== 0 ? rotateImage(this._unrotatedRawFrame, rot) : this._unrotatedRawFrame;
@@ -6950,6 +7161,7 @@
           shoeImg: cropNorm(snap, shoeRoi),
           discardImg: cropNorm(snap, discRoi),
           forceDealerScan: true,
+          forceUiScan: true,
           useShoeBaseline: false,
         });
 
@@ -7430,6 +7642,7 @@
     defaultConfig,
     createImage,
     fromRGBA,
+    fromRGBARect,
     bgrToRGBA,
     toGray,
     toMinGray,
@@ -7461,6 +7674,7 @@
     guessMissingDealerCard,
     computeRoiSignature,
     roiSigDiff,
+    roiSigMeanDiff,
     hudRoiSigChanged,
     PlaytechDetector,
     SequenceDebouncer,

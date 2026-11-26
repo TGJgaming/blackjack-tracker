@@ -458,7 +458,7 @@ class SequenceDebouncer:
             self._wipe_dets = ()
         return emitted, False
 
-    def flush_pending_on_wipe(self, min_conf: float = 0.80) -> list[tuple[int, CardDetection]]:
+    def flush_pending_on_wipe(self, min_conf: float = 0.80, clear_state: bool = True) -> list[tuple[int, CardDetection]]:
         """Flush high-confidence pending reveal or hit cards caught right before table wipe or partial clear."""
         if not self.committed_ranks:
             return []
@@ -485,6 +485,8 @@ class SequenceDebouncer:
                 if _can_rescue(idx, det):
                     self.committed_ranks[idx] = det.rank
                     emitted.append((idx, det))
+                    self._pending_tail.pop(idx, None)
+                    self._slot_cands.pop(idx, None)
 
         if "BACK" not in self.committed_ranks:
             while True:
@@ -494,10 +496,13 @@ class SequenceDebouncer:
                     break
                 self.committed_ranks.append(det.rank)
                 emitted.append((idx, det))
+                self._pending_tail.pop(idx, None)
+                self._slot_cands.pop(idx, None)
 
-        self._wipe_dets = ()
-        self._pending_tail.clear()
-        self._slot_cands.clear()
+        if clear_state:
+            self._wipe_dets = ()
+            self._pending_tail.clear()
+            self._slot_cands.clear()
         return emitted
 
 
@@ -1770,7 +1775,10 @@ class CompanionStateMachine:
 
     def _finalize_cleared_round(self, now: float) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
-        rescued_d = self.d_debouncer.flush_pending_on_wipe(min_conf=max(0.78, self.cfg.min_hud_confidence - 0.06))
+        rescued_d = self.d_debouncer.flush_pending_on_wipe(
+            min_conf=max(0.78, self.cfg.min_hud_confidence - 0.06),
+            clear_state=False,
+        )
         if rescued_d:
             self._emit_dealer_cards(rescued_d, events, ts=now)
         if self.felt_tracking_armed:
